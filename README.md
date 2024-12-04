@@ -44,7 +44,7 @@ aurora-dsql-loader.py [-h] [--host HOST] [--database DATABASE] [--user USER] [--
 
 # Troubleshooting
 
-On a unix machine, if you see the following error `permission denied: ./aurora-dsql-loader.py`, it means that the script is not executable. 
+On a unix machine, if you see the error `permission denied: ./aurora-dsql-loader.py`, it means that the script is not executable. 
 Fix this error by making the file executable. On the unix machines it can be done by running following command
 
 ```
