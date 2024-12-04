@@ -9,7 +9,7 @@ You can customize the data loading workflow through parameters. This tool featur
 ## Pre-requisites:
 
 1. Python 3.8+
-2. Psycopg3 module installed in environment (https://www.psycopg.org/psycopg3/docs/basic/install.html)
+2. Psycopg3 module [installed in environment](https://www.psycopg.org/psycopg3/docs/basic/install.html)
     Python venv is recommended
 3. A latest version of [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
 
