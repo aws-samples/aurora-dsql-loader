@@ -1,0 +1,4 @@
+box/
+*_venv/
+venv/
+.vscode/
