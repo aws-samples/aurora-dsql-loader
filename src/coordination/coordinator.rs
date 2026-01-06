@@ -153,32 +153,36 @@ impl Coordinator {
         } else {
             // Query existing table schema for proper type handling
             info!("Querying schema from existing table...");
-            match crate::db::schema::query_table_schema(&self.pool, &config.target_table).await {
-                Ok(queried_schema) => {
-                    info!(
-                        "Retrieved schema with {} columns",
-                        queried_schema.columns.len()
-                    );
-                    Some(queried_schema)
-                }
-                Err(e) => {
-                    warn!("Failed to query table schema: {}", e);
-                    warn!("Continuing without schema information (all values will be TEXT)");
-                    None
-                }
-            }
+            let queried_schema = crate::db::schema::query_table_schema(
+                &self.pool,
+                &config.target_table,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Table '{}' does not exist. Use --if-not-exists to create it automatically.",
+                    config.target_table
+                )
+            })?;
+
+            info!(
+                "Retrieved schema with {} columns",
+                queried_schema.columns.len()
+            );
+            Some(queried_schema)
         };
 
         // Apply column mappings to schema if provided
         if !config.column_mappings.is_empty()
-            && let Some(ref mut s) = schema {
-                for col in &mut s.columns {
-                    if let Some(new_name) = config.column_mappings.get(&col.name) {
-                        info!("Mapping column: {} -> {}", col.name, new_name);
-                        col.name = new_name.clone();
-                    }
+            && let Some(ref mut s) = schema
+        {
+            for col in &mut s.columns {
+                if let Some(new_name) = config.column_mappings.get(&col.name) {
+                    info!("Mapping column: {} -> {}", col.name, new_name);
+                    col.name = new_name.clone();
                 }
             }
+        }
 
         // 4. Create table (optional)
         let table_created = if config.create_table_if_missing {

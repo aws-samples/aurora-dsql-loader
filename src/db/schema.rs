@@ -144,23 +144,70 @@ impl From<Schema> for SchemaJson {
     }
 }
 
+/// Query SQLite table schema using PRAGMA
+#[cfg(test)]
+async fn query_sqlite_table_schema(
+    pool: &super::pool::Pool,
+    table_name: &str,
+) -> Result<Vec<(String, String, String)>> {
+    use super::pool::PoolConnection;
+
+    let mut conn = pool.acquire().await?;
+
+    if let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
+        let pragma_sql = format!("PRAGMA table_info({})", table_name);
+
+        // PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk)
+        let rows: Vec<(i32, String, String, i32, Option<String>, i32)> =
+            sqlx::query_as(&pragma_sql)
+                .fetch_all(&mut **sqlite_conn)
+                .await?;
+
+        // Convert to (column_name, data_type, is_nullable) format
+        let result = rows
+            .into_iter()
+            .map(|(_, name, data_type, notnull, _, _)| {
+                let is_nullable = if notnull == 1 { "NO" } else { "YES" };
+                (name, data_type, is_nullable.to_string())
+            })
+            .collect();
+
+        Ok(result)
+    } else {
+        anyhow::bail!("Expected SQLite connection");
+    }
+}
+
 /// Query the schema of an existing table from the database
 pub async fn query_table_schema(pool: &super::pool::Pool, table_name: &str) -> Result<Schema> {
-    // Query PostgreSQL information_schema to get column types
-    let query = r#"
-        SELECT
-            column_name,
-            data_type,
-            is_nullable
-        FROM information_schema.columns
-        WHERE table_name = $1
-        ORDER BY ordinal_position
-    "#;
+    let rows = if pool.is_postgres() {
+        // Query PostgreSQL information_schema to get column types
+        let query = r#"
+            SELECT
+                column_name,
+                data_type,
+                is_nullable
+            FROM information_schema.columns
+            WHERE table_name = $1
+            ORDER BY ordinal_position
+        "#;
 
-    let rows = pool
-        .fetch_all_with_bind(query, table_name)
-        .await
-        .context("Failed to query table schema")?;
+        pool.fetch_all_with_bind(query, table_name)
+            .await
+            .context("Failed to query table schema")?
+    } else {
+        // For SQLite, use PRAGMA table_info
+        #[cfg(test)]
+        {
+            query_sqlite_table_schema(pool, table_name)
+                .await
+                .context("Failed to query table schema")?
+        }
+        #[cfg(not(test))]
+        {
+            anyhow::bail!("Non-Postgres databases are only supported in tests");
+        }
+    };
 
     if rows.is_empty() {
         anyhow::bail!("Table '{}' not found or has no columns", table_name);

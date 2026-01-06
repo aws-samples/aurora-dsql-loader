@@ -51,10 +51,11 @@ mod tests {
     async fn setup_sqlite_table(table_name: &str, columns: &str) -> Pool {
         let pool = Pool::sqlite_in_memory().await.unwrap();
         if let Ok(mut conn) = pool.acquire().await
-            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
-                let sql = format!("CREATE TABLE {} ({})", table_name, columns);
-                sqlx::query(&sql).execute(&mut **sqlite_conn).await.unwrap();
-            }
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let sql = format!("CREATE TABLE {} ({})", table_name, columns);
+            sqlx::query(&sql).execute(&mut **sqlite_conn).await.unwrap();
+        }
         pool
     }
 
@@ -107,14 +108,15 @@ mod tests {
     /// Helper to query table row count
     async fn get_table_count(pool: &Pool, table_name: &str) -> i64 {
         if let Ok(mut conn) = pool.acquire().await
-            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
-                let sql = format!("SELECT COUNT(*) FROM {}", table_name);
-                let (count,): (i64,) = sqlx::query_as(&sql)
-                    .fetch_one(&mut **sqlite_conn)
-                    .await
-                    .unwrap();
-                return count;
-            }
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let sql = format!("SELECT COUNT(*) FROM {}", table_name);
+            let (count,): (i64,) = sqlx::query_as(&sql)
+                .fetch_one(&mut **sqlite_conn)
+                .await
+                .unwrap();
+            return count;
+        }
         0
     }
 
@@ -217,13 +219,14 @@ mod tests {
 
         // Manually create the SQLite table with correct types
         if let Ok(mut conn) = pool.acquire().await
-            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
-                let create_table_sql = "CREATE TABLE test_parquet (id INTEGER, name TEXT, value REAL)";
-                sqlx::query(create_table_sql)
-                    .execute(&mut **sqlite_conn)
-                    .await
-                    .unwrap();
-            }
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let create_table_sql = "CREATE TABLE test_parquet (id INTEGER, name TEXT, value REAL)";
+            sqlx::query(create_table_sql)
+                .execute(&mut **sqlite_conn)
+                .await
+                .unwrap();
+        }
 
         let byte_reader = LocalFileByteReader::new(&parquet_path_str);
         let parquet_reader = GenericParquetReader::new(byte_reader).await.unwrap();
@@ -299,15 +302,16 @@ mod tests {
 
         // Verify first occurrence of duplicate key is kept
         if let Ok(mut conn) = pool.acquire().await
-            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
-                let row: (i64, String, i64) =
-                    sqlx::query_as("SELECT id, name, value FROM test_unique WHERE id = 1")
-                        .fetch_one(&mut **sqlite_conn)
-                        .await
-                        .unwrap();
-                assert_eq!(row.1, "first", "First record should be kept");
-                assert_eq!(row.2, 100, "First value should be kept");
-            }
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let row: (i64, String, i64) =
+                sqlx::query_as("SELECT id, name, value FROM test_unique WHERE id = 1")
+                    .fetch_one(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            assert_eq!(row.1, "first", "First record should be kept");
+            assert_eq!(row.2, 100, "First value should be kept");
+        }
     }
 
     #[tokio::test]
@@ -341,22 +345,23 @@ mod tests {
 
         // Verify data format is preserved and queryable
         if let Ok(mut conn) = pool.acquire().await
-            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
-                let row1: (String, String) =
-                    sqlx::query_as("SELECT iso_date, timestamp_space FROM test_datetime WHERE id = 1")
-                        .fetch_one(&mut **sqlite_conn)
-                        .await
-                        .unwrap();
-                assert_eq!(row1.0, "2024-01-15");
-                assert_eq!(row1.1, "2024-01-15 10:30:00");
-
-                // Verify leap year date loaded correctly
-                let leap: (String,) = sqlx::query_as("SELECT iso_date FROM test_datetime WHERE id = 2")
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let row1: (String, String) =
+                sqlx::query_as("SELECT iso_date, timestamp_space FROM test_datetime WHERE id = 1")
                     .fetch_one(&mut **sqlite_conn)
                     .await
                     .unwrap();
-                assert_eq!(leap.0, "2024-02-29");
-            }
+            assert_eq!(row1.0, "2024-01-15");
+            assert_eq!(row1.1, "2024-01-15 10:30:00");
+
+            // Verify leap year date loaded correctly
+            let leap: (String,) = sqlx::query_as("SELECT iso_date FROM test_datetime WHERE id = 2")
+                .fetch_one(&mut **sqlite_conn)
+                .await
+                .unwrap();
+            assert_eq!(leap.0, "2024-02-29");
+        }
     }
 
     // ============ Runner API Tests ============
@@ -444,14 +449,15 @@ mod tests {
         // Set up SQLite pool and table
         let pool = Pool::sqlite_in_memory().await.unwrap();
         if let Ok(mut conn) = pool.acquire().await
-            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
-                let create_table_sql =
-                    "CREATE TABLE runner_parquet (id INTEGER, name TEXT, value REAL)";
-                sqlx::query(create_table_sql)
-                    .execute(&mut **sqlite_conn)
-                    .await
-                    .unwrap();
-            }
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let create_table_sql =
+                "CREATE TABLE runner_parquet (id INTEGER, name TEXT, value REAL)";
+            sqlx::query(create_table_sql)
+                .execute(&mut **sqlite_conn)
+                .await
+                .unwrap();
+        }
 
         let parquet_path_str = parquet_path.to_str().unwrap().to_string();
 
@@ -483,6 +489,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_table_does_not_exist_error() {
+        // This test verifies that:
+        // 1. When a table doesn't exist and --if-not-exists is not set, the loader fails immediately
+        // 2. The error message provides a helpful hint to use --if-not-exists
+
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "test.csv", 10).await;
+
+        // Create a pool but DO NOT create the table
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::default(),
+        ));
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool,
+        );
+
+        let config = LoadConfig {
+            source_uri: csv_path.to_string(),
+            target_table: "nonexistent_table".to_string(),
+            dsql_config: DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            },
+            worker_count: 1,
+            partition_size_bytes: 1000,
+            batch_size: 10,
+            batch_concurrency: 1,
+            create_table_if_missing: false, // This is the key - not creating the table
+            file_format: FileFormat::Csv(DelimitedConfig::csv()),
+            column_mappings: std::collections::HashMap::new(),
+            quiet: true,
+        };
+
+        // Attempt to run the load and expect it to fail
+        let result = coordinator.run_load(config).await;
+
+        assert!(result.is_err(), "Load should fail when table doesn't exist");
+
+        let error = result.unwrap_err();
+        let error_msg = error.to_string();
+
+        // Verify error message contains the table name
+        assert!(
+            error_msg.contains("nonexistent_table"),
+            "Error should mention the table name. Got: {}",
+            error_msg
+        );
+
+        // Verify error message contains the helpful hint
+        assert!(
+            error_msg.contains("--if-not-exists"),
+            "Error should suggest using --if-not-exists flag. Got: {}",
+            error_msg
+        );
+
+        // Verify the error message indicates the table doesn't exist
+        assert!(
+            error_msg.contains("does not exist") || error_msg.contains("not found"),
+            "Error should clearly state the table doesn't exist. Got: {}",
+            error_msg
+        );
+    }
+
+    #[tokio::test]
     async fn test_failed_record_error_reporting() {
         // This test verifies that:
         // 1. Failed records are tracked accurately
@@ -491,23 +574,26 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
 
-        // Create CSV with 4 columns
+        // Create table with CHECK constraint that will cause failures
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        if let Ok(mut conn) = pool.acquire().await
+            && let crate::db::pool::PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            // Create table with CHECK constraint requiring value > 0
+            let sql = "CREATE TABLE test_check_constraint (id INTEGER, name TEXT, value INTEGER CHECK(value > 0))";
+            sqlx::query(sql).execute(&mut **sqlite_conn).await.unwrap();
+        }
+
+        // Create CSV with values that violate the CHECK constraint
         let csv_path = create_csv_with_content(
             &temp_dir,
-            "extra_columns.csv",
+            "invalid_values.csv",
             &[
-                "id,name,value,extra\n",
-                "1,Alice,100,foo\n",
-                "2,Bob,200,bar\n",
-                "3,Charlie,300,baz\n",
+                "id,name,value\n",
+                "1,Alice,-10\n",   // Negative value violates CHECK
+                "2,Bob,-20\n",     // Negative value violates CHECK
+                "3,Charlie,-30\n", // Negative value violates CHECK
             ],
-        )
-        .await;
-
-        // Create table with only 3 columns - mismatch will cause failure
-        let pool = setup_sqlite_table(
-            "test_column_mismatch",
-            "id INTEGER, name TEXT, value INTEGER",
         )
         .await;
 
@@ -530,7 +616,7 @@ mod tests {
 
         let config = LoadConfig {
             source_uri: csv_path.to_string(),
-            target_table: "test_column_mismatch".to_string(),
+            target_table: "test_check_constraint".to_string(),
             dsql_config: DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
@@ -560,7 +646,7 @@ mod tests {
         );
 
         // Verify no data was actually inserted
-        assert_eq!(get_table_count(&pool, "test_column_mismatch").await, 0);
+        assert_eq!(get_table_count(&pool, "test_check_constraint").await, 0);
 
         // Verify partition result contains detailed error information
         let partition_result = &result.partition_results[0];

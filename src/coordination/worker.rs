@@ -357,7 +357,9 @@ impl Worker {
                     if use_pg_cast {
                         if let Some(s) = schema {
                             if let Some(col) = s.columns.get(col_idx) {
-                                if TypeCategory::from_sql_type(&col.col_type) == TypeCategory::StringCast {
+                                if TypeCategory::from_sql_type(&col.col_type)
+                                    == TypeCategory::StringCast
+                                {
                                     format!("CAST({} AS {})", placeholder, col.col_type)
                                 } else {
                                     placeholder
