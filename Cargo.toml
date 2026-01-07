@@ -1,9 +1,8 @@
 [package]
 name = "aurora-dsql-loader"
-version = "2.0.0"
+version = "1.0.0"
 edition = "2024"
-authors = ["Amazon Web Services"]
-description = "A high-performance data loader for Aurora DSQL with support for CSV, TSV, and Parquet files"
+description = "A data loader for Aurora DSQL with support for CSV, TSV, and Parquet files"
 homepage = "https://github.com/aws-samples/aurora-dsql-loader"
 repository = "https://github.com/aws-samples/aurora-dsql-loader"
 license = "MIT-0"

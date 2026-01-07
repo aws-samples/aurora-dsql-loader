@@ -2,7 +2,7 @@
 
 Fast, parallel data loader for Aurora DSQL. Load CSV, TSV, and Parquet files into DSQL with automatic schema detection and progress tracking.
 
-> **Version 2.0**: Migrating from Python v1? See [CHANGELOG.md](CHANGELOG.md).
+> Migrating from Python v1? See [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick Start
 
