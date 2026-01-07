@@ -189,7 +189,7 @@ impl Worker {
             .await
             .context("Failed to read partition data")?;
 
-        // Split partition into batches
+        // Split partition into batches with line offset tracking
         let batches: Vec<Vec<Record>> = partition_data
             .records
             .chunks(self.batch_size)
@@ -206,6 +206,10 @@ impl Worker {
         // Process batches in parallel with JoinSet for concurrency control
         let mut join_set: JoinSet<BatchResult> = JoinSet::new();
         let mut results = Vec::new();
+
+        // Track line numbers: partition records start at line 1, +1 if file has header (to skip header line)
+        let has_header = matches!(manifest.file_format, crate::coordination::manifest::FileFormat::Csv(_) | crate::coordination::manifest::FileFormat::Tsv(_));
+        let mut current_line = if has_header { 2u64 } else { 1u64 };
 
         for batch in batches {
             // Wait if we've reached concurrency limit
@@ -226,10 +230,14 @@ impl Worker {
             let table_name = manifest.table.name.clone();
             let schema = manifest.table.schema.clone();
             let has_unique_constraints = manifest.table.has_unique_constraints;
+            let line_offset = current_line;
+            let batch_len = batch.len() as u64;
 
             join_set.spawn(async move {
-                Self::load_batch(&pool, &table_name, &batch, &schema, has_unique_constraints).await
+                Self::load_batch(&pool, &table_name, &batch, &schema, has_unique_constraints, line_offset).await
             });
+
+            current_line += batch_len;
         }
 
         // Wait for remaining tasks
@@ -309,6 +317,7 @@ impl Worker {
         records: &[Record],
         schema: &Option<super::manifest::SchemaJson>,
         has_unique_constraints: bool,
+        line_offset: u64,
     ) -> BatchResult {
         // Check if we're using PostgreSQL (CAST needed) or SQLite (CAST causes issues)
         let use_pg_cast = pool.is_postgres();
@@ -425,13 +434,20 @@ impl Worker {
                     })
                     .unwrap_or_else(|| "<empty>".to_string());
 
+                // Extract just the database error message (root cause)
+                let db_error = e
+                    .source()
+                    .and_then(|s| s.source())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| e.to_string());
+
                 let error_message = format!(
-                    "Batch insert execution failed: {}\n\
+                    "Database error: {}\n\
                      \n\
                      Batch context:\n\
                      - Batch size: {} records\n\
                      - First record sample: {}",
-                    e,
+                    db_error,
                     records.len(),
                     first_record_sample
                 );
@@ -441,7 +457,7 @@ impl Worker {
                     records_loaded: 0,
                     records_failed: records.len() as u64,
                     errors: vec![ErrorRecord {
-                        line_number: 0,
+                        line_number: line_offset,
                         error_type: "batch_error".to_string(),
                         error_message,
                     }],

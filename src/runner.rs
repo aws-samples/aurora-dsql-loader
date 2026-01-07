@@ -92,6 +92,8 @@ pub struct LoadResult {
     pub records_loaded: u64,
     pub records_failed: u64,
     pub duration: Duration,
+    /// Path to persisted manifest directory (if errors occurred and temp dir was used)
+    pub persisted_manifest_dir: Option<PathBuf>,
 }
 
 /// Run a data load operation with the specified arguments
@@ -134,7 +136,7 @@ pub struct LoadResult {
 /// ```
 pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     // Set up manifest directory (use temp dir if not provided)
-    let (_temp_dir, manifest_dir_path) = if let Some(dir) = args.manifest_dir {
+    let (mut temp_dir, manifest_dir_path) = if let Some(dir) = args.manifest_dir {
         (None, dir)
     } else {
         let temp_dir = TempDir::new()?;
@@ -218,6 +220,15 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     // Run the load
     let result = coordinator.run_load(load_config).await?;
 
+    // If there were errors and we used a temp directory, persist it for debugging
+    let persisted_manifest_dir = if result.records_failed > 0 && temp_dir.is_some() {
+        let temp = temp_dir.take().unwrap();
+        let persisted_path = temp.keep();
+        Some(persisted_path)
+    } else {
+        None
+    };
+
     // Convert to public LoadResult type
     Ok(LoadResult {
         job_id: result.job_id,
@@ -225,5 +236,6 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         records_loaded: result.records_loaded,
         records_failed: result.records_failed,
         duration: result.duration,
+        persisted_manifest_dir,
     })
 }

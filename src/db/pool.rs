@@ -71,7 +71,7 @@ pub struct PoolArgs {
     region: Region,
     #[builder(setter(into))]
     username: String,
-    #[builder(default = "2000")]
+    #[builder(default = "100")]
     min_idle: u32,
     #[builder(default = "5000")]
     max_pool_size: u32,

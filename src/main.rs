@@ -268,6 +268,19 @@ async fn run_loader(
         result.records_loaded as f64 / result.duration.as_secs_f64()
     );
 
+    // If errors occurred and manifest was persisted, tell the user where to find them
+    if let Some(ref persisted_path) = result.persisted_manifest_dir {
+        println!();
+        println!("Errors detected! Manifest directory has been preserved for debugging:");
+        println!("  {}", persisted_path.display());
+        println!();
+        println!("To inspect errors:");
+        println!("  # View all partition results");
+        println!("  ls {}/jobs/{}/partitions/", persisted_path.display(), result.job_id);
+        println!("  # View errors from a specific partition");
+        println!("  cat {}/jobs/{}/partitions/0000.result", persisted_path.display(), result.job_id);
+    }
+
     // Note: To keep manifest directory, use --manifest-dir to specify a persistent location
     if keep_manifest && manifest_dir.is_none() {
         println!();

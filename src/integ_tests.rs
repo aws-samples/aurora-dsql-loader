@@ -566,6 +566,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_manifest_persisted_on_errors() {
+        // This test verifies that when errors occur and no manifest_dir is specified,
+        // the temp directory is persisted for debugging
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create table with CHECK constraint that will cause failures
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        if let Ok(mut conn) = pool.acquire().await
+            && let crate::db::pool::PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let sql = "CREATE TABLE test_persist_manifest (id INTEGER, value INTEGER CHECK(value > 0))";
+            sqlx::query(sql).execute(&mut **sqlite_conn).await.unwrap();
+        }
+
+        // Create CSV with values that will fail
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "invalid.csv",
+            &[
+                "id,value\n",
+                "1,-100\n", // Violates CHECK constraint
+            ],
+        )
+        .await;
+
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path,
+            target_table: "test_persist_manifest".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            partition_size_bytes: 1000,
+            batch_size: 10,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None, // Don't specify manifest dir - this is key
+            quiet: true,
+            column_mappings: std::collections::HashMap::new(),
+            test_pool: Some(pool),
+        };
+
+        let result = crate::runner::run_load(args).await.unwrap();
+
+        // Verify errors occurred
+        assert!(result.records_failed > 0, "Should have failed records");
+
+        // Verify manifest directory was persisted
+        assert!(
+            result.persisted_manifest_dir.is_some(),
+            "Manifest directory should be persisted when errors occur"
+        );
+
+        let manifest_path = result.persisted_manifest_dir.as_ref().unwrap();
+
+        // Verify the directory exists
+        assert!(
+            manifest_path.exists(),
+            "Persisted manifest directory should exist: {:?}",
+            manifest_path
+        );
+
+        // Verify we can read the manifest file
+        let manifest_file = manifest_path.join("jobs").join(&result.job_id).join("manifest.json");
+        assert!(
+            manifest_file.exists(),
+            "Manifest file should exist: {:?}",
+            manifest_file
+        );
+
+        // Verify we can read partition result files with errors
+        let partition_result_file = manifest_path
+            .join("jobs")
+            .join(&result.job_id)
+            .join("partitions")
+            .join("0000.result");
+        assert!(
+            partition_result_file.exists(),
+            "Partition result file should exist: {:?}",
+            partition_result_file
+        );
+
+        // Read and verify the result file contains error information
+        let result_content = std::fs::read_to_string(&partition_result_file).unwrap();
+        let result_json: serde_json::Value = serde_json::from_str(&result_content).unwrap();
+
+        assert!(
+            result_json["errors"].as_array().is_some(),
+            "Result should contain errors array"
+        );
+        assert!(
+            !result_json["errors"].as_array().unwrap().is_empty(),
+            "Errors array should not be empty"
+        );
+        assert_eq!(
+            result_json["status"].as_str().unwrap(),
+            "failed",
+            "Status should be 'failed'"
+        );
+
+        // Clean up the persisted directory
+        std::fs::remove_dir_all(manifest_path).unwrap();
+    }
+
+    #[tokio::test]
     async fn test_failed_record_error_reporting() {
         // This test verifies that:
         // 1. Failed records are tracked accurately
