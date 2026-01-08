@@ -8,7 +8,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::manifest::{
-    DsqlConfig, FileFormat, ManifestFile, ManifestStorage, PartitionInfo, PartitionResultFile,
+    ChunkInfo, ChunkResultFile, DsqlConfig, FileFormat, ManifestFile, ManifestStorage,
 };
 use super::worker::Worker;
 use crate::db::{Pool, SchemaInferrer};
@@ -30,7 +30,7 @@ pub struct LoadConfig {
     pub schema: String,
     pub dsql_config: DsqlConfig,
     pub worker_count: usize,
-    pub partition_size_bytes: u64,
+    pub chunk_size_bytes: u64,
     pub batch_size: usize,
     pub batch_concurrency: usize,
     pub create_table_if_missing: bool,
@@ -43,13 +43,13 @@ pub struct LoadConfig {
 #[derive(Debug)]
 pub struct LoadResult {
     pub job_id: String,
-    pub partitions_processed: usize,
+    pub chunks_processed: usize,
     pub records_loaded: u64,
     pub records_failed: u64,
     pub duration: Duration,
-    /// Detailed results for each partition (accessed in integration tests)
+    /// Detailed results for each chunk (accessed in integration tests)
     #[cfg_attr(not(test), allow(dead_code))]
-    pub partition_results: Vec<PartitionResultFile>,
+    pub chunk_results: Vec<ChunkResultFile>,
 }
 
 /// The Coordinator orchestrates the data load process.
@@ -80,11 +80,11 @@ impl Coordinator {
     ///
     /// This method orchestrates the entire load process:
     /// 1. Generate unique job ID
-    /// 2. Create partitions from the source file
+    /// 2. Create chunks from the source file
     /// 3. Optionally infer schema from sample data
     /// 4. Optionally create the target table
     /// 5. Write manifest file
-    /// 6. Spawn worker tasks to process partitions
+    /// 6. Spawn worker tasks to process chunks
     /// 7. Wait for completion and aggregate results
     pub async fn run_load(&self, config: LoadConfig) -> Result<LoadResult> {
         let start_time = Instant::now();
@@ -96,13 +96,13 @@ impl Coordinator {
         // Validate that the schema exists before starting
         crate::db::schema::validate_schema_exists(&self.pool, &config.schema).await?;
 
-        // 2. Create partitions
-        let (file_metadata, partitions) = self
-            .create_file_partitions(config.partition_size_bytes)
-            .await?;
+        // 2. Create chunks
+        let (file_metadata, chunks) = self.create_file_chunks(config.chunk_size_bytes).await?;
 
         // 3. Resolve schema (infer or query)
-        let mut schema = self.resolve_table_schema(&config, &partitions).await?;
+        let mut schema = self
+            .resolve_table_schema(&config, &chunks)
+            .await?;
 
         // Apply column mappings to schema if provided
         Self::apply_column_mappings(&mut schema, &config.column_mappings);
@@ -115,7 +115,7 @@ impl Coordinator {
             &job_id,
             &config,
             &file_metadata,
-            &partitions,
+            &chunks,
             schema,
             table_created,
         )
@@ -130,7 +130,7 @@ impl Coordinator {
 
         // 7. Setup progress tracking
         let prog_jh =
-            Self::setup_progress_tracking(&config, &file_metadata, &partitions, telemetry_rx);
+            Self::setup_progress_tracking(&config, &file_metadata, &chunks, telemetry_rx);
 
         // 8. Wait for all workers to complete
         let worker_results = futures::future::join_all(worker_handles).await;
@@ -154,29 +154,25 @@ impl Coordinator {
         }
 
         // 9. Aggregate results
-        self.aggregate_final_results(&job_id, &partitions, start_time)
+        self.aggregate_final_results(&job_id, &chunks, start_time)
             .await
     }
 
-    /// Collect all partition results from manifest storage
+    /// Collect all chunk results from manifest storage
     async fn collect_results(
         &self,
         job_id: &str,
-        partition_count: usize,
-    ) -> Result<Vec<PartitionResultFile>> {
+        chunk_count: usize,
+    ) -> Result<Vec<ChunkResultFile>> {
         let mut results = Vec::new();
 
-        for partition_id in 0..partition_count as u32 {
-            match self
-                .manifest_storage
-                .read_result(job_id, partition_id)
-                .await
-            {
+        for chunk_id in 0..chunk_count as u32 {
+            match self.manifest_storage.read_result(job_id, chunk_id).await {
                 Ok(result) => results.push(result),
                 Err(_) => {
-                    // Partition result may be missing if worker crashed before writing result file
+                    // Chunk result may be missing if worker crashed before writing result file
                     // This is tracked in failure metrics and doesn't require hard failure
-                    tracing::warn!("Partition {partition_id} result missing");
+                    tracing::warn!("Chunk {chunk_id} result missing");
                 }
             }
         }
@@ -184,17 +180,17 @@ impl Coordinator {
         Ok(results)
     }
 
-    /// Create partitions from the source file and return metadata
-    async fn create_file_partitions(
+    /// Create chunks from the source file and return metadata
+    async fn create_file_chunks(
         &self,
-        partition_size_bytes: u64,
+        chunk_size_bytes: u64,
     ) -> Result<(
         crate::formats::reader::FileMetadata,
-        Vec<crate::formats::reader::Partition>,
+        Vec<crate::formats::reader::Chunk>,
     )> {
         info!(
-            "Creating partitions with target size: {} bytes",
-            partition_size_bytes
+            "Creating chunks with target size: {} bytes",
+            chunk_size_bytes
         );
 
         let file_metadata = self
@@ -203,50 +199,50 @@ impl Coordinator {
             .await
             .context("Failed to get file metadata")?;
 
-        let partitions = self
+        let chunks = self
             .file_reader
-            .create_partitions(partition_size_bytes)
+            .create_chunks(chunk_size_bytes)
             .await
-            .context("Failed to create partitions")?;
+            .context("Failed to create chunks")?;
 
         info!(
-            "Created {} partitions for file of {} bytes (estimated {} rows)",
-            partitions.len(),
+            "Created {} chunks for file of {} bytes (estimated {} rows)",
+            chunks.len(),
             file_metadata.file_size_bytes,
             file_metadata.estimated_rows.unwrap_or(0)
         );
 
-        Ok((file_metadata, partitions))
+        Ok((file_metadata, chunks))
     }
 
     /// Resolve the table schema: either infer from data or query existing table
     async fn resolve_table_schema(
         &self,
         config: &LoadConfig,
-        partitions: &[crate::formats::reader::Partition],
+        chunks: &[crate::formats::reader::Chunk],
     ) -> Result<Option<crate::db::schema::Schema>> {
         if config.create_table_if_missing {
             info!("Inferring schema from sample data...");
 
             // For schema inference, we need to read from the beginning of the file
-            // including the header, not from partition 0 (which starts after the header)
-            let first_partition = partitions
+            // including the header, not from chunk 0 (which starts after the header)
+            let first_chunk = chunks
                 .first()
-                .context("No partitions available for schema inference")?;
+                .context("No chunks available for schema inference")?;
 
             // Cap the sample size to avoid reading massive files
-            let end_offset = first_partition.end_offset.min(MAX_SCHEMA_INFERENCE_BYTES);
+            let end_offset = first_chunk.end_offset.min(MAX_SCHEMA_INFERENCE_BYTES);
 
-            let sample_partition = crate::formats::reader::Partition {
-                partition_id: 0,
+            let sample_chunk = crate::formats::reader::Chunk {
+                chunk_id: 0,
                 start_offset: 0,
                 end_offset,
-                estimated_rows: first_partition.estimated_rows,
+                estimated_rows: first_chunk.estimated_rows,
             };
 
             let sample_data = self
                 .file_reader
-                .read_partition(&sample_partition)
+                .read_chunk(&sample_chunk)
                 .await
                 .context("Failed to read sample data for schema inference")?;
 
@@ -356,7 +352,7 @@ impl Coordinator {
         job_id: &str,
         config: &LoadConfig,
         file_metadata: &crate::formats::reader::FileMetadata,
-        partitions: &[crate::formats::reader::Partition],
+        chunks: &[crate::formats::reader::Chunk],
         schema: Option<crate::db::schema::Schema>,
         table_created: bool,
     ) -> Result<()> {
@@ -373,11 +369,11 @@ impl Coordinator {
         }
 
         // Build manifest
-        let partition_infos: Vec<PartitionInfo> = partitions
+        let chunk_infos: Vec<ChunkInfo> = chunks
             .iter()
             .enumerate()
-            .map(|(idx, p)| PartitionInfo {
-                partition_id: idx as u32,
+            .map(|(idx, p)| ChunkInfo {
+                chunk_id: idx as u32,
                 start_offset: p.start_offset,
                 end_offset: p.end_offset,
                 estimated_rows: p.estimated_rows,
@@ -402,7 +398,7 @@ impl Coordinator {
             total_size_bytes: file_metadata.file_size_bytes,
             estimated_rows: file_metadata.estimated_rows,
             batch_size: config.batch_size,
-            partitions: partition_infos,
+            chunks: chunk_infos,
         };
 
         self.manifest_storage
@@ -414,7 +410,7 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Spawn worker tasks to process partitions
+    /// Spawn worker tasks to process chunks
     fn spawn_worker_pool(
         &self,
         job_id: &str,
@@ -448,7 +444,7 @@ impl Coordinator {
     fn setup_progress_tracking(
         config: &LoadConfig,
         file_metadata: &crate::formats::reader::FileMetadata,
-        partitions: &[crate::formats::reader::Partition],
+        chunks: &[crate::formats::reader::Chunk],
         mut telemetry_rx: mpsc::UnboundedReceiver<TelemetryEvent>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         if config.quiet {
@@ -457,14 +453,14 @@ impl Coordinator {
 
         // Create progress bars with MultiProgress
         let multi_progress = MultiProgress::new();
-        let total_partitions = partitions.len() as u64;
+        let total_chunks = chunks.len() as u64;
         let estimated_total_rows = file_metadata.estimated_rows.unwrap_or(0);
 
-        let partition_bar = multi_progress.add(ProgressBar::new(total_partitions));
-        partition_bar.set_style(
+        let chunk_bar = multi_progress.add(ProgressBar::new(total_chunks));
+        chunk_bar.set_style(
             ProgressStyle::default_bar()
                 .template(
-                    "[{elapsed_precise}] Partitions: [{bar:30.cyan/blue}] {pos}/{len} ({percent}%)",
+                    "[{elapsed_precise}] Chunks: [{bar:30.cyan/blue}] {pos}/{len} ({percent}%)",
                 )
                 .unwrap()
                 .progress_chars("=>-"),
@@ -506,7 +502,7 @@ impl Coordinator {
                 stats.update(&event);
 
                 // Update progress bars
-                partition_bar.set_position(stats.partitions_completed as u64);
+                chunk_bar.set_position(stats.chunks_completed as u64);
                 if let Some(ref bar) = rows_bar {
                     bar.set_position(stats.records_loaded);
                 }
@@ -521,7 +517,7 @@ impl Coordinator {
             }
 
             // Finish progress bars
-            partition_bar.finish_with_message("All partitions completed");
+            chunk_bar.finish_with_message("All chunks completed");
             if let Some(bar) = rows_bar {
                 bar.finish();
             }
@@ -538,26 +534,26 @@ impl Coordinator {
         }))
     }
 
-    /// Aggregate the final results from all partition result files
+    /// Aggregate the final results from all chunk result files
     async fn aggregate_final_results(
         &self,
         job_id: &str,
-        partitions: &[crate::formats::reader::Partition],
+        chunks: &[crate::formats::reader::Chunk],
         start_time: Instant,
     ) -> Result<LoadResult> {
         info!("Aggregating results...");
-        let partition_results = self
-            .collect_results(job_id, partitions.len())
+        let chunk_results = self
+            .collect_results(job_id, chunks.len())
             .await
             .context("Failed to collect results")?;
 
-        let total_records_loaded: u64 = partition_results.iter().map(|r| r.records_loaded).sum();
-        let total_records_failed: u64 = partition_results.iter().map(|r| r.records_failed).sum();
+        let total_records_loaded: u64 = chunk_results.iter().map(|r| r.records_loaded).sum();
+        let total_records_failed: u64 = chunk_results.iter().map(|r| r.records_failed).sum();
         let duration = start_time.elapsed();
 
         info!(
-            "Load complete: {} partitions, {} records loaded, {} records failed in {:.2}s",
-            partition_results.len(),
+            "Load complete: {} chunks, {} records loaded, {} records failed in {:.2}s",
+            chunk_results.len(),
             total_records_loaded,
             total_records_failed,
             duration.as_secs_f64()
@@ -565,11 +561,11 @@ impl Coordinator {
 
         Ok(LoadResult {
             job_id: job_id.to_string(),
-            partitions_processed: partition_results.len(),
+            chunks_processed: chunk_results.len(),
             records_loaded: total_records_loaded,
             records_failed: total_records_failed,
             duration,
-            partition_results,
+            chunk_results,
         })
     }
 }

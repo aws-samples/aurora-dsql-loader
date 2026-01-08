@@ -1,13 +1,11 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
-use crate::formats::reader::{
-    DelimitedConfig, FileMetadata, FileReader, Partition, PartitionData, Record,
-};
+use crate::formats::reader::{Chunk, ChunkData, DelimitedConfig, FileMetadata, FileReader, Record};
 use crate::io::{ByteReader, estimate_rows_in_range, find_next_record_boundary};
 
 /// Generic delimited file reader that works with any ByteReader implementation
-/// This provides the common partitioning and parsing logic for CSV, TSV, etc.
+/// This provides the common chunking and parsing logic for CSV, TSV, etc.
 pub struct GenericDelimitedReader<R: ByteReader> {
     reader: R,
     config: DelimitedConfig,
@@ -37,7 +35,7 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
         })
     }
 
-    async fn create_partitions(&self, target_size: u64) -> Result<Vec<Partition>> {
+    async fn create_chunks(&self, target_size: u64) -> Result<Vec<Chunk>> {
         let metadata = self.metadata().await?;
         let file_size = metadata.file_size_bytes;
 
@@ -45,9 +43,9 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
             return Ok(vec![]);
         }
 
-        let mut partitions = Vec::new();
+        let mut chunks = Vec::new();
         let mut current_offset = 0u64;
-        let mut partition_id = 0u32;
+        let mut chunk_id = 0u32;
 
         // Skip header if present
         if self.config.has_header {
@@ -64,31 +62,31 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
                 find_next_record_boundary(&self.reader, target_end).await?
             };
 
-            // Estimate rows for this partition
+            // Estimate rows for this chunk
             let estimated_rows =
                 estimate_rows_in_range(&self.reader, current_offset, actual_end).await?;
 
-            partitions.push(Partition {
-                partition_id,
+            chunks.push(Chunk {
+                chunk_id,
                 start_offset: current_offset,
                 end_offset: actual_end,
                 estimated_rows,
             });
 
             current_offset = actual_end;
-            partition_id += 1;
+            chunk_id += 1;
         }
 
-        Ok(partitions)
+        Ok(chunks)
     }
 
-    async fn read_partition(&self, partition: &Partition) -> Result<PartitionData> {
-        // Read the partition data
+    async fn read_chunk(&self, chunk: &Chunk) -> Result<ChunkData> {
+        // Read the chunk data
         let buffer = self
             .reader
-            .read_range(partition.start_offset, partition.end_offset)
+            .read_range(chunk.start_offset, chunk.end_offset)
             .await
-            .context("Failed to read partition data")?;
+            .context("Failed to read chunk data")?;
 
         // Parse the CSV data
         let mut csv_reader = csv::ReaderBuilder::new()
@@ -107,9 +105,9 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
             });
         }
 
-        Ok(PartitionData {
+        Ok(ChunkData {
             records,
-            bytes_read: partition.end_offset - partition.start_offset,
+            bytes_read: chunk.end_offset - chunk.start_offset,
         })
     }
 }

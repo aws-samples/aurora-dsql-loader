@@ -65,7 +65,7 @@ mod tests {
         table_name: &str,
         csv_path: &str,
         worker_count: usize,
-        partition_size: u64,
+        chunk_size: u64,
     ) -> LoadResult {
         let byte_reader = LocalFileByteReader::new(csv_path);
         let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
@@ -94,7 +94,7 @@ mod tests {
                 username: "test".to_string(),
             },
             worker_count,
-            partition_size_bytes: partition_size,
+            chunk_size_bytes: chunk_size,
             batch_size: 10,
             batch_concurrency: 2,
             create_table_if_missing: true,
@@ -132,13 +132,13 @@ mod tests {
 
         let result = run_csv_load(&pool, "test_table", &csv_path, 1, 1000).await;
 
-        assert!(result.partitions_processed > 0);
+        assert!(result.chunks_processed > 0);
         assert_eq!(result.records_loaded, 100);
         assert_eq!(result.records_failed, 0);
     }
 
     #[tokio::test]
-    async fn test_multiple_workers_and_partition_distribution() {
+    async fn test_multiple_workers_and_chunk_distribution() {
         let temp_dir = TempDir::new().unwrap();
         let csv_path = create_test_csv(&temp_dir, "test.csv", 500).await;
         let pool =
@@ -147,18 +147,15 @@ mod tests {
         let result = run_csv_load(&pool, "test_table", &csv_path, 4, 800).await;
 
         assert!(
-            result.partitions_processed > 1,
-            "Should create multiple partitions"
+            result.chunks_processed > 1,
+            "Should create multiple chunks"
         );
         assert_eq!(result.records_loaded, 500);
         assert_eq!(result.records_failed, 0);
 
         // Verify work was distributed across multiple workers
-        let unique_workers: std::collections::HashSet<_> = result
-            .partition_results
-            .iter()
-            .map(|r| &r.worker_id)
-            .collect();
+        let unique_workers: std::collections::HashSet<_> =
+            result.chunk_results.iter().map(|r| &r.worker_id).collect();
         assert!(
             unique_workers.len() >= 2,
             "Expected at least 2 workers, got {}",
@@ -251,7 +248,7 @@ mod tests {
                 username: "test".to_string(),
             },
             worker_count: 2,
-            partition_size_bytes: 500,
+            chunk_size_bytes: 500,
             batch_size: 20,
             batch_concurrency: 2,
             create_table_if_missing: false, // Table already created
@@ -263,7 +260,7 @@ mod tests {
         let result = coordinator.run_load(config).await.unwrap();
 
         // Verify results
-        assert!(result.partitions_processed > 0);
+        assert!(result.chunks_processed > 0);
         assert_eq!(result.records_loaded, 100);
         assert_eq!(result.records_failed, 0);
     }
@@ -391,7 +388,7 @@ mod tests {
             schema: "public".to_string(),
             format: Format::Csv,
             worker_count: 2,
-            partition_size_bytes: 1000,
+            chunk_size_bytes: 1000,
             batch_size: 10,
             batch_concurrency: 2,
             create_table_if_missing: false, // Table already created
@@ -403,7 +400,7 @@ mod tests {
 
         let result = crate::runner::run_load(args).await.unwrap();
 
-        assert!(result.partitions_processed > 0);
+        assert!(result.chunks_processed > 0);
         assert_eq!(result.records_loaded, 100);
         assert_eq!(result.records_failed, 0);
         assert_eq!(get_table_count(&pool, "runner_test_table").await, 100);
@@ -477,7 +474,7 @@ mod tests {
             schema: "public".to_string(),
             format: Format::Parquet,
             worker_count: 2,
-            partition_size_bytes: 500,
+            chunk_size_bytes: 500,
             batch_size: 20,
             batch_concurrency: 2,
             create_table_if_missing: false,
@@ -490,7 +487,7 @@ mod tests {
         let result = crate::runner::run_load(args).await.unwrap();
 
         // Verify results
-        assert!(result.partitions_processed > 0);
+        assert!(result.chunks_processed > 0);
         assert_eq!(result.records_loaded, 50);
         assert_eq!(result.records_failed, 0);
         assert_eq!(get_table_count(&pool, "runner_parquet").await, 50);
@@ -535,7 +532,7 @@ mod tests {
                 username: "test".to_string(),
             },
             worker_count: 1,
-            partition_size_bytes: 1000,
+            chunk_size_bytes: 1000,
             batch_size: 10,
             batch_concurrency: 1,
             create_table_if_missing: false, // This is the key - not creating the table
@@ -611,7 +608,7 @@ mod tests {
             schema: "public".to_string(),
             format: Format::Csv,
             worker_count: 1,
-            partition_size_bytes: 1000,
+            chunk_size_bytes: 1000,
             batch_size: 10,
             batch_concurrency: 1,
             create_table_if_missing: false,
@@ -652,20 +649,20 @@ mod tests {
             manifest_file
         );
 
-        // Verify we can read partition result files with errors
-        let partition_result_file = manifest_path
+        // Verify we can read chunk result files with errors
+        let chunk_result_file = manifest_path
             .join("jobs")
             .join(&result.job_id)
-            .join("partitions")
+            .join("chunks")
             .join("0000.result");
         assert!(
-            partition_result_file.exists(),
-            "Partition result file should exist: {:?}",
-            partition_result_file
+            chunk_result_file.exists(),
+            "Chunk result file should exist: {:?}",
+            chunk_result_file
         );
 
         // Read and verify the result file contains error information
-        let result_content = std::fs::read_to_string(&partition_result_file).unwrap();
+        let result_content = std::fs::read_to_string(&chunk_result_file).unwrap();
         let result_json: serde_json::Value = serde_json::from_str(&result_content).unwrap();
 
         assert!(
@@ -691,7 +688,7 @@ mod tests {
         // This test verifies that:
         // 1. Failed records are tracked accurately
         // 2. Error messages contain helpful batch context
-        // 3. Partition results show correct status and counts
+        // 3. Chunk results show correct status and counts
 
         let temp_dir = TempDir::new().unwrap();
 
@@ -745,7 +742,7 @@ mod tests {
                 username: "test".to_string(),
             },
             worker_count: 1,
-            partition_size_bytes: 1000,
+            chunk_size_bytes: 1000,
             batch_size: 3, // All 3 records in one batch
             batch_concurrency: 1,
             create_table_if_missing: false,
@@ -757,7 +754,7 @@ mod tests {
         let result = coordinator.run_load(config).await.unwrap();
 
         // Verify that failures were properly tracked
-        assert_eq!(result.partitions_processed, 1, "Should process 1 partition");
+        assert_eq!(result.chunks_processed, 1, "Should process 1 chunk");
         assert_eq!(
             result.records_loaded, 0,
             "Should load 0 records (batch failed)"
@@ -770,21 +767,21 @@ mod tests {
         // Verify no data was actually inserted
         assert_eq!(get_table_count(&pool, "test_check_constraint").await, 0);
 
-        // Verify partition result contains detailed error information
-        let partition_result = &result.partition_results[0];
-        assert_eq!(partition_result.status, "failed");
+        // Verify chunk result contains detailed error information
+        let chunk_result = &result.chunk_results[0];
+        assert_eq!(chunk_result.status, "failed");
         assert_eq!(
-            partition_result.records_failed, 3,
-            "Partition should show 3 failed records"
+            chunk_result.records_failed, 3,
+            "Chunk should show 3 failed records"
         );
-        assert_eq!(partition_result.records_loaded, 0);
+        assert_eq!(chunk_result.records_loaded, 0);
         assert!(
-            !partition_result.errors.is_empty(),
+            !chunk_result.errors.is_empty(),
             "Should have error records"
         );
 
         // Check that error message contains helpful batch context
-        let error_msg = &partition_result.errors[0].error_message;
+        let error_msg = &chunk_result.errors[0].error_message;
         assert!(
             error_msg.contains("Batch context"),
             "Error should contain batch context. Got: {}",
@@ -841,7 +838,7 @@ mod tests {
                 username: "test".to_string(),
             },
             worker_count: 2,
-            partition_size_bytes: 1000,
+            chunk_size_bytes: 1000,
             batch_size: 10,
             batch_concurrency: 2,
             create_table_if_missing: false,
@@ -877,7 +874,7 @@ mod tests {
             schema: "public".to_string(),
             format: Format::Csv,
             worker_count: 1,
-            partition_size_bytes: 1000,
+            chunk_size_bytes: 1000,
             batch_size: 10,
             batch_concurrency: 2,
             create_table_if_missing: false,
@@ -926,7 +923,7 @@ mod tests {
                 username: "test".to_string(),
             },
             worker_count: 1,
-            partition_size_bytes: 1000,
+            chunk_size_bytes: 1000,
             batch_size: 10,
             batch_concurrency: 1,
             create_table_if_missing: true,

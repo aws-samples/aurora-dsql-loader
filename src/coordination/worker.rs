@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::manifest::{ClaimFile, ErrorRecord, ManifestStorage, PartitionResultFile};
+use super::manifest::{ChunkResultFile, ClaimFile, ErrorRecord, ManifestStorage};
 use crate::config::{MAX_RETRIES, QUERY_TIMEOUT};
 use crate::db::Pool;
 use crate::formats::{FileReader, Record};
@@ -50,7 +50,7 @@ struct BatchResult {
     duration_ms: u64,
 }
 
-/// Worker that processes partitions of data
+/// Worker that processes chunks of data
 pub struct Worker {
     pub worker_id: String,
     pub manifest_storage: Arc<dyn ManifestStorage>,
@@ -93,18 +93,18 @@ impl Worker {
         loop {
             let unclaimed = self
                 .manifest_storage
-                .list_unclaimed_partitions(job_id)
+                .list_unclaimed_chunks(job_id)
                 .await
-                .context("Failed to list unclaimed partitions")?;
+                .context("Failed to list unclaimed chunks")?;
 
             if unclaimed.is_empty() {
                 break;
             }
 
             let mut claimed_any = false;
-            for partition_id in unclaimed {
+            for chunk_id in unclaimed {
                 let claimed = self
-                    .try_claim_and_process(job_id, partition_id, &file_reader)
+                    .try_claim_and_process(job_id, chunk_id, &file_reader)
                     .await?;
                 if claimed {
                     claimed_any = true;
@@ -120,47 +120,46 @@ impl Worker {
         Ok(())
     }
 
-    /// Try to claim and process a single partition
+    /// Try to claim and process a single chunk
     async fn try_claim_and_process(
         &self,
         job_id: &str,
-        partition_id: u32,
+        chunk_id: u32,
         file_reader: &Arc<dyn FileReader>,
     ) -> Result<bool> {
         let claim = ClaimFile {
-            partition_id,
+            chunk_id,
             worker_id: self.worker_id.clone(),
             claimed_at: Utc::now().to_rfc3339(),
         };
 
         let claimed = self
             .manifest_storage
-            .try_claim_partition(job_id, partition_id, &claim)
+            .try_claim_chunk(job_id, chunk_id, &claim)
             .await
-            .context("Failed to claim partition")?;
+            .context("Failed to claim chunk")?;
 
         if !claimed {
             return Ok(false);
         }
 
-        // Process partition (writes its own result)
-        self.process_partition(job_id, partition_id, file_reader)
-            .await?;
+        // Process chunk (writes its own result)
+        self.process_chunk(job_id, chunk_id, file_reader).await?;
         Ok(true)
     }
 
-    /// Process a single partition by reading data and loading it into the database
+    /// Process a single chunk by reading data and loading it into the database
     /// Writes the result to manifest storage before returning
-    async fn process_partition(
+    async fn process_chunk(
         &self,
         job_id: &str,
-        partition_id: u32,
+        chunk_id: u32,
         file_reader: &Arc<dyn FileReader>,
     ) -> Result<()> {
         use tokio::task::JoinSet;
 
-        // Send partition started event
-        let _ = self.telemetry_tx.send(TelemetryEvent::PartitionStarted);
+        // Send chunk started event
+        let _ = self.telemetry_tx.send(TelemetryEvent::ChunkStarted);
 
         let start_time = Utc::now();
         let start_instant = std::time::Instant::now();
@@ -171,43 +170,43 @@ impl Worker {
             .await
             .context("Failed to read manifest")?;
 
-        let partition_info = manifest
-            .partitions
+        let chunk_info = manifest
+            .chunks
             .iter()
-            .find(|p| p.partition_id == partition_id)
-            .context("Partition not found in manifest")?;
+            .find(|p| p.chunk_id == chunk_id)
+            .context("Chunk not found in manifest")?;
 
-        let partition = crate::formats::Partition {
-            partition_id,
-            start_offset: partition_info.start_offset,
-            end_offset: partition_info.end_offset,
-            estimated_rows: partition_info.estimated_rows,
+        let chunk = crate::formats::Chunk {
+            chunk_id,
+            start_offset: chunk_info.start_offset,
+            end_offset: chunk_info.end_offset,
+            estimated_rows: chunk_info.estimated_rows,
         };
 
-        let partition_data = file_reader
-            .read_partition(&partition)
+        let chunk_data = file_reader
+            .read_chunk(&chunk)
             .await
-            .context("Failed to read partition data")?;
+            .context("Failed to read chunk data")?;
 
-        // Split partition into batches with line offset tracking
-        let batches: Vec<Vec<Record>> = partition_data
+        // Split chunk into batches with line offset tracking
+        let batches: Vec<Vec<Record>> = chunk_data
             .records
             .chunks(self.batch_size)
             .map(|chunk| chunk.to_vec())
             .collect();
 
         // Calculate average bytes per record for telemetry
-        let bytes_per_record = if partition_data.records.is_empty() {
+        let bytes_per_record = if chunk_data.records.is_empty() {
             0
         } else {
-            partition_data.bytes_read / partition_data.records.len() as u64
+            chunk_data.bytes_read / chunk_data.records.len() as u64
         };
 
         // Process batches in parallel with JoinSet for concurrency control
         let mut join_set: JoinSet<BatchResult> = JoinSet::new();
         let mut results = Vec::new();
 
-        // Track line numbers: partition records start at line 1, +1 if file has header (to skip header line)
+        // Track line numbers: chunk records start at line 1, +1 if file has header (to skip header line)
         let has_header = matches!(
             manifest.file_format,
             crate::coordination::manifest::FileFormat::Csv(_)
@@ -279,10 +278,10 @@ impl Worker {
         let end_time = Utc::now();
         let duration_secs = start_instant.elapsed().as_secs();
 
-        // Send partition completed event
+        // Send chunk completed event
         let _ = self
             .telemetry_tx
-            .send(TelemetryEvent::PartitionCompleted { records_failed });
+            .send(TelemetryEvent::ChunkCompleted { records_failed });
 
         // Determine status based on whether any records failed
         let status = if records_failed > 0 {
@@ -291,13 +290,13 @@ impl Worker {
             "success"
         };
 
-        let result = PartitionResultFile {
-            partition_id,
+        let result = ChunkResultFile {
+            chunk_id,
             worker_id: self.worker_id.clone(),
             status: status.to_string(),
             records_loaded,
             records_failed,
-            bytes_processed: partition_data.bytes_read,
+            bytes_processed: chunk_data.bytes_read,
             started_at: start_time.to_rfc3339(),
             completed_at: end_time.to_rfc3339(),
             duration_secs,
@@ -306,14 +305,14 @@ impl Worker {
 
         // Write result to manifest
         self.manifest_storage
-            .write_result(job_id, partition_id, &result)
+            .write_result(job_id, chunk_id, &result)
             .await
-            .context("Failed to write partition result")?;
+            .context("Failed to write chunk result")?;
 
         // Return error if any records failed
         if records_failed > 0 {
             Err(anyhow!(
-                "Partition had {} failed records out of {} total",
+                "Chunk had {} failed records out of {} total",
                 records_failed,
                 records_loaded + records_failed
             ))

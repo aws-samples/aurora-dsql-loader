@@ -43,9 +43,9 @@ enum Command {
         #[arg(short, long, default_value = "8")]
         workers: usize,
 
-        /// Partition size (e.g., 10MB, 1GB)
+        /// Chunk size (e.g., 10MB, 1GB)
         #[arg(short, long, default_value = "10MB")]
-        partition_size: String,
+        chunk_size: String,
 
         /// Batch size for inserts
         #[arg(short, long, default_value = "2000")]
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
             username,
             format,
             workers,
-            partition_size,
+            chunk_size,
             batch_size,
             batch_concurrency,
             if_not_exists,
@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
                 username,
                 format,
                 workers,
-                partition_size,
+                chunk_size,
                 batch_size,
                 batch_concurrency,
                 if_not_exists,
@@ -140,7 +140,7 @@ async fn run_loader(
     username: String,
     format: Option<String>,
     workers: usize,
-    partition_size: String,
+    chunk_size: String,
     batch_size: usize,
     batch_concurrency: usize,
     if_not_exists: bool,
@@ -212,9 +212,9 @@ async fn run_loader(
         std::collections::HashMap::new()
     };
 
-    // Parse partition size
-    let partition_size_bytes = cli::parse_size_string(&partition_size)
-        .map_err(|e| anyhow::anyhow!("Invalid partition size '{}': {}", partition_size, e))?;
+    // Parse chunk size
+    let chunk_size_bytes = cli::parse_size_string(&chunk_size)
+        .map_err(|e| anyhow::anyhow!("Invalid chunk size '{}': {}", chunk_size, e))?;
 
     // Parse format
     let format_enum = Format::parse(&format)?;
@@ -226,7 +226,7 @@ async fn run_loader(
         println!("Configuration:");
         println!("  Table: {}", table);
         println!("  Workers: {}", workers);
-        println!("  Partition size: {} bytes", partition_size_bytes);
+        println!("  Chunk size: {} bytes", chunk_size_bytes);
         println!("  Batch size: {}", batch_size);
         println!("  Batch concurrency: {}", batch_concurrency);
         println!("  Create table if missing: {}", if_not_exists);
@@ -251,7 +251,7 @@ async fn run_loader(
         schema,
         format: format_enum,
         worker_count: workers,
-        partition_size_bytes,
+        chunk_size_bytes,
         batch_size,
         batch_concurrency,
         create_table_if_missing: if_not_exists,
@@ -267,7 +267,7 @@ async fn run_loader(
     println!("Load Summary");
     println!("============");
     println!("Job ID: {}", result.job_id);
-    println!("Partitions processed: {}", result.partitions_processed);
+    println!("Chunks processed: {}", result.chunks_processed);
     println!("Records loaded: {}", result.records_loaded);
     println!("Records failed: {}", result.records_failed);
     println!("Duration: {:.2}s", result.duration.as_secs_f64());
@@ -283,15 +283,15 @@ async fn run_loader(
         println!("  {}", persisted_path.display());
         println!();
         println!("To inspect errors:");
-        println!("  # View all partition results");
+        println!("  # View all chunk results");
         println!(
-            "  ls {}/jobs/{}/partitions/",
+            "  ls {}/jobs/{}/chunks/",
             persisted_path.display(),
             result.job_id
         );
-        println!("  # View errors from a specific partition");
+        println!("  # View errors from a specific chunk");
         println!(
-            "  cat {}/jobs/{}/partitions/0000.result",
+            "  cat {}/jobs/{}/chunks/0000.result",
             persisted_path.display(),
             result.job_id
         );

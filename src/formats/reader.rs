@@ -15,10 +15,10 @@ pub struct FileMetadata {
     pub estimated_rows: Option<u64>,
 }
 
-/// A partition of a file, defined by byte offsets
+/// A chunk of a file, defined by byte offsets
 #[derive(Debug, Clone)]
-pub struct Partition {
-    pub partition_id: u32,
+pub struct Chunk {
+    pub chunk_id: u32,
     pub start_offset: u64,
     pub end_offset: u64,
     pub estimated_rows: Option<u64>,
@@ -30,25 +30,25 @@ pub struct Record {
     pub fields: Vec<String>,
 }
 
-/// Data from a partition read
+/// Data from a chunk read
 #[derive(Debug)]
-pub struct PartitionData {
+pub struct ChunkData {
     pub records: Vec<Record>,
     pub bytes_read: u64,
 }
 
-/// Trait for reading different file formats with partitioning support
+/// Trait for reading different file formats with chunking support
 #[async_trait]
 pub trait FileReader: Send + Sync {
     /// Get metadata about the file
     async fn metadata(&self) -> Result<FileMetadata>;
 
-    /// Create partitions for the file, respecting record boundaries
-    /// target_size is the approximate size in bytes for each partition
-    async fn create_partitions(&self, target_size: u64) -> Result<Vec<Partition>>;
+    /// Create chunks for the file, respecting record boundaries
+    /// target_size is the approximate size in bytes for each chunk
+    async fn create_chunks(&self, target_size: u64) -> Result<Vec<Chunk>>;
 
-    /// Read a specific partition from the file
-    async fn read_partition(&self, partition: &Partition) -> Result<PartitionData>;
+    /// Read a specific chunk from the file
+    async fn read_chunk(&self, chunk: &Chunk) -> Result<ChunkData>;
 }
 
 /// Configuration for delimited file reading (CSV, TSV, etc.)
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_csv_partitioning() {
+    async fn test_csv_chunking() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "id,name,email").unwrap();
         for i in 0..100 {
@@ -236,19 +236,19 @@ mod tests {
 
         let byte_reader = LocalFileByteReader::new(temp_file.path());
         let reader = GenericDelimitedReader::new(byte_reader, DelimitedConfig::csv());
-        let partitions = reader.create_partitions(500).await.unwrap();
+        let chunks = reader.create_chunks(500).await.unwrap();
 
-        // Should create multiple partitions
-        assert!(partitions.len() > 1);
+        // Should create multiple chunks
+        assert!(chunks.len() > 1);
 
-        // Partitions should be contiguous
-        for i in 1..partitions.len() {
-            assert_eq!(partitions[i - 1].end_offset, partitions[i].start_offset);
+        // Chunks should be contiguous
+        for i in 1..chunks.len() {
+            assert_eq!(chunks[i - 1].end_offset, chunks[i].start_offset);
         }
     }
 
     #[tokio::test]
-    async fn test_read_partition() {
+    async fn test_read_chunk() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "id,name,email").unwrap();
         writeln!(temp_file, "1,Alice,alice@example.com").unwrap();
@@ -260,15 +260,15 @@ mod tests {
         let reader = GenericDelimitedReader::new(byte_reader, DelimitedConfig::csv());
         let metadata = reader.metadata().await.unwrap();
 
-        // Create partitions and use the first one (which skips the header)
-        let partitions = reader
-            .create_partitions(metadata.file_size_bytes)
+        // Create chunks and use the first one (which skips the header)
+        let chunks = reader
+            .create_chunks(metadata.file_size_bytes)
             .await
             .unwrap();
-        assert_eq!(partitions.len(), 1);
+        assert_eq!(chunks.len(), 1);
 
-        let partition = &partitions[0];
-        let data = reader.read_partition(partition).await.unwrap();
+        let chunk = &chunks[0];
+        let data = reader.read_chunk(chunk).await.unwrap();
 
         assert_eq!(data.records.len(), 3);
         assert_eq!(data.records[0].fields.len(), 3);

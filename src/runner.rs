@@ -68,7 +68,7 @@ pub struct LoadArgs {
 
     // Performance tuning
     pub worker_count: usize,
-    pub partition_size_bytes: u64,
+    pub chunk_size_bytes: u64,
     pub batch_size: usize,
     pub batch_concurrency: usize,
 
@@ -89,7 +89,7 @@ pub struct LoadArgs {
 #[derive(Debug)]
 pub struct LoadResult {
     pub job_id: String,
-    pub partitions_processed: usize,
+    pub chunks_processed: usize,
     pub records_loaded: u64,
     pub records_failed: u64,
     pub duration: Duration,
@@ -122,7 +122,7 @@ pub struct LoadResult {
 ///     schema: "public".to_string(),
 ///     format: Format::Csv,
 ///     worker_count: 8,
-///     partition_size_bytes: 10 * 1024 * 1024, // 10MB
+///     chunk_size_bytes: 10 * 1024 * 1024, // 10MB
 ///     batch_size: 3000,
 ///     batch_concurrency: 20,
 ///     create_table_if_missing: true,
@@ -211,7 +211,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
             username: args.username,
         },
         worker_count: args.worker_count,
-        partition_size_bytes: args.partition_size_bytes,
+        chunk_size_bytes: args.chunk_size_bytes,
         batch_size: args.batch_size,
         batch_concurrency: args.batch_concurrency,
         create_table_if_missing: args.create_table_if_missing,
@@ -235,7 +235,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     // Convert to public LoadResult type
     Ok(LoadResult {
         job_id: result.job_id,
-        partitions_processed: result.partitions_processed,
+        chunks_processed: result.chunks_processed,
         records_loaded: result.records_loaded,
         records_failed: result.records_failed,
         duration: result.duration,

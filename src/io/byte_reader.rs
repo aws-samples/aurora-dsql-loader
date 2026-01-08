@@ -5,7 +5,7 @@ use crate::config::{CHUNK_SIZE, SAMPLE_SIZE};
 
 /// Abstraction for byte-level I/O operations
 /// This trait enables reading files from different sources (local, S3, etc.)
-/// with a unified interface for partitioning and parsing
+/// with a unified interface for chunking and parsing
 #[async_trait]
 pub trait ByteReader: Send + Sync {
     /// Get the total size of the file/object in bytes

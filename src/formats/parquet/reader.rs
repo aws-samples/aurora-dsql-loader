@@ -6,7 +6,7 @@ use futures::StreamExt;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use std::sync::Arc;
 
-use crate::formats::reader::{FileMetadata, FileReader, Partition, PartitionData};
+use crate::formats::reader::{Chunk, ChunkData, FileMetadata, FileReader};
 use crate::io::ByteReader;
 
 use super::adapter::ByteReaderAdapter;
@@ -58,7 +58,7 @@ impl<R: ByteReader + Clone + 'static> GenericParquetReader<R> {
     }
 
     /// Read specific row groups and convert to Records
-    async fn read_row_groups(&self, row_group_indices: &[usize]) -> Result<PartitionData> {
+    async fn read_row_groups(&self, row_group_indices: &[usize]) -> Result<ChunkData> {
         // Create a new adapter for this read (clone the reader from Arc)
         let reader_clone = (*self.reader).clone();
         let adapter = ByteReaderAdapter::new(reader_clone)
@@ -92,7 +92,7 @@ impl<R: ByteReader + Clone + 'static> GenericParquetReader<R> {
             all_records.extend(records);
         }
 
-        Ok(PartitionData {
+        Ok(ChunkData {
             records: all_records,
             bytes_read,
         })
@@ -113,9 +113,9 @@ impl<R: ByteReader + Clone + 'static> FileReader for GenericParquetReader<R> {
         })
     }
 
-    async fn create_partitions(&self, target_size: u64) -> Result<Vec<Partition>> {
-        let mut partitions = Vec::new();
-        let mut partition_id = 0u32;
+    async fn create_chunks(&self, target_size: u64) -> Result<Vec<Chunk>> {
+        let mut chunks = Vec::new();
+        let mut chunk_id = 0u32;
 
         let mut current_row_groups = Vec::new();
         let mut current_size = 0u64;
@@ -124,19 +124,19 @@ impl<R: ByteReader + Clone + 'static> FileReader for GenericParquetReader<R> {
         for rg in &self.row_groups {
             // Check if adding this row group would exceed target
             if !current_row_groups.is_empty() && current_size + rg.total_byte_size > target_size {
-                // Finalize current partition
+                // Finalize current chunk
                 // Use row group indices encoded in offsets
                 let start_rg = current_row_groups[0];
                 let end_rg = current_row_groups[current_row_groups.len() - 1] + 1;
 
-                partitions.push(Partition {
-                    partition_id,
+                chunks.push(Chunk {
+                    chunk_id,
                     start_offset: start_rg as u64,
                     end_offset: end_rg as u64,
                     estimated_rows: Some(current_rows),
                 });
 
-                partition_id += 1;
+                chunk_id += 1;
                 current_row_groups.clear();
                 current_size = 0;
                 current_rows = 0;
@@ -147,35 +147,32 @@ impl<R: ByteReader + Clone + 'static> FileReader for GenericParquetReader<R> {
             current_rows += rg.num_rows;
         }
 
-        // Add final partition if any row groups remain
+        // Add final chunk if any row groups remain
         if !current_row_groups.is_empty() {
             let start_rg = current_row_groups[0];
             let end_rg = current_row_groups[current_row_groups.len() - 1] + 1;
 
-            partitions.push(Partition {
-                partition_id,
+            chunks.push(Chunk {
+                chunk_id,
                 start_offset: start_rg as u64,
                 end_offset: end_rg as u64,
                 estimated_rows: Some(current_rows),
             });
         }
 
-        Ok(partitions)
+        Ok(chunks)
     }
 
-    async fn read_partition(&self, partition: &Partition) -> Result<PartitionData> {
-        // Map partition offsets to row group indices
+    async fn read_chunk(&self, chunk: &Chunk) -> Result<ChunkData> {
+        // Map chunk offsets to row group indices
         // Offsets encode row group indices (start_offset = first RG, end_offset = last RG + 1)
-        let start_rg = partition.start_offset as usize;
-        let end_rg = partition.end_offset as usize;
+        let start_rg = chunk.start_offset as usize;
+        let end_rg = chunk.end_offset as usize;
 
         let row_group_indices: Vec<usize> = (start_rg..end_rg).collect();
 
         if row_group_indices.is_empty() {
-            return Err(anyhow!(
-                "No row groups found for partition {}",
-                partition.partition_id
-            ));
+            return Err(anyhow!("No row groups found for chunk {}", chunk.chunk_id));
         }
 
         self.read_row_groups(&row_group_indices).await
@@ -288,7 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parquet_reader_single_partition() {
+    async fn test_parquet_reader_single_chunk() {
         let temp_file = create_test_parquet_file(50, 10000);
         let reader = LocalFileReader {
             path: temp_file.path().to_path_buf(),
@@ -296,11 +293,11 @@ mod tests {
 
         let parquet_reader = GenericParquetReader::new(reader).await.unwrap();
 
-        // Large target size should create single partition
-        let partitions = parquet_reader.create_partitions(1_000_000).await.unwrap();
-        assert_eq!(partitions.len(), 1);
+        // Large target size should create single chunk
+        let chunks = parquet_reader.create_chunks(1_000_000).await.unwrap();
+        assert_eq!(chunks.len(), 1);
 
-        let data = parquet_reader.read_partition(&partitions[0]).await.unwrap();
+        let data = parquet_reader.read_chunk(&chunks[0]).await.unwrap();
         assert_eq!(data.records.len(), 50);
         assert!(data.bytes_read > 0);
 
@@ -311,7 +308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parquet_reader_multiple_partitions() {
+    async fn test_parquet_reader_multiple_chunks() {
         // Create file with multiple row groups
         let temp_file = create_test_parquet_file(1000, 100); // ~10 row groups
 
@@ -321,14 +318,14 @@ mod tests {
 
         let parquet_reader = GenericParquetReader::new(reader).await.unwrap();
 
-        // Small partition size should create multiple partitions
-        let partitions = parquet_reader.create_partitions(5000).await.unwrap();
-        assert!(partitions.len() > 1);
+        // Small chunk size should create multiple chunks
+        let chunks = parquet_reader.create_chunks(5000).await.unwrap();
+        assert!(chunks.len() > 1);
 
-        // Read all partitions and verify total rows
+        // Read all chunks and verify total rows
         let mut total_rows = 0;
-        for partition in &partitions {
-            let data = parquet_reader.read_partition(partition).await.unwrap();
+        for chunk in &chunks {
+            let data = parquet_reader.read_chunk(chunk).await.unwrap();
             total_rows += data.records.len();
         }
 

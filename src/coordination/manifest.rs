@@ -183,10 +183,10 @@ impl<'de> Deserialize<'de> for FileFormat {
     }
 }
 
-/// Information about a partition to be processed
+/// Information about a chunk to be processed
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionInfo {
-    pub partition_id: u32,
+pub struct ChunkInfo {
+    pub chunk_id: u32,
     pub start_offset: u64,
     pub end_offset: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -227,21 +227,21 @@ pub struct ManifestFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_rows: Option<u64>,
     pub batch_size: usize,
-    pub partitions: Vec<PartitionInfo>,
+    pub chunks: Vec<ChunkInfo>,
 }
 
-/// Claim file structure created when a worker claims a partition
+/// Claim file structure created when a worker claims a chunk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimFile {
-    pub partition_id: u32,
+    pub chunk_id: u32,
     pub worker_id: String,
     pub claimed_at: String, // ISO 8601
 }
 
 /// The result file structure written by workers
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionResultFile {
-    pub partition_id: u32,
+pub struct ChunkResultFile {
+    pub chunk_id: u32,
     pub worker_id: String,
     pub status: String, // "success", "failed", etc.
     pub records_loaded: u64,
@@ -273,28 +273,24 @@ pub trait ManifestStorage: Send + Sync {
     /// Read the manifest file for a job
     async fn read_manifest(&self, job_id: &str) -> Result<ManifestFile>;
 
-    /// Attempt to claim a partition atomically
+    /// Attempt to claim a chunk atomically
     /// Returns true if the claim was successful, false if already claimed
-    async fn try_claim_partition(
-        &self,
-        job_id: &str,
-        partition_id: u32,
-        claim: &ClaimFile,
-    ) -> Result<bool>;
+    async fn try_claim_chunk(&self, job_id: &str, chunk_id: u32, claim: &ClaimFile)
+    -> Result<bool>;
 
-    /// Write a result file for a completed partition
+    /// Write a result file for a completed chunk
     async fn write_result(
         &self,
         job_id: &str,
-        partition_id: u32,
-        result: &PartitionResultFile,
+        chunk_id: u32,
+        result: &ChunkResultFile,
     ) -> Result<()>;
 
-    /// Read a result file for a completed partition
-    async fn read_result(&self, job_id: &str, partition_id: u32) -> Result<PartitionResultFile>;
+    /// Read a result file for a completed chunk
+    async fn read_result(&self, job_id: &str, chunk_id: u32) -> Result<ChunkResultFile>;
 
-    /// List all partition IDs that have not been claimed yet
-    async fn list_unclaimed_partitions(&self, job_id: &str) -> Result<Vec<u32>>;
+    /// List all chunk IDs that have not been claimed yet
+    async fn list_unclaimed_chunks(&self, job_id: &str) -> Result<Vec<u32>>;
 }
 
 /// Local filesystem implementation of ManifestStorage
@@ -302,8 +298,8 @@ pub trait ManifestStorage: Send + Sync {
 /// Uses atomic file operations to ensure correct coordination between workers.
 /// Directory structure:
 ///   {base_dir}/jobs/{job_id}/manifest.json
-///   {base_dir}/jobs/{job_id}/partitions/{partition_id:04}.claim
-///   {base_dir}/jobs/{job_id}/partitions/{partition_id:04}.result
+///   {base_dir}/jobs/{job_id}/chunks/{chunk_id:04}.claim
+///   {base_dir}/jobs/{job_id}/chunks/{chunk_id:04}.result
 pub struct LocalManifestStorage {
     base_dir: PathBuf,
 }
@@ -319,9 +315,9 @@ impl LocalManifestStorage {
         self.base_dir.join("jobs").join(job_id)
     }
 
-    /// Get the partitions directory path
-    fn partitions_dir(&self, job_id: &str) -> PathBuf {
-        self.job_dir(job_id).join("partitions")
+    /// Get the chunks directory path
+    fn chunks_dir(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("chunks")
     }
 
     /// Get the manifest file path
@@ -329,16 +325,16 @@ impl LocalManifestStorage {
         self.job_dir(job_id).join("manifest.json")
     }
 
-    /// Get the claim file path for a partition
-    fn claim_path(&self, job_id: &str, partition_id: u32) -> PathBuf {
-        self.partitions_dir(job_id)
-            .join(format!("{:04}.claim", partition_id))
+    /// Get the claim file path for a chunk
+    fn claim_path(&self, job_id: &str, chunk_id: u32) -> PathBuf {
+        self.chunks_dir(job_id)
+            .join(format!("{:04}.claim", chunk_id))
     }
 
-    /// Get the result file path for a partition
-    fn result_path(&self, job_id: &str, partition_id: u32) -> PathBuf {
-        self.partitions_dir(job_id)
-            .join(format!("{:04}.result", partition_id))
+    /// Get the result file path for a chunk
+    fn result_path(&self, job_id: &str, chunk_id: u32) -> PathBuf {
+        self.chunks_dir(job_id)
+            .join(format!("{:04}.result", chunk_id))
     }
 }
 
@@ -362,11 +358,11 @@ impl ManifestStorage for LocalManifestStorage {
             .await
             .context("Failed to write manifest file")?;
 
-        // Create partitions directory
-        let partitions_dir = self.partitions_dir(job_id);
-        fs::create_dir_all(&partitions_dir)
+        // Create chunks directory
+        let chunks_dir = self.chunks_dir(job_id);
+        fs::create_dir_all(&chunks_dir)
             .await
-            .context("Failed to create partitions directory")?;
+            .context("Failed to create chunks directory")?;
 
         Ok(())
     }
@@ -384,13 +380,13 @@ impl ManifestStorage for LocalManifestStorage {
         Ok(manifest)
     }
 
-    async fn try_claim_partition(
+    async fn try_claim_chunk(
         &self,
         job_id: &str,
-        partition_id: u32,
+        chunk_id: u32,
         claim: &ClaimFile,
     ) -> Result<bool> {
-        let claim_path = self.claim_path(job_id, partition_id);
+        let claim_path = self.claim_path(job_id, chunk_id);
 
         // Serialize claim data
         let json = serde_json::to_string_pretty(claim).context("Failed to serialize claim")?;
@@ -411,7 +407,7 @@ impl ManifestStorage for LocalManifestStorage {
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Partition already claimed
+                // Chunk already claimed
                 Ok(false)
             }
             Err(e) => Err(e).context("Failed to create claim file"),
@@ -421,10 +417,10 @@ impl ManifestStorage for LocalManifestStorage {
     async fn write_result(
         &self,
         job_id: &str,
-        partition_id: u32,
-        result: &PartitionResultFile,
+        chunk_id: u32,
+        result: &ChunkResultFile,
     ) -> Result<()> {
-        let result_path = self.result_path(job_id, partition_id);
+        let result_path = self.result_path(job_id, chunk_id);
 
         // Serialize result data
         let json = serde_json::to_string_pretty(result).context("Failed to serialize result")?;
@@ -436,35 +432,35 @@ impl ManifestStorage for LocalManifestStorage {
         Ok(())
     }
 
-    async fn read_result(&self, job_id: &str, partition_id: u32) -> Result<PartitionResultFile> {
-        let result_path = self.result_path(job_id, partition_id);
+    async fn read_result(&self, job_id: &str, chunk_id: u32) -> Result<ChunkResultFile> {
+        let result_path = self.result_path(job_id, chunk_id);
 
         let contents = fs::read_to_string(&result_path)
             .await
             .context("Failed to read result file")?;
 
-        let result: PartitionResultFile =
+        let result: ChunkResultFile =
             serde_json::from_str(&contents).context("Failed to parse result file")?;
 
         Ok(result)
     }
 
-    async fn list_unclaimed_partitions(&self, job_id: &str) -> Result<Vec<u32>> {
-        // First read the manifest to get the total number of partitions
+    async fn list_unclaimed_chunks(&self, job_id: &str) -> Result<Vec<u32>> {
+        // First read the manifest to get the total number of chunks
         let manifest = self.read_manifest(job_id).await?;
 
-        // Check each partition to see if it has a claim file
+        // Check each chunk to see if it has a claim file
         let mut unclaimed = Vec::new();
 
-        for partition in &manifest.partitions {
-            let claim_path = self.claim_path(job_id, partition.partition_id);
+        for chunk in &manifest.chunks {
+            let claim_path = self.claim_path(job_id, chunk.chunk_id);
 
-            // If claim file doesn't exist, partition is unclaimed
+            // If claim file doesn't exist, chunk is unclaimed
             if !fs::try_exists(&claim_path)
                 .await
                 .context("Failed to check claim file existence")?
             {
-                unclaimed.push(partition.partition_id);
+                unclaimed.push(chunk.chunk_id);
             }
         }
 
@@ -547,7 +543,7 @@ mod tests {
             total_size_bytes: 1024,
             estimated_rows: Some(100),
             batch_size: 1000,
-            partitions: vec![],
+            chunks: vec![],
         };
 
         // Serialize and print
