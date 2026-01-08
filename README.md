@@ -77,18 +77,18 @@ aurora-dsql-loader load \
 - **Flexible**: Works with local files or S3 URIs
 - **Formats**: CSV, TSV, and Parquet support
 
+## Requirements
+
+- **Rust**: 1.85 or later (for building)
+- **AWS**: Aurora DSQL cluster with `dsql:DbConnectAdmin` or `dsql:DbConnect` permissions
+- **Credentials**: Configured via AWS CLI, SSO, or IAM role
+
 ## Options
 
 See all options with:
 ```bash
 aurora-dsql-loader load --help
 ```
-
-## Requirements
-
-- **Rust**: 1.85 or later (for building)
-- **AWS**: Aurora DSQL cluster with `dsql:DbConnectAdmin` or `dsql:DbConnect` permissions
-- **Credentials**: Configured via AWS CLI, SSO, or IAM role
 
 ## Troubleshooting
 

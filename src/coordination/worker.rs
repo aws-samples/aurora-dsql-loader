@@ -208,7 +208,11 @@ impl Worker {
         let mut results = Vec::new();
 
         // Track line numbers: partition records start at line 1, +1 if file has header (to skip header line)
-        let has_header = matches!(manifest.file_format, crate::coordination::manifest::FileFormat::Csv(_) | crate::coordination::manifest::FileFormat::Tsv(_));
+        let has_header = matches!(
+            manifest.file_format,
+            crate::coordination::manifest::FileFormat::Csv(_)
+                | crate::coordination::manifest::FileFormat::Tsv(_)
+        );
         let mut current_line = if has_header { 2u64 } else { 1u64 };
 
         for batch in batches {
@@ -234,7 +238,15 @@ impl Worker {
             let batch_len = batch.len() as u64;
 
             join_set.spawn(async move {
-                Self::load_batch(&pool, &table_name, &batch, &schema, has_unique_constraints, line_offset).await
+                Self::load_batch(
+                    &pool,
+                    &table_name,
+                    &batch,
+                    &schema,
+                    has_unique_constraints,
+                    line_offset,
+                )
+                .await
             });
 
             current_line += batch_len;

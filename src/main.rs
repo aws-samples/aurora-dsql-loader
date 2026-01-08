@@ -276,9 +276,17 @@ async fn run_loader(
         println!();
         println!("To inspect errors:");
         println!("  # View all partition results");
-        println!("  ls {}/jobs/{}/partitions/", persisted_path.display(), result.job_id);
+        println!(
+            "  ls {}/jobs/{}/partitions/",
+            persisted_path.display(),
+            result.job_id
+        );
         println!("  # View errors from a specific partition");
-        println!("  cat {}/jobs/{}/partitions/0000.result", persisted_path.display(), result.job_id);
+        println!(
+            "  cat {}/jobs/{}/partitions/0000.result",
+            persisted_path.display(),
+            result.job_id
+        );
     }
 
     // Note: To keep manifest directory, use --manifest-dir to specify a persistent location

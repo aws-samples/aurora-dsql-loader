@@ -577,7 +577,8 @@ mod tests {
         if let Ok(mut conn) = pool.acquire().await
             && let crate::db::pool::PoolConnection::Sqlite(ref mut sqlite_conn) = conn
         {
-            let sql = "CREATE TABLE test_persist_manifest (id INTEGER, value INTEGER CHECK(value > 0))";
+            let sql =
+                "CREATE TABLE test_persist_manifest (id INTEGER, value INTEGER CHECK(value > 0))";
             sqlx::query(sql).execute(&mut **sqlite_conn).await.unwrap();
         }
 
@@ -631,7 +632,10 @@ mod tests {
         );
 
         // Verify we can read the manifest file
-        let manifest_file = manifest_path.join("jobs").join(&result.job_id).join("manifest.json");
+        let manifest_file = manifest_path
+            .join("jobs")
+            .join(&result.job_id)
+            .join("manifest.json");
         assert!(
             manifest_file.exists(),
             "Manifest file should exist: {:?}",
