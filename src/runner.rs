@@ -63,6 +63,7 @@ pub struct LoadArgs {
     // Source configuration
     pub source_uri: String,
     pub target_table: String,
+    pub schema: String,
     pub format: Format,
 
     // Performance tuning
@@ -118,6 +119,7 @@ pub struct LoadResult {
 ///     username: "admin".to_string(),
 ///     source_uri: "s3://my-bucket/data.csv".to_string(),
 ///     target_table: "my_table".to_string(),
+///     schema: "public".to_string(),
 ///     format: Format::Csv,
 ///     worker_count: 8,
 ///     partition_size_bytes: 10 * 1024 * 1024, // 10MB
@@ -202,6 +204,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     let load_config = LoadConfig {
         source_uri: args.source_uri,
         target_table: args.target_table,
+        schema: args.schema,
         dsql_config: DsqlConfig {
             endpoint: args.endpoint,
             region: args.region,

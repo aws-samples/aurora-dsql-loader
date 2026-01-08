@@ -178,8 +178,40 @@ async fn query_sqlite_table_schema(
     }
 }
 
+/// Validate that a schema exists in the database
+pub async fn validate_schema_exists(pool: &super::pool::Pool, schema_name: &str) -> Result<()> {
+    if pool.is_postgres() {
+        // Query returns 3 text columns to match fetch_all_with_binds signature
+        let query =
+            "SELECT schema_name, '', '' FROM information_schema.schemata WHERE schema_name = $1";
+        let rows = pool
+            .fetch_all_with_binds(query, &[schema_name])
+            .await
+            .context("Failed to check schema existence")?;
+
+        if rows.is_empty() {
+            anyhow::bail!(
+                "Schema '{}' does not exist.\n\n\
+                 To create it, run:\n  \
+                 CREATE SCHEMA \"{}\";\n\n\
+                 Note: Creating schemas requires elevated database privileges.",
+                schema_name,
+                schema_name
+            );
+        }
+        Ok(())
+    } else {
+        // SQLite testing - skip validation (schemas simulated via table name prefixes)
+        Ok(())
+    }
+}
+
 /// Query the schema of an existing table from the database
-pub async fn query_table_schema(pool: &super::pool::Pool, table_name: &str) -> Result<Schema> {
+pub async fn query_table_schema(
+    pool: &super::pool::Pool,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Schema> {
     let rows = if pool.is_postgres() {
         // Query PostgreSQL information_schema to get column types
         let query = r#"
@@ -188,18 +220,21 @@ pub async fn query_table_schema(pool: &super::pool::Pool, table_name: &str) -> R
                 data_type,
                 is_nullable
             FROM information_schema.columns
-            WHERE table_name = $1
+            WHERE table_schema = $1
+              AND table_name = $2
             ORDER BY ordinal_position
         "#;
 
-        pool.fetch_all_with_bind(query, table_name)
+        pool.fetch_all_with_binds(query, &[schema_name, table_name])
             .await
             .context("Failed to query table schema")?
     } else {
         // For SQLite, use PRAGMA table_info
+        // SQLite doesn't support schemas - use table_identifier for consistent naming
         #[cfg(test)]
         {
-            query_sqlite_table_schema(pool, table_name)
+            let (_, sqlite_table) = pool.table_identifier(schema_name, table_name);
+            query_sqlite_table_schema(pool, &sqlite_table)
                 .await
                 .context("Failed to query table schema")?
         }
@@ -210,7 +245,12 @@ pub async fn query_table_schema(pool: &super::pool::Pool, table_name: &str) -> R
     };
 
     if rows.is_empty() {
-        anyhow::bail!("Table '{}' not found or has no columns", table_name);
+        anyhow::bail!(
+            "Table '{}.{}' not found or has no columns.\n\n\
+             Ensure the table exists or use --if-not-exists to create it.",
+            schema_name,
+            table_name
+        );
     }
 
     let mut columns = Vec::new();
@@ -442,8 +482,9 @@ impl SchemaInferrer {
     }
 
     /// Generate DDL statement for creating a table
-    pub fn generate_ddl(&self, table_name: &str, schema: &Schema) -> String {
-        let mut ddl = format!("CREATE TABLE \"{}\" (\n", table_name);
+    /// The table_spec should be pre-formatted (e.g., "schema"."table" or just "table")
+    pub fn generate_ddl(&self, table_spec: &str, schema: &Schema) -> String {
+        let mut ddl = format!("CREATE TABLE {} (\n", table_spec);
 
         let column_defs: Vec<String> = schema
             .columns
@@ -600,8 +641,9 @@ mod tests {
         };
 
         let inferrer = SchemaInferrer { has_header: true };
-        let ddl = inferrer.generate_ddl("customers", &schema);
+        let ddl = inferrer.generate_ddl("\"customers\"", &schema);
 
+        // For public schema, table name is unqualified
         assert!(ddl.contains("CREATE TABLE \"customers\""));
         assert!(ddl.contains("\"id\" INTEGER NOT NULL"));
         assert!(ddl.contains("\"name\" TEXT"));

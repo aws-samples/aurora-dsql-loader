@@ -193,10 +193,19 @@ pub struct PartitionInfo {
     pub estimated_rows: Option<u64>,
 }
 
+/// Default schema name for backward compatibility
+fn default_schema() -> String {
+    "public".to_string()
+}
+
 /// Table metadata and configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableInfo {
     pub name: String,
+    /// Database schema name (e.g., "public", "sales")
+    #[serde(default = "default_schema")]
+    pub schema_name: String,
+    /// Table structure (column definitions)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaJson>,
     pub was_created: bool,
@@ -524,6 +533,7 @@ mod tests {
             source_uri: "/data/test.csv".to_string(),
             table: TableInfo {
                 name: "test_table".to_string(),
+                schema_name: "public".to_string(),
                 schema: None,
                 was_created: false,
                 has_unique_constraints: false,

@@ -170,11 +170,12 @@ impl Pool {
         }
     }
 
-    /// Fetch all rows from a query with a single bind parameter - works for both Postgres and SQLite
-    pub async fn fetch_all_with_bind(
+    /// Fetch all rows from a query with bind parameters - works for both Postgres and SQLite
+    /// Accepts a slice of bind values for flexible parameter binding
+    pub async fn fetch_all_with_binds(
         &self,
         sql: &str,
-        bind_value: &str,
+        bind_values: &[&str],
     ) -> Result<Vec<(String, String, String)>, sqlx::Error> {
         match &self.inner {
             PoolInner::Postgres(pool) => {
@@ -182,21 +183,24 @@ impl Pool {
                     bb8::RunError::User(e) => e,
                     bb8::RunError::TimedOut => sqlx::Error::PoolTimedOut,
                 })?;
-                let rows = sqlx::query_as::<_, (String, String, String)>(sql)
-                    .bind(bind_value)
-                    .fetch_all(&mut *conn)
-                    .await?;
-                Ok(rows)
+                let mut query = sqlx::query_as::<_, (String, String, String)>(sql);
+                for value in bind_values {
+                    query = query.bind(*value);
+                }
+                query.fetch_all(&mut *conn).await
             }
             #[cfg(test)]
             PoolInner::Sqlite(pool) => {
-                // Convert Postgres-style $1 to SQLite-style ?
-                let sqlite_sql = sql.replace("$1", "?");
-                let rows = sqlx::query_as::<_, (String, String, String)>(&sqlite_sql)
-                    .bind(bind_value)
-                    .fetch_all(pool)
-                    .await?;
-                Ok(rows)
+                // Convert Postgres-style $1, $2, ... to SQLite-style ?, ?, ...
+                let mut sqlite_sql = sql.to_string();
+                for i in (1..=bind_values.len()).rev() {
+                    sqlite_sql = sqlite_sql.replace(&format!("${}", i), "?");
+                }
+                let mut query = sqlx::query_as::<_, (String, String, String)>(&sqlite_sql);
+                for value in bind_values {
+                    query = query.bind(*value);
+                }
+                query.fetch_all(pool).await
             }
         }
     }
@@ -206,8 +210,42 @@ impl Pool {
         matches!(&self.inner, PoolInner::Postgres(_))
     }
 
+    /// Get the table identifier for the current database type
+    /// - PostgreSQL: Returns (schema_name, table_name) as-is for qualified names
+    /// - SQLite: Simulates schemas by prefixing table name (e.g., "sales_orders" for sales.orders)
+    pub fn table_identifier(&self, schema_name: &str, table_name: &str) -> (String, String) {
+        if self.is_postgres() {
+            (schema_name.to_string(), table_name.to_string())
+        } else {
+            // SQLite: simulate schemas with table name prefix
+            let sqlite_table = if schema_name != "public" {
+                format!("{}_{}", schema_name, table_name)
+            } else {
+                table_name.to_string()
+            };
+            ("public".to_string(), sqlite_table)
+        }
+    }
+
+    /// Get a fully qualified table name for SQL statements
+    /// - PostgreSQL: Returns "schema"."table" for non-public, or "table" for public
+    /// - SQLite: Returns "table" (possibly prefixed like "sales_orders")
+    pub fn qualified_table_name(&self, schema_name: &str, table_name: &str) -> String {
+        let (schema, table) = self.table_identifier(schema_name, table_name);
+
+        if self.is_postgres() && schema != "public" {
+            format!("\"{}\".\"{}\"", schema, table)
+        } else {
+            format!("\"{}\"", table)
+        }
+    }
+
     /// Check if a table has unique constraints (primary key or unique index)
-    pub async fn has_unique_constraints(&self, table_name: &str) -> Result<bool, sqlx::Error> {
+    pub async fn has_unique_constraints(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<bool, sqlx::Error> {
         match &self.inner {
             PoolInner::Postgres(pool) => {
                 let mut conn = pool.get().await.map_err(|e| match e {
@@ -221,11 +259,13 @@ impl Pool {
                     FROM pg_constraint c
                     JOIN pg_class t ON c.conrelid = t.oid
                     JOIN pg_namespace n ON t.relnamespace = n.oid
-                    WHERE t.relname = $1
-                    AND (c.contype = 'p' OR c.contype = 'u')
+                    WHERE n.nspname = $1
+                      AND t.relname = $2
+                      AND (c.contype = 'p' OR c.contype = 'u')
                 "#;
 
                 let result: (i64,) = sqlx::query_as(constraint_sql)
+                    .bind(schema_name)
                     .bind(table_name)
                     .fetch_one(&mut *conn)
                     .await?;
@@ -238,11 +278,13 @@ impl Pool {
                 let index_sql = r#"
                     SELECT COUNT(*) as count
                     FROM pg_indexes
-                    WHERE tablename = $1
-                    AND indexdef LIKE '%UNIQUE INDEX%'
+                    WHERE schemaname = $1
+                      AND tablename = $2
+                      AND indexdef LIKE '%UNIQUE INDEX%'
                 "#;
 
                 let index_result: (i64,) = sqlx::query_as(index_sql)
+                    .bind(schema_name)
                     .bind(table_name)
                     .fetch_one(&mut *conn)
                     .await?;
@@ -251,9 +293,12 @@ impl Pool {
             }
             #[cfg(test)]
             PoolInner::Sqlite(pool) => {
+                // SQLite doesn't support schemas - use table_identifier for consistent naming
+                let (_, sqlite_table) = self.table_identifier(schema_name, table_name);
+
                 // For SQLite, check both table info and indexes
                 // First check if table has primary key
-                let pragma_sql = format!("PRAGMA table_info({})", table_name);
+                let pragma_sql = format!("PRAGMA table_info({})", sqlite_table);
                 let rows: Vec<(i32, String, String, i32, Option<String>, i32)> =
                     sqlx::query_as(&pragma_sql).fetch_all(pool).await?;
 
@@ -264,7 +309,7 @@ impl Pool {
                 }
 
                 // Check for unique indexes
-                let index_sql = format!("PRAGMA index_list({})", table_name);
+                let index_sql = format!("PRAGMA index_list({})", sqlite_table);
                 let indexes: Vec<(i32, String, i32, String, i32)> =
                     sqlx::query_as(&index_sql).fetch_all(pool).await?;
 

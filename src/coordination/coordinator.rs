@@ -27,6 +27,7 @@ const MAX_SCHEMA_INFERENCE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 pub struct LoadConfig {
     pub source_uri: String,
     pub target_table: String,
+    pub schema: String,
     pub dsql_config: DsqlConfig,
     pub worker_count: usize,
     pub partition_size_bytes: u64,
@@ -91,6 +92,9 @@ impl Coordinator {
         // 1. Generate job ID
         let job_id = Uuid::new_v4().to_string();
         info!("Starting load job: {}", job_id);
+
+        // Validate that the schema exists before starting
+        crate::db::schema::validate_schema_exists(&self.pool, &config.schema).await?;
 
         // 2. Create partitions
         let (file_metadata, partitions) = self
@@ -269,13 +273,14 @@ impl Coordinator {
             info!("Querying schema from existing table...");
             let queried_schema = crate::db::schema::query_table_schema(
                 &self.pool,
+                &config.schema,
                 &config.target_table,
             )
             .await
             .with_context(|| {
                 format!(
-                    "Table '{}' does not exist. Use --if-not-exists to create it automatically.",
-                    config.target_table
+                    "Table '{}.{}' does not exist. Use --if-not-exists to create it automatically.",
+                    config.schema, config.target_table
                 )
             })?;
 
@@ -312,10 +317,14 @@ impl Coordinator {
     ) -> Result<bool> {
         if config.create_table_if_missing {
             if let Some(schema) = schema {
-                info!("Creating table: {}", config.target_table);
-                let ddl = self
-                    .schema_inferrer
-                    .generate_ddl(&config.target_table, schema);
+                info!("Creating table: {}.{}", config.schema, config.target_table);
+
+                // Use Pool helper to generate the properly formatted table name
+                let table_spec = self
+                    .pool
+                    .qualified_table_name(&config.schema, &config.target_table);
+
+                let ddl = self.schema_inferrer.generate_ddl(&table_spec, schema);
 
                 match self.pool.execute_query(&ddl).await {
                     Ok(_) => {
@@ -355,7 +364,7 @@ impl Coordinator {
         info!("Checking for unique constraints on table...");
         let has_unique_constraints = self
             .pool
-            .has_unique_constraints(&config.target_table)
+            .has_unique_constraints(&config.schema, &config.target_table)
             .await
             .unwrap_or(false);
 
@@ -377,6 +386,7 @@ impl Coordinator {
 
         let table = super::manifest::TableInfo {
             name: config.target_table.clone(),
+            schema_name: config.schema.clone(),
             schema: schema.map(|s| s.into()),
             was_created: table_created,
             has_unique_constraints,

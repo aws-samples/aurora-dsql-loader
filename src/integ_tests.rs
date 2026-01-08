@@ -87,6 +87,7 @@ mod tests {
         let config = LoadConfig {
             source_uri: csv_path.to_string(),
             target_table: table_name.to_string(),
+            schema: "public".to_string(),
             dsql_config: DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
@@ -243,6 +244,7 @@ mod tests {
         let config = LoadConfig {
             source_uri: parquet_path_str,
             target_table: "test_parquet".to_string(),
+            schema: "public".to_string(),
             dsql_config: DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
@@ -289,7 +291,11 @@ mod tests {
         .await;
 
         // Verify that the table has unique constraints
-        assert!(pool.has_unique_constraints("test_unique").await.unwrap());
+        assert!(
+            pool.has_unique_constraints("public", "test_unique")
+                .await
+                .unwrap()
+        );
 
         let result = run_csv_load(&pool, "test_unique", &csv_path, 1, 1000).await;
 
@@ -382,6 +388,7 @@ mod tests {
             username: "test".to_string(),
             source_uri: csv_path,
             target_table: "runner_test_table".to_string(),
+            schema: "public".to_string(),
             format: Format::Csv,
             worker_count: 2,
             partition_size_bytes: 1000,
@@ -467,6 +474,7 @@ mod tests {
             username: "test".to_string(),
             source_uri: parquet_path_str,
             target_table: "runner_parquet".to_string(),
+            schema: "public".to_string(),
             format: Format::Parquet,
             worker_count: 2,
             partition_size_bytes: 500,
@@ -520,6 +528,7 @@ mod tests {
         let config = LoadConfig {
             source_uri: csv_path.to_string(),
             target_table: "nonexistent_table".to_string(),
+            schema: "public".to_string(),
             dsql_config: DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
@@ -599,6 +608,7 @@ mod tests {
             username: "test".to_string(),
             source_uri: csv_path,
             target_table: "test_persist_manifest".to_string(),
+            schema: "public".to_string(),
             format: Format::Csv,
             worker_count: 1,
             partition_size_bytes: 1000,
@@ -728,6 +738,7 @@ mod tests {
         let config = LoadConfig {
             source_uri: csv_path.to_string(),
             target_table: "test_check_constraint".to_string(),
+            schema: "public".to_string(),
             dsql_config: DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
@@ -789,5 +800,144 @@ mod tests {
             "Error should show first record sample. Got: {}",
             error_msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_schema_qualified_table_load() {
+        // This test verifies schema-qualified table operations
+        // Note: SQLite doesn't support schemas, so we simulate with table name prefix
+
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "test.csv", 50).await;
+
+        // Create table simulating schema prefix (sales_orders instead of sales.orders)
+        let pool = setup_sqlite_table(
+            "sales_orders", // Simulates sales.orders
+            "id TEXT, name TEXT, value TEXT, amount TEXT",
+        )
+        .await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let schema_inferrer = SchemaInferrer { has_header: true };
+        let coordinator =
+            Coordinator::new(manifest_storage, file_reader, schema_inferrer, pool.clone());
+
+        let config = LoadConfig {
+            source_uri: csv_path.to_string(),
+            target_table: "orders".to_string(),
+            schema: "sales".to_string(), // Non-public schema
+            dsql_config: DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            },
+            worker_count: 2,
+            partition_size_bytes: 1000,
+            batch_size: 10,
+            batch_concurrency: 2,
+            create_table_if_missing: false,
+            file_format: FileFormat::Csv(DelimitedConfig::csv()),
+            column_mappings: std::collections::HashMap::new(),
+            quiet: true,
+        };
+
+        let result = coordinator.run_load(config).await.unwrap();
+
+        assert_eq!(result.records_loaded, 50);
+        assert_eq!(result.records_failed, 0);
+
+        // Verify data was loaded to the correct table
+        assert_eq!(get_table_count(&pool, "sales_orders").await, 50);
+    }
+
+    #[tokio::test]
+    async fn test_default_public_schema() {
+        // Verify that "public" schema works (default behavior)
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "test.csv", 20).await;
+
+        let pool =
+            setup_sqlite_table("test_table", "id TEXT, name TEXT, value TEXT, amount TEXT").await;
+
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path,
+            target_table: "test_table".to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            partition_size_bytes: 1000,
+            batch_size: 10,
+            batch_concurrency: 2,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            column_mappings: std::collections::HashMap::new(),
+            test_pool: Some(pool.clone()),
+        };
+
+        let result = crate::runner::run_load(args).await.unwrap();
+
+        assert_eq!(result.records_loaded, 20);
+        assert_eq!(result.records_failed, 0);
+        assert_eq!(get_table_count(&pool, "test_table").await, 20);
+    }
+
+    #[tokio::test]
+    async fn test_schema_qualified_ddl_generation() {
+        // Test that generated DDL includes schema qualification
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "test.csv", 10).await;
+
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let schema_inferrer = SchemaInferrer { has_header: true };
+        let coordinator = Coordinator::new(manifest_storage, file_reader, schema_inferrer, pool);
+
+        // Use a simulated schema for SQLite (analytics_metrics instead of analytics.metrics)
+        let config = LoadConfig {
+            source_uri: csv_path.to_string(),
+            target_table: "metrics".to_string(),
+            schema: "analytics".to_string(),
+            dsql_config: DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            },
+            worker_count: 1,
+            partition_size_bytes: 1000,
+            batch_size: 10,
+            batch_concurrency: 1,
+            create_table_if_missing: true,
+            file_format: FileFormat::Csv(DelimitedConfig::csv()),
+            column_mappings: std::collections::HashMap::new(),
+            quiet: true,
+        };
+
+        let result = coordinator.run_load(config).await.unwrap();
+
+        assert_eq!(result.records_loaded, 10);
+        assert_eq!(result.records_failed, 0);
     }
 }

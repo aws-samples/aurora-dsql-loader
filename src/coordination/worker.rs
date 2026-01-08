@@ -231,6 +231,7 @@ impl Worker {
 
             // Spawn new batch processing task
             let pool = self.pool.clone();
+            let schema_name = manifest.table.schema_name.clone();
             let table_name = manifest.table.name.clone();
             let schema = manifest.table.schema.clone();
             let has_unique_constraints = manifest.table.has_unique_constraints;
@@ -240,6 +241,7 @@ impl Worker {
             join_set.spawn(async move {
                 Self::load_batch(
                     &pool,
+                    &schema_name,
                     &table_name,
                     &batch,
                     &schema,
@@ -325,6 +327,7 @@ impl Worker {
     /// Errors are captured in the result, not returned as Err
     async fn load_batch(
         pool: &Pool,
+        schema_name: &str,
         table_name: &str,
         records: &[Record],
         schema: &Option<super::manifest::SchemaJson>,
@@ -405,9 +408,12 @@ impl Worker {
         } else {
             ""
         };
+
+        // Use Pool helper to generate the properly formatted table name
+        let table_spec = pool.qualified_table_name(schema_name, table_name);
         let insert_sql = format!(
-            "INSERT INTO \"{}\" {} {}{}",
-            table_name, column_list, values_clause, conflict_clause
+            "INSERT INTO {} {} {}{}",
+            table_spec, column_list, values_clause, conflict_clause
         );
 
         // Execute with retry on error code 42001

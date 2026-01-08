@@ -23,6 +23,10 @@ enum Command {
         #[arg(short, long)]
         table: String,
 
+        /// Database schema (default: "public")
+        #[arg(long, default_value = "public")]
+        schema: String,
+
         /// AWS region (optional, inferred from endpoint if not specified)
         #[arg(short, long)]
         region: Option<String>,
@@ -86,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
             endpoint,
             source_uri,
             table,
+            schema,
             region,
             username,
             format,
@@ -104,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
                 endpoint,
                 source_uri,
                 table,
+                schema,
                 region,
                 username,
                 format,
@@ -129,6 +135,7 @@ async fn run_loader(
     endpoint: String,
     source_uri: String,
     table: String,
+    schema: String,
     region: Option<String>,
     username: String,
     format: Option<String>,
@@ -159,7 +166,7 @@ async fn run_loader(
         println!("================");
         println!("Endpoint: {}", endpoint);
         println!("Source: {}", source_uri);
-        println!("Table: {}", table);
+        println!("Table: {}.{}", schema, table);
         println!("Workers: {}", workers);
         println!();
     }
@@ -241,6 +248,7 @@ async fn run_loader(
         username,
         source_uri,
         target_table: table.clone(),
+        schema,
         format: format_enum,
         worker_count: workers,
         partition_size_bytes,
