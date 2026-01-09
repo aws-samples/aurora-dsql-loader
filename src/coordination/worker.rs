@@ -377,25 +377,16 @@ impl Worker {
 
                     // Add CAST() for types we bind as strings (not parsed to native Rust types)
                     // Only for PostgreSQL - SQLite doesn't handle CAST() well for DATE/TIME types
-                    if use_pg_cast {
-                        if let Some(s) = schema {
-                            if let Some(col) = s.columns.get(col_idx) {
-                                if TypeCategory::from_sql_type(&col.col_type)
+                    schema
+                        .as_ref()
+                        .and_then(|s| s.columns.get(col_idx))
+                        .filter(|col| {
+                            use_pg_cast
+                                && TypeCategory::from_sql_type(&col.col_type)
                                     == TypeCategory::StringCast
-                                {
-                                    format!("CAST({} AS {})", placeholder, col.col_type)
-                                } else {
-                                    placeholder
-                                }
-                            } else {
-                                placeholder
-                            }
-                        } else {
-                            placeholder
-                        }
-                    } else {
-                        placeholder
-                    }
+                        })
+                        .map(|col| format!("CAST({} AS {})", placeholder, col.col_type))
+                        .unwrap_or(placeholder)
                 })
                 .collect();
             value_groups.push(format!("({})", placeholders.join(", ")));
@@ -497,7 +488,7 @@ impl Worker {
                 Ok(conn) => conn,
                 Err(e) => {
                     if attempt < MAX_RETRIES - 1 {
-                        let delay_ms = 100 * 2u64.pow(attempt);
+                        let delay_ms = 1000 * 2u64.pow(attempt);
                         tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                         continue;
                     }
