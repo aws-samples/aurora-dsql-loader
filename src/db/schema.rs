@@ -181,10 +181,8 @@ async fn query_sqlite_table_schema(
 /// Validate that a schema exists in the database
 pub async fn validate_schema_exists(pool: &super::pool::Pool, schema_name: &str) -> Result<()> {
     if pool.is_postgres() {
-        // Query returns 3 text columns to match fetch_all_with_binds signature
-        let query =
-            "SELECT schema_name, '', '' FROM information_schema.schemata WHERE schema_name = $1";
-        let rows = pool
+        let query = "SELECT schema_name FROM information_schema.schemata WHERE schema_name = $1";
+        let rows: Vec<(String,)> = pool
             .fetch_all_with_binds(query, &[schema_name])
             .await
             .context("Failed to check schema existence")?;
@@ -212,7 +210,7 @@ pub async fn query_table_schema(
     schema_name: &str,
     table_name: &str,
 ) -> Result<Schema> {
-    let rows = if pool.is_postgres() {
+    let rows: Vec<(String, String, String)> = if pool.is_postgres() {
         // Query PostgreSQL information_schema to get column types
         let query = r#"
             SELECT

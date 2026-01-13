@@ -172,18 +172,26 @@ impl Pool {
 
     /// Fetch all rows from a query with bind parameters - works for both Postgres and SQLite
     /// Accepts a slice of bind values for flexible parameter binding
-    pub async fn fetch_all_with_binds(
+    ///
+    /// The generic type T must implement FromRow for both Postgres and SQLite row types
+    pub async fn fetch_all_with_binds<T>(
         &self,
         sql: &str,
         bind_values: &[&str],
-    ) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    ) -> Result<Vec<T>, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow>
+            + for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow>
+            + Send
+            + Unpin,
+    {
         match &self.inner {
             PoolInner::Postgres(pool) => {
                 let mut conn = pool.get().await.map_err(|e| match e {
                     bb8::RunError::User(e) => e,
                     bb8::RunError::TimedOut => sqlx::Error::PoolTimedOut,
                 })?;
-                let mut query = sqlx::query_as::<_, (String, String, String)>(sql);
+                let mut query = sqlx::query_as::<_, T>(sql);
                 for value in bind_values {
                     query = query.bind(*value);
                 }
@@ -196,7 +204,7 @@ impl Pool {
                 for i in (1..=bind_values.len()).rev() {
                     sqlite_sql = sqlite_sql.replace(&format!("${}", i), "?");
                 }
-                let mut query = sqlx::query_as::<_, (String, String, String)>(&sqlite_sql);
+                let mut query = sqlx::query_as::<_, T>(&sqlite_sql);
                 for value in bind_values {
                     query = query.bind(*value);
                 }
