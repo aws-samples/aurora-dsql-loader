@@ -1,5 +1,5 @@
 use aurora_dsql_loader::runner::{Format, LoadArgs, run_load};
-use clap::{Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
@@ -8,76 +8,106 @@ struct Args {
     command: Command,
 }
 
+#[derive(Clone, ClapArgs)]
+struct ConnectionArgs {
+    /// DSQL cluster endpoint (region is auto-detected from endpoint format)
+    #[arg(short, long)]
+    endpoint: String,
+
+    /// AWS region (optional, inferred from endpoint if not specified)
+    #[arg(short, long)]
+    region: Option<String>,
+
+    /// Database username
+    #[arg(short, long, default_value = "admin")]
+    username: String,
+}
+
+#[derive(Clone, ClapArgs)]
+struct SourceArgs {
+    /// Path to source data file or S3 URI (local path, s3://bucket/key)
+    #[arg(short, long)]
+    source_uri: String,
+
+    /// File format (csv, tsv, parquet) - auto-detected from extension if not specified
+    #[arg(short, long)]
+    format: Option<String>,
+}
+
+#[derive(Clone, ClapArgs)]
+struct TargetArgs {
+    /// Target table name
+    #[arg(short, long)]
+    table: String,
+
+    /// Database schema (default: "public")
+    #[arg(long, default_value = "public")]
+    schema: String,
+}
+
+#[derive(Clone, ClapArgs)]
+struct LoadParams {
+    /// Number of worker threads
+    #[arg(short, long, default_value = "8")]
+    workers: usize,
+
+    /// Chunk size (e.g., 10MB, 1GB)
+    #[arg(short, long, default_value = "10MB")]
+    chunk_size: String,
+
+    /// Batch size for inserts
+    #[arg(short, long, default_value = "2000")]
+    batch_size: usize,
+
+    /// Number of concurrent batches per worker
+    #[arg(long, default_value = "32")]
+    batch_concurrency: usize,
+
+    /// Create table if it doesn't exist
+    #[arg(long)]
+    if_not_exists: bool,
+
+    /// Column mapping from source to destination (format: src:dest,src2:dest2)
+    #[arg(long)]
+    column_map: Option<String>,
+}
+
+#[derive(Clone, ClapArgs)]
+struct OutputArgs {
+    /// Quiet mode - minimal output, only show summary
+    #[arg(short, long)]
+    quiet: bool,
+
+    /// Validate schema and show plan without loading data
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Keep manifest directory after load (for debugging)
+    #[arg(long)]
+    keep_manifest: bool,
+
+    /// Directory for manifest files (default: system temp directory)
+    #[arg(long)]
+    manifest_dir: Option<String>,
+}
+
 #[derive(Clone, Subcommand)]
 enum Command {
     Load {
-        /// DSQL cluster endpoint (region is auto-detected from endpoint format)
-        #[arg(short, long)]
-        endpoint: String,
+        #[command(flatten)]
+        connection: ConnectionArgs,
 
-        /// Path to source data file or S3 URI (local path, s3://bucket/key)
-        #[arg(short, long)]
-        source_uri: String,
+        #[command(flatten)]
+        source: SourceArgs,
 
-        /// Target table name
-        #[arg(short, long)]
-        table: String,
+        #[command(flatten)]
+        target: TargetArgs,
 
-        /// Database schema (default: "public")
-        #[arg(long, default_value = "public")]
-        schema: String,
+        #[command(flatten)]
+        load: LoadParams,
 
-        /// AWS region (optional, inferred from endpoint if not specified)
-        #[arg(short, long)]
-        region: Option<String>,
-
-        /// Database username
-        #[arg(short, long, default_value = "admin")]
-        username: String,
-
-        /// File format (csv, tsv, parquet) - auto-detected from extension if not specified
-        #[arg(short, long)]
-        format: Option<String>,
-
-        /// Number of worker threads
-        #[arg(short, long, default_value = "8")]
-        workers: usize,
-
-        /// Chunk size (e.g., 10MB, 1GB)
-        #[arg(short, long, default_value = "10MB")]
-        chunk_size: String,
-
-        /// Batch size for inserts
-        #[arg(short, long, default_value = "2000")]
-        batch_size: usize,
-
-        /// Number of concurrent batches per worker
-        #[arg(long, default_value = "32")]
-        batch_concurrency: usize,
-
-        /// Create table if it doesn't exist
-        #[arg(long)]
-        if_not_exists: bool,
-
-        /// Validate schema and show plan without loading data
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Keep manifest directory after load (for debugging)
-        #[arg(long)]
-        keep_manifest: bool,
-
-        /// Column mapping from source to destination (format: src:dest,src2:dest2)
-        #[arg(long)]
-        column_map: Option<String>,
-
-        /// Quiet mode - minimal output, only show summary
-        #[arg(short, long)]
-        quiet: bool,
-
-        /// Directory for manifest files (default: system temp directory)
-        #[arg(long)]
-        manifest_dir: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
@@ -87,72 +117,28 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Command::Load {
-            endpoint,
-            source_uri,
-            table,
-            schema,
-            region,
-            username,
-            format,
-            workers,
-            chunk_size,
-            batch_size,
-            batch_concurrency,
-            if_not_exists,
-            dry_run,
-            keep_manifest,
-            column_map,
-            quiet,
-            manifest_dir,
+            connection,
+            source,
+            target,
+            load,
+            output,
         } => {
-            run_loader(
-                endpoint,
-                source_uri,
-                table,
-                schema,
-                region,
-                username,
-                format,
-                workers,
-                chunk_size,
-                batch_size,
-                batch_concurrency,
-                if_not_exists,
-                dry_run,
-                keep_manifest,
-                column_map,
-                quiet,
-                manifest_dir,
-            )
-            .await?;
+            run_loader(connection, source, target, load, output).await?;
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_loader(
-    endpoint: String,
-    source_uri: String,
-    table: String,
-    schema: String,
-    region: Option<String>,
-    username: String,
-    format: Option<String>,
-    workers: usize,
-    chunk_size: String,
-    batch_size: usize,
-    batch_concurrency: usize,
-    if_not_exists: bool,
-    dry_run: bool,
-    keep_manifest: bool,
-    column_map: Option<String>,
-    quiet: bool,
-    manifest_dir: Option<String>,
+    connection: ConnectionArgs,
+    source: SourceArgs,
+    target: TargetArgs,
+    load: LoadParams,
+    output: OutputArgs,
 ) -> anyhow::Result<()> {
     // Initialize tracing based on quiet mode
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
-    let filter = if quiet {
+    let filter = if output.quiet {
         EnvFilter::new("aurora_dsql_loader=warn,sqlx=off")
     } else {
         EnvFilter::new("aurora_dsql_loader=info,sqlx=off")
@@ -161,46 +147,46 @@ async fn run_loader(
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     // Setup output based on quiet flag
-    if !quiet {
+    if !output.quiet {
         println!("DSQL Data Loader");
         println!("================");
-        println!("Endpoint: {}", endpoint);
-        println!("Source: {}", source_uri);
-        println!("Table: {}.{}", schema, table);
-        println!("Workers: {}", workers);
+        println!("Endpoint: {}", connection.endpoint);
+        println!("Source: {}", source.source_uri);
+        println!("Table: {}.{}", target.schema, target.table);
+        println!("Workers: {}", load.workers);
         println!();
     }
 
     // Extract region from endpoint if not provided
-    let region = if let Some(r) = region {
+    let region = if let Some(r) = connection.region {
         r
     } else {
-        cli::extract_region_from_endpoint(&endpoint).ok_or_else(|| {
+        cli::extract_region_from_endpoint(&connection.endpoint).ok_or_else(|| {
             anyhow::anyhow!(
                 "Could not extract region from endpoint '{}'.\n\
                  Expected format: xxx.dsql.REGION.on.aws (e.g., xxx.dsql.us-east-1.on.aws)\n\
                  Please specify --region explicitly.",
-                endpoint
+                connection.endpoint
             )
         })?
     };
 
     // Auto-detect format from file extension if not provided
-    let format = if let Some(f) = format {
+    let format = if let Some(f) = source.format {
         f
     } else {
-        cli::detect_format_from_path(&source_uri).ok_or_else(|| {
+        cli::detect_format_from_path(&source.source_uri).ok_or_else(|| {
             anyhow::anyhow!(
                 "Could not detect format from file '{}'.\n\
                  Supported extensions: .csv, .tsv, .parquet\n\
                  Please specify --format explicitly.",
-                source_uri
+                source.source_uri
             )
         })?
     };
 
     // Parse column mapping if provided
-    let column_mappings = if let Some(ref mapping_str) = column_map {
+    let column_mappings = if let Some(ref mapping_str) = load.column_map {
         cli::parse_column_mapping(mapping_str).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse column mapping: {}\n\
@@ -213,23 +199,23 @@ async fn run_loader(
     };
 
     // Parse chunk size
-    let chunk_size_bytes = cli::parse_size_string(&chunk_size)
-        .map_err(|e| anyhow::anyhow!("Invalid chunk size '{}': {}", chunk_size, e))?;
+    let chunk_size_bytes = cli::parse_size_string(&load.chunk_size)
+        .map_err(|e| anyhow::anyhow!("Invalid chunk size '{}': {}", load.chunk_size, e))?;
 
     // Parse format
     let format_enum = Format::parse(&format)?;
 
     // Handle dry-run mode
-    if dry_run {
+    if output.dry_run {
         println!("DRY RUN MODE - No data will be loaded");
         println!();
         println!("Configuration:");
-        println!("  Table: {}", table);
-        println!("  Workers: {}", workers);
+        println!("  Table: {}", target.table);
+        println!("  Workers: {}", load.workers);
         println!("  Chunk size: {} bytes", chunk_size_bytes);
-        println!("  Batch size: {}", batch_size);
-        println!("  Batch concurrency: {}", batch_concurrency);
-        println!("  Create table if missing: {}", if_not_exists);
+        println!("  Batch size: {}", load.batch_size);
+        println!("  Batch concurrency: {}", load.batch_concurrency);
+        println!("  Create table if missing: {}", load.if_not_exists);
         if !column_mappings.is_empty() {
             println!("  Column mappings:");
             for (src, dest) in &column_mappings {
@@ -243,20 +229,20 @@ async fn run_loader(
 
     // Build load arguments
     let load_args = LoadArgs {
-        endpoint,
+        endpoint: connection.endpoint,
         region,
-        username,
-        source_uri,
-        target_table: table.clone(),
-        schema,
+        username: connection.username,
+        source_uri: source.source_uri,
+        target_table: target.table.clone(),
+        schema: target.schema,
         format: format_enum,
-        worker_count: workers,
+        worker_count: load.workers,
         chunk_size_bytes,
-        batch_size,
-        batch_concurrency,
-        create_table_if_missing: if_not_exists,
-        manifest_dir: manifest_dir.clone().map(PathBuf::from),
-        quiet,
+        batch_size: load.batch_size,
+        batch_concurrency: load.batch_concurrency,
+        create_table_if_missing: load.if_not_exists,
+        manifest_dir: output.manifest_dir.clone().map(PathBuf::from),
+        quiet: output.quiet,
         column_mappings,
     };
 
@@ -298,7 +284,7 @@ async fn run_loader(
     }
 
     // Note: To keep manifest directory, use --manifest-dir to specify a persistent location
-    if keep_manifest && manifest_dir.is_none() {
+    if output.keep_manifest && output.manifest_dir.is_none() {
         println!();
         println!("Warning: --keep-manifest is only effective with --manifest-dir.");
         println!("Manifest was stored in a temporary directory and has been cleaned up.");

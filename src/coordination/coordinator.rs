@@ -161,7 +161,7 @@ impl Coordinator {
         job_id: &str,
         chunk_count: usize,
     ) -> Result<Vec<ChunkResultFile>> {
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(chunk_count);
 
         for chunk_id in 0..chunk_count as u32 {
             match self.manifest_storage.read_result(job_id, chunk_id).await {
