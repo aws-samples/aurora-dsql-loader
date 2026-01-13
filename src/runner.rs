@@ -14,7 +14,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use crate::coordination::manifest::{LocalManifestStorage, ParquetConfig};
-use crate::coordination::{Coordinator, DsqlConfig, FileFormat, LoadConfig};
+use crate::coordination::{Coordinator, DsqlConfig, FileFormat, LoadConfigBuilder};
 use crate::db::pool::PoolArgsBuilder;
 use crate::db::{self as db_pool, SchemaInferrer};
 use crate::formats::{DelimitedConfig, ReaderFactory};
@@ -201,27 +201,27 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     let coordinator = Coordinator::new(manifest_storage, file_reader, schema_inferrer, pool);
 
     // Build load config
-    let load_config = LoadConfig {
-        source_uri: args.source_uri,
-        target_table: args.target_table,
-        schema: args.schema,
-        dsql_config: DsqlConfig {
+    let load_config = LoadConfigBuilder::default()
+        .source_uri(args.source_uri)
+        .target_table(args.target_table)
+        .schema(args.schema)
+        .dsql_config(DsqlConfig {
             endpoint: args.endpoint,
             region: args.region,
             username: args.username,
-        },
-        worker_count: args.worker_count,
-        chunk_size_bytes: args.chunk_size_bytes,
-        batch_size: args.batch_size,
-        batch_concurrency: args.batch_concurrency,
-        create_table_if_missing: args.create_table_if_missing,
-        file_format,
-        column_mappings: args.column_mappings,
-        quiet: args.quiet,
-    };
+        })
+        .worker_count(args.worker_count)
+        .chunk_size_bytes(args.chunk_size_bytes)
+        .batch_size(args.batch_size)
+        .batch_concurrency(args.batch_concurrency)
+        .create_table_if_missing(args.create_table_if_missing)
+        .file_format(file_format)
+        .column_mappings(args.column_mappings)
+        .quiet(args.quiet)
+        .build()?;
 
     // Run the load
-    let result = coordinator.run_load(load_config).await?;
+    let result = coordinator.run_load(&load_config).await?;
 
     // If there were errors and we used a temp directory, persist it for debugging
     let persisted_manifest_dir = if result.records_failed > 0 && temp_dir.is_some() {

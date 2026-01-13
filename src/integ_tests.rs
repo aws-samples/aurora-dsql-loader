@@ -6,15 +6,15 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        coordination::coordinator::LoadResult,
-        coordination::manifest::{ChunkStatus, LocalManifestStorage},
-        coordination::{Coordinator, DsqlConfig, FileFormat, LoadConfig},
-        db::pool::PoolConnection,
-        db::{Pool, SchemaInferrer},
-        formats::delimited::reader::GenericDelimitedReader,
-        formats::{DelimitedConfig, FileReader},
+        coordination::{
+            Coordinator, DsqlConfig, FileFormat, LoadConfigBuilder,
+            coordinator::LoadResult,
+            manifest::{ChunkStatus, LocalManifestStorage},
+        },
+        db::{Pool, SchemaInferrer, pool::PoolConnection},
+        formats::{DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader},
         io::LocalFileByteReader,
-        runner::{Format, LoadArgs},
+        runner::{Format, LoadArgs, run_load},
     };
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -84,26 +84,27 @@ mod tests {
             pool.clone(),
         );
 
-        let config = LoadConfig {
-            source_uri: csv_path.to_string(),
-            target_table: table_name.to_string(),
-            schema: "public".to_string(),
-            dsql_config: DsqlConfig {
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path.to_string())
+            .target_table(table_name.to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
                 username: "test".to_string(),
-            },
-            worker_count,
-            chunk_size_bytes: chunk_size,
-            batch_size: 10,
-            batch_concurrency: 2,
-            create_table_if_missing: true,
-            file_format: FileFormat::Csv(DelimitedConfig::csv()),
-            column_mappings: std::collections::HashMap::new(),
-            quiet: true,
-        };
+            })
+            .worker_count(worker_count)
+            .chunk_size_bytes(chunk_size)
+            .batch_size(10)
+            .batch_concurrency(2)
+            .create_table_if_missing(true)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .build()
+            .unwrap();
 
-        coordinator.run_load(config).await.unwrap()
+        coordinator.run_load(&config).await.unwrap()
     }
 
     /// Helper to query table row count
@@ -235,26 +236,27 @@ mod tests {
 
         let coordinator = Coordinator::new(manifest_storage, file_reader, schema_inferrer, pool);
 
-        let config = LoadConfig {
-            source_uri: parquet_path_str,
-            target_table: "test_parquet".to_string(),
-            schema: "public".to_string(),
-            dsql_config: DsqlConfig {
+        let config = LoadConfigBuilder::default()
+            .source_uri(parquet_path_str)
+            .target_table("test_parquet".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
                 username: "test".to_string(),
-            },
-            worker_count: 2,
-            chunk_size_bytes: 500,
-            batch_size: 20,
-            batch_concurrency: 2,
-            create_table_if_missing: false, // Table already created
-            file_format: FileFormat::Parquet(ParquetConfig::default()),
-            column_mappings: std::collections::HashMap::new(),
-            quiet: true,
-        };
+            })
+            .worker_count(2)
+            .chunk_size_bytes(500)
+            .batch_size(20)
+            .batch_concurrency(2)
+            .create_table_if_missing(false) // Table already created
+            .file_format(FileFormat::Parquet(ParquetConfig::default()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .build()
+            .unwrap();
 
-        let result = coordinator.run_load(config).await.unwrap();
+        let result = coordinator.run_load(&config).await.unwrap();
 
         // Verify results
         assert!(result.chunks_processed > 0);
@@ -395,7 +397,7 @@ mod tests {
             test_pool: Some(pool.clone()),
         };
 
-        let result = crate::runner::run_load(args).await.unwrap();
+        let result = run_load(args).await.unwrap();
 
         assert!(result.chunks_processed > 0);
         assert_eq!(result.records_loaded, 100);
@@ -481,7 +483,7 @@ mod tests {
             test_pool: Some(pool.clone()),
         };
 
-        let result = crate::runner::run_load(args).await.unwrap();
+        let result = run_load(args).await.unwrap();
 
         // Verify results
         assert!(result.chunks_processed > 0);
@@ -519,27 +521,28 @@ mod tests {
             pool,
         );
 
-        let config = LoadConfig {
-            source_uri: csv_path.to_string(),
-            target_table: "nonexistent_table".to_string(),
-            schema: "public".to_string(),
-            dsql_config: DsqlConfig {
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path.to_string())
+            .target_table("nonexistent_table".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
                 username: "test".to_string(),
-            },
-            worker_count: 1,
-            chunk_size_bytes: 1000,
-            batch_size: 10,
-            batch_concurrency: 1,
-            create_table_if_missing: false, // This is the key - not creating the table
-            file_format: FileFormat::Csv(DelimitedConfig::csv()),
-            column_mappings: std::collections::HashMap::new(),
-            quiet: true,
-        };
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false) // This is the key - not creating the table
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .build()
+            .unwrap();
 
         // Attempt to run the load and expect it to fail
-        let result = coordinator.run_load(config).await;
+        let result = coordinator.run_load(&config).await;
 
         assert!(result.is_err(), "Load should fail when table doesn't exist");
 
@@ -615,7 +618,7 @@ mod tests {
             test_pool: Some(pool),
         };
 
-        let result = crate::runner::run_load(args).await.unwrap();
+        let result = run_load(args).await.unwrap();
 
         // Verify errors occurred
         assert!(result.records_failed > 0, "Should have failed records");
@@ -729,26 +732,27 @@ mod tests {
             pool.clone(),
         );
 
-        let config = LoadConfig {
-            source_uri: csv_path.to_string(),
-            target_table: "test_check_constraint".to_string(),
-            schema: "public".to_string(),
-            dsql_config: DsqlConfig {
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path.to_string())
+            .target_table("test_check_constraint".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
                 username: "test".to_string(),
-            },
-            worker_count: 1,
-            chunk_size_bytes: 1000,
-            batch_size: 3, // All 3 records in one batch
-            batch_concurrency: 1,
-            create_table_if_missing: false,
-            file_format: FileFormat::Csv(DelimitedConfig::csv()),
-            column_mappings: std::collections::HashMap::new(),
-            quiet: true,
-        };
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(3) // All 3 records in one batch
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .build()
+            .unwrap();
 
-        let result = coordinator.run_load(config).await.unwrap();
+        let result = coordinator.run_load(&config).await.unwrap();
 
         // Verify that failures were properly tracked
         assert_eq!(result.chunks_processed, 1, "Should process 1 chunk");
@@ -822,26 +826,27 @@ mod tests {
         let coordinator =
             Coordinator::new(manifest_storage, file_reader, schema_inferrer, pool.clone());
 
-        let config = LoadConfig {
-            source_uri: csv_path.to_string(),
-            target_table: "orders".to_string(),
-            schema: "sales".to_string(), // Non-public schema
-            dsql_config: DsqlConfig {
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path.to_string())
+            .target_table("orders".to_string())
+            .schema("sales".to_string()) // Non-public schema
+            .dsql_config(DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
                 username: "test".to_string(),
-            },
-            worker_count: 2,
-            chunk_size_bytes: 1000,
-            batch_size: 10,
-            batch_concurrency: 2,
-            create_table_if_missing: false,
-            file_format: FileFormat::Csv(DelimitedConfig::csv()),
-            column_mappings: std::collections::HashMap::new(),
-            quiet: true,
-        };
+            })
+            .worker_count(2)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(2)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .build()
+            .unwrap();
 
-        let result = coordinator.run_load(config).await.unwrap();
+        let result = coordinator.run_load(&config).await.unwrap();
 
         assert_eq!(result.records_loaded, 50);
         assert_eq!(result.records_failed, 0);
@@ -878,7 +883,7 @@ mod tests {
             test_pool: Some(pool.clone()),
         };
 
-        let result = crate::runner::run_load(args).await.unwrap();
+        let result = run_load(args).await.unwrap();
 
         assert_eq!(result.records_loaded, 20);
         assert_eq!(result.records_failed, 0);
@@ -907,26 +912,27 @@ mod tests {
         let coordinator = Coordinator::new(manifest_storage, file_reader, schema_inferrer, pool);
 
         // Use a simulated schema for SQLite (analytics_metrics instead of analytics.metrics)
-        let config = LoadConfig {
-            source_uri: csv_path.to_string(),
-            target_table: "metrics".to_string(),
-            schema: "analytics".to_string(),
-            dsql_config: DsqlConfig {
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path.to_string())
+            .target_table("metrics".to_string())
+            .schema("analytics".to_string())
+            .dsql_config(DsqlConfig {
                 endpoint: "test".to_string(),
                 region: "us-west-2".to_string(),
                 username: "test".to_string(),
-            },
-            worker_count: 1,
-            chunk_size_bytes: 1000,
-            batch_size: 10,
-            batch_concurrency: 1,
-            create_table_if_missing: true,
-            file_format: FileFormat::Csv(DelimitedConfig::csv()),
-            column_mappings: std::collections::HashMap::new(),
-            quiet: true,
-        };
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(true)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .build()
+            .unwrap();
 
-        let result = coordinator.run_load(config).await.unwrap();
+        let result = coordinator.run_load(&config).await.unwrap();
 
         assert_eq!(result.records_loaded, 10);
         assert_eq!(result.records_failed, 0);

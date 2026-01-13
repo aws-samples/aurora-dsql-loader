@@ -4,5 +4,5 @@ pub mod coordinator;
 pub mod manifest;
 pub mod worker;
 
-pub use coordinator::{Coordinator, LoadConfig};
+pub use coordinator::{Coordinator, LoadConfigBuilder};
 pub use manifest::{DsqlConfig, FileFormat};

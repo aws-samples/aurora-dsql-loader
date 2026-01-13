@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use derive_builder::Builder;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +12,9 @@ use super::manifest::{
     ChunkInfo, ChunkResultFile, DsqlConfig, FileFormat, ManifestFile, ManifestStorage,
 };
 use super::worker::Worker;
+use crate::db::schema::{query_table_schema, validate_schema_exists, Schema};
 use crate::db::{Pool, SchemaInferrer};
+use crate::formats::reader::{Chunk, FileMetadata};
 use crate::formats::FileReader;
 use crate::telemetry::{ProgressStats, TelemetryEvent};
 
@@ -23,20 +26,24 @@ use crate::telemetry::{ProgressStats, TelemetryEvent};
 const MAX_SCHEMA_INFERENCE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 
 /// Configuration for a data load operation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Builder)]
 pub struct LoadConfig {
-    pub source_uri: String,
-    pub target_table: String,
-    pub schema: String,
-    pub dsql_config: DsqlConfig,
-    pub worker_count: usize,
-    pub chunk_size_bytes: u64,
-    pub batch_size: usize,
-    pub batch_concurrency: usize,
-    pub create_table_if_missing: bool,
-    pub file_format: FileFormat,
-    pub column_mappings: std::collections::HashMap<String, String>,
-    pub quiet: bool,
+    #[builder(setter(into))]
+    source_uri: String,
+    #[builder(setter(into))]
+    target_table: String,
+    #[builder(setter(into))]
+    schema: String,
+    dsql_config: DsqlConfig,
+    worker_count: usize,
+    chunk_size_bytes: u64,
+    batch_size: usize,
+    batch_concurrency: usize,
+    create_table_if_missing: bool,
+    file_format: FileFormat,
+    #[builder(default)]
+    column_mappings: std::collections::HashMap<String, String>,
+    quiet: bool,
 }
 
 /// Result of a completed data load operation
@@ -86,7 +93,7 @@ impl Coordinator {
     /// 5. Write manifest file
     /// 6. Spawn worker tasks to process chunks
     /// 7. Wait for completion and aggregate results
-    pub async fn run_load(&self, config: LoadConfig) -> Result<LoadResult> {
+    pub async fn run_load(&self, config: &LoadConfig) -> Result<LoadResult> {
         let start_time = Instant::now();
 
         // 1. Generate job ID
@@ -94,7 +101,7 @@ impl Coordinator {
         info!("Starting load job: {}", job_id);
 
         // Validate that the schema exists before starting
-        crate::db::schema::validate_schema_exists(&self.pool, &config.schema).await?;
+        validate_schema_exists(&self.pool, &config.schema).await?;
 
         // 2. Create chunks
         let (file_metadata, chunks) = self.create_file_chunks(config.chunk_size_bytes).await?;
@@ -181,10 +188,7 @@ impl Coordinator {
     async fn create_file_chunks(
         &self,
         chunk_size_bytes: u64,
-    ) -> Result<(
-        crate::formats::reader::FileMetadata,
-        Vec<crate::formats::reader::Chunk>,
-    )> {
+    ) -> Result<(FileMetadata, Vec<Chunk>)> {
         info!(
             "Creating chunks with target size: {} bytes",
             chunk_size_bytes
@@ -216,8 +220,8 @@ impl Coordinator {
     async fn resolve_table_schema(
         &self,
         config: &LoadConfig,
-        chunks: &[crate::formats::reader::Chunk],
-    ) -> Result<Option<crate::db::schema::Schema>> {
+        chunks: &[Chunk],
+    ) -> Result<Option<Schema>> {
         if config.create_table_if_missing {
             info!("Inferring schema from sample data...");
 
@@ -230,7 +234,7 @@ impl Coordinator {
             // Cap the sample size to avoid reading massive files
             let end_offset = first_chunk.end_offset.min(MAX_SCHEMA_INFERENCE_BYTES);
 
-            let sample_chunk = crate::formats::reader::Chunk {
+            let sample_chunk = Chunk {
                 chunk_id: 0,
                 start_offset: 0,
                 end_offset,
@@ -264,7 +268,7 @@ impl Coordinator {
         } else {
             // Query existing table schema for proper type handling
             info!("Querying schema from existing table...");
-            let queried_schema = crate::db::schema::query_table_schema(
+            let queried_schema = query_table_schema(
                 &self.pool,
                 &config.schema,
                 &config.target_table,
@@ -287,7 +291,7 @@ impl Coordinator {
 
     /// Apply column mappings to schema if provided
     fn apply_column_mappings(
-        schema: &mut Option<crate::db::schema::Schema>,
+        schema: &mut Option<Schema>,
         column_mappings: &std::collections::HashMap<String, String>,
     ) {
         if !column_mappings.is_empty()
@@ -306,7 +310,7 @@ impl Coordinator {
     async fn ensure_table_exists(
         &self,
         config: &LoadConfig,
-        schema: &Option<crate::db::schema::Schema>,
+        schema: &Option<Schema>,
     ) -> Result<bool> {
         if config.create_table_if_missing {
             if let Some(schema) = schema {
@@ -348,9 +352,9 @@ impl Coordinator {
         &self,
         job_id: &str,
         config: &LoadConfig,
-        file_metadata: &crate::formats::reader::FileMetadata,
-        chunks: &[crate::formats::reader::Chunk],
-        schema: Option<crate::db::schema::Schema>,
+        file_metadata: &FileMetadata,
+        chunks: &[Chunk],
+        schema: Option<Schema>,
         table_created: bool,
     ) -> Result<()> {
         // Detect unique constraints
@@ -440,8 +444,8 @@ impl Coordinator {
     /// Setup progress tracking with progress bars
     fn setup_progress_tracking(
         config: &LoadConfig,
-        file_metadata: &crate::formats::reader::FileMetadata,
-        chunks: &[crate::formats::reader::Chunk],
+        file_metadata: &FileMetadata,
+        chunks: &[Chunk],
         mut telemetry_rx: mpsc::UnboundedReceiver<TelemetryEvent>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         if config.quiet {
@@ -535,7 +539,7 @@ impl Coordinator {
     async fn aggregate_final_results(
         &self,
         job_id: &str,
-        chunks: &[crate::formats::reader::Chunk],
+        chunks: &[Chunk],
         start_time: Instant,
     ) -> Result<LoadResult> {
         info!("Aggregating results...");

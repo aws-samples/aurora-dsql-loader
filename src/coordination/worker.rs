@@ -524,8 +524,9 @@ impl Worker {
                             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                             continue;
                         }
-                        return Err(e)
-                            .context("Failed to execute batch insert after {attempt} attempts");
+                        return Err(e).context(format!(
+                            "Failed to execute batch insert after {attempt} attempts"
+                        ));
                     }
                     return Err(e).context("Failed to execute batch insert");
                 }
