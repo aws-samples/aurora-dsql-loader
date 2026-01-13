@@ -137,12 +137,15 @@ async fn run_loader(
     output: OutputArgs,
 ) -> anyhow::Result<()> {
     // Initialize tracing based on quiet mode
+    // RUST_LOG environment variable takes precedence if set
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
-    let filter = if output.quiet {
-        EnvFilter::new("aurora_dsql_loader=warn,sqlx=off")
-    } else {
-        EnvFilter::new("aurora_dsql_loader=info,sqlx=off")
-    };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if output.quiet {
+            EnvFilter::new("aurora_dsql_loader=warn,sqlx=off")
+        } else {
+            EnvFilter::new("aurora_dsql_loader=info,sqlx=off")
+        }
+    });
     let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
