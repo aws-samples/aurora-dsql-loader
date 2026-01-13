@@ -238,12 +238,20 @@ pub struct ClaimFile {
     pub claimed_at: String, // ISO 8601
 }
 
+/// Status of a chunk processing operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChunkStatus {
+    Success,
+    Failed,
+}
+
 /// The result file structure written by workers
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkResultFile {
     pub chunk_id: u32,
     pub worker_id: String,
-    pub status: String, // "success", "failed", etc.
+    pub status: ChunkStatus,
     pub records_loaded: u64,
     pub records_failed: u64,
     pub bytes_processed: u64,

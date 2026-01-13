@@ -100,9 +100,7 @@ impl Coordinator {
         let (file_metadata, chunks) = self.create_file_chunks(config.chunk_size_bytes).await?;
 
         // 3. Resolve schema (infer or query)
-        let mut schema = self
-            .resolve_table_schema(&config, &chunks)
-            .await?;
+        let mut schema = self.resolve_table_schema(&config, &chunks).await?;
 
         // Apply column mappings to schema if provided
         Self::apply_column_mappings(&mut schema, &config.column_mappings);
@@ -129,8 +127,7 @@ impl Coordinator {
         drop(telemetry_tx);
 
         // 7. Setup progress tracking
-        let prog_jh =
-            Self::setup_progress_tracking(&config, &file_metadata, &chunks, telemetry_rx);
+        let prog_jh = Self::setup_progress_tracking(&config, &file_metadata, &chunks, telemetry_rx);
 
         // 8. Wait for all workers to complete
         let worker_results = futures::future::join_all(worker_handles).await;

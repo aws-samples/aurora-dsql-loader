@@ -7,7 +7,7 @@
 mod tests {
     use crate::{
         coordination::coordinator::LoadResult,
-        coordination::manifest::LocalManifestStorage,
+        coordination::manifest::{ChunkStatus, LocalManifestStorage},
         coordination::{Coordinator, DsqlConfig, FileFormat, LoadConfig},
         db::pool::PoolConnection,
         db::{Pool, SchemaInferrer},
@@ -146,10 +146,7 @@ mod tests {
 
         let result = run_csv_load(&pool, "test_table", &csv_path, 4, 800).await;
 
-        assert!(
-            result.chunks_processed > 1,
-            "Should create multiple chunks"
-        );
+        assert!(result.chunks_processed > 1, "Should create multiple chunks");
         assert_eq!(result.records_loaded, 500);
         assert_eq!(result.records_failed, 0);
 
@@ -769,16 +766,13 @@ mod tests {
 
         // Verify chunk result contains detailed error information
         let chunk_result = &result.chunk_results[0];
-        assert_eq!(chunk_result.status, "failed");
+        assert_eq!(chunk_result.status, ChunkStatus::Failed);
         assert_eq!(
             chunk_result.records_failed, 3,
             "Chunk should show 3 failed records"
         );
         assert_eq!(chunk_result.records_loaded, 0);
-        assert!(
-            !chunk_result.errors.is_empty(),
-            "Should have error records"
-        );
+        assert!(!chunk_result.errors.is_empty(), "Should have error records");
 
         // Check that error message contains helpful batch context
         let error_msg = &chunk_result.errors[0].error_message;

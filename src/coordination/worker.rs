@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::manifest::{ChunkResultFile, ClaimFile, ErrorRecord, ManifestStorage};
+use super::manifest::{ChunkResultFile, ChunkStatus, ClaimFile, ErrorRecord, ManifestStorage};
 use crate::config::{MAX_RETRIES, QUERY_TIMEOUT};
 use crate::db::Pool;
 use crate::formats::{FileReader, Record};
@@ -285,15 +285,15 @@ impl Worker {
 
         // Determine status based on whether any records failed
         let status = if records_failed > 0 {
-            "failed"
+            ChunkStatus::Failed
         } else {
-            "success"
+            ChunkStatus::Success
         };
 
         let result = ChunkResultFile {
             chunk_id,
             worker_id: self.worker_id.clone(),
-            status: status.to_string(),
+            status,
             records_loaded,
             records_failed,
             bytes_processed: chunk_data.bytes_read,
