@@ -89,9 +89,17 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
             .context("Failed to read chunk data")?;
 
         // Parse the CSV data
+        // Convert string delimiter to byte (handle \t specially)
+        let delimiter_byte = if self.config.delimiter == "\\t" {
+            b'\t'
+        } else {
+            self.config.delimiter.as_bytes()[0]
+        };
+        let quote_byte = self.config.quote.as_bytes()[0];
+
         let mut csv_reader = csv::ReaderBuilder::new()
-            .delimiter(self.config.delimiter)
-            .quote(self.config.quote)
+            .delimiter(delimiter_byte)
+            .quote(quote_byte)
             .has_headers(false) // We handle headers at the file level
             .from_reader(buffer.as_slice());
 

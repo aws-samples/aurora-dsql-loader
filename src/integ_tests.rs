@@ -47,6 +47,19 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
+    /// Helper to create a standard test TSV file with id,name,value,amount columns (tab-separated)
+    async fn create_test_tsv(dir: &TempDir, filename: &str, num_rows: usize) -> String {
+        let path = dir.path().join(filename);
+        let mut file = File::create(&path).await.unwrap();
+        file.write_all(b"id\tname\tvalue\tamount\n").await.unwrap();
+        for i in 0..num_rows {
+            let line = format!("{}\tname_{}\t{}.5\t{}\n", i, i, i, i * 10);
+            file.write_all(line.as_bytes()).await.unwrap();
+        }
+        file.flush().await.unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
     /// Helper to create a SQLite pool and table
     async fn setup_sqlite_table(table_name: &str, columns: &str) -> Pool {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -99,6 +112,54 @@ mod tests {
             .batch_concurrency(2)
             .create_table_if_missing(true)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .build()
+            .unwrap();
+
+        coordinator.run_load(&config).await.unwrap()
+    }
+
+    /// Helper to run a basic TSV load test with defaults
+    async fn run_tsv_load(
+        pool: &Pool,
+        table_name: &str,
+        tsv_path: &str,
+        worker_count: usize,
+        chunk_size: u64,
+    ) -> LoadResult {
+        let byte_reader = LocalFileByteReader::new(tsv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::tsv(),
+        ));
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(tsv_path.to_string())
+            .target_table(table_name.to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(worker_count)
+            .chunk_size_bytes(chunk_size)
+            .batch_size(10)
+            .batch_concurrency(2)
+            .create_table_if_missing(true)
+            .file_format(FileFormat::Tsv(DelimitedConfig::tsv()))
             .column_mappings(std::collections::HashMap::new())
             .quiet(true)
             .build()
@@ -262,6 +323,25 @@ mod tests {
         assert!(result.chunks_processed > 0);
         assert_eq!(result.records_loaded, 100);
         assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_tsv_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let tsv_path = create_test_tsv(&temp_dir, "test.tsv", 100).await;
+        let pool =
+            setup_sqlite_table("test_tsv", "id TEXT, name TEXT, value TEXT, amount TEXT").await;
+
+        let result = run_tsv_load(&pool, "test_tsv", &tsv_path, 2, 1000).await;
+
+        // Verify results
+        assert!(result.chunks_processed > 0);
+        assert_eq!(result.records_loaded, 100);
+        assert_eq!(result.records_failed, 0);
+
+        // Verify data was correctly parsed (tab-separated values)
+        let count = get_table_count(&pool, "test_tsv").await;
+        assert_eq!(count, 100);
     }
 
     #[tokio::test]

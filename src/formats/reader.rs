@@ -52,59 +52,19 @@ pub trait FileReader: Send + Sync {
 }
 
 /// Configuration for delimited file reading (CSV, TSV, etc.)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DelimitedConfig {
-    pub delimiter: u8,
+    pub delimiter: String,
     pub has_header: bool,
-    pub quote: u8,
-}
-
-impl DelimitedConfig {
-    /// Convert delimiter byte to string representation
-    pub(crate) fn delimiter_as_string(&self) -> String {
-        if self.delimiter == b'\t' {
-            "\\t".to_string()
-        } else {
-            String::from_utf8(vec![self.delimiter])
-                .unwrap_or_else(|_| format!("\\x{:02x}", self.delimiter))
-        }
-    }
-
-    /// Convert quote byte to string representation
-    pub(crate) fn quote_as_string(&self) -> String {
-        String::from_utf8(vec![self.quote]).unwrap_or_else(|_| format!("\\x{:02x}", self.quote))
-    }
-
-    /// Create from string representations
-    pub(crate) fn from_strings(delimiter: &str, has_header: bool, quote: &str) -> Result<Self> {
-        let delimiter_byte = if delimiter == "\\t" {
-            b'\t'
-        } else if delimiter.len() == 1 {
-            delimiter.as_bytes()[0]
-        } else {
-            anyhow::bail!("Delimiter must be a single character or \\t");
-        };
-
-        let quote_byte = if quote.len() == 1 {
-            quote.as_bytes()[0]
-        } else {
-            anyhow::bail!("Quote must be a single character");
-        };
-
-        Ok(Self {
-            delimiter: delimiter_byte,
-            has_header,
-            quote: quote_byte,
-        })
-    }
+    pub quote: String,
 }
 
 impl Default for DelimitedConfig {
     fn default() -> Self {
         Self {
-            delimiter: b',',
+            delimiter: ",".to_string(),
             has_header: true,
-            quote: b'"',
+            quote: "\"".to_string(),
         }
     }
 }
@@ -116,9 +76,9 @@ impl DelimitedConfig {
 
     pub fn tsv() -> Self {
         Self {
-            delimiter: b'\t',
+            delimiter: "\\t".to_string(),
             has_header: true,
-            quote: b'"',
+            quote: "\"".to_string(),
         }
     }
 }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -29,32 +29,6 @@ pub struct SchemaJson {
     pub columns: Vec<ColumnJson>,
 }
 
-/// Helper struct for JSON serialization of DelimitedConfig
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DelimitedConfigJson {
-    delimiter: String,
-    has_header: bool,
-    quote: String,
-}
-
-impl From<&DelimitedConfig> for DelimitedConfigJson {
-    fn from(config: &DelimitedConfig) -> Self {
-        Self {
-            delimiter: config.delimiter_as_string(),
-            has_header: config.has_header,
-            quote: config.quote_as_string(),
-        }
-    }
-}
-
-impl TryFrom<DelimitedConfigJson> for DelimitedConfig {
-    type Error = anyhow::Error;
-
-    fn try_from(json: DelimitedConfigJson) -> Result<Self> {
-        DelimitedConfig::from_strings(&json.delimiter, json.has_header, &json.quote)
-    }
-}
-
 /// Configuration for Parquet files
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParquetConfig {
@@ -64,123 +38,14 @@ pub struct ParquetConfig {
 /// File format and its associated configuration
 ///
 /// This enum encapsulates both the file format type and its specific configuration.
-/// Serde will serialize this as a tagged enum with format-specific fields.
-#[derive(Debug, Clone)]
+/// Uses serde's adjacently tagged enum serialization for a clean nested JSON structure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "format", content = "config")]
+#[serde(rename_all = "lowercase")]
 pub enum FileFormat {
     Csv(DelimitedConfig),
     Tsv(DelimitedConfig),
     Parquet(ParquetConfig),
-}
-
-impl Serialize for FileFormat {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::SerializeMap;
-
-        let mut map = serializer.serialize_map(None)?;
-        match self {
-            FileFormat::Csv(config) => {
-                map.serialize_entry("format", "csv")?;
-                let json_config = DelimitedConfigJson::from(config);
-                map.serialize_entry("delimiter", &json_config.delimiter)?;
-                map.serialize_entry("has_header", &json_config.has_header)?;
-                map.serialize_entry("quote", &json_config.quote)?;
-            }
-            FileFormat::Tsv(config) => {
-                map.serialize_entry("format", "tsv")?;
-                let json_config = DelimitedConfigJson::from(config);
-                map.serialize_entry("delimiter", &json_config.delimiter)?;
-                map.serialize_entry("has_header", &json_config.has_header)?;
-                map.serialize_entry("quote", &json_config.quote)?;
-            }
-            FileFormat::Parquet(config) => {
-                map.serialize_entry("format", "parquet")?;
-                map.serialize_entry("config", config)?;
-            }
-        }
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for FileFormat {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        use serde::de::{self, MapAccess, Visitor};
-        use std::fmt;
-
-        struct FileFormatVisitor;
-
-        impl<'de> Visitor<'de> for FileFormatVisitor {
-            type Value = FileFormat;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a file format with configuration")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut format: Option<String> = None;
-                let mut delimiter: Option<String> = None;
-                let mut has_header: Option<bool> = None;
-                let mut quote: Option<String> = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "format" => format = Some(map.next_value()?),
-                        "delimiter" => delimiter = Some(map.next_value()?),
-                        "has_header" => has_header = Some(map.next_value()?),
-                        "quote" => quote = Some(map.next_value()?),
-                        "config" => {
-                            let _: serde_json::Value = map.next_value()?;
-                        } // Ignore for now
-                        _ => {
-                            let _: serde_json::Value = map.next_value()?;
-                        }
-                    }
-                }
-
-                let format = format.ok_or_else(|| de::Error::missing_field("format"))?;
-
-                match format.as_str() {
-                    "csv" | "tsv" => {
-                        let delimiter =
-                            delimiter.ok_or_else(|| de::Error::missing_field("delimiter"))?;
-                        let has_header =
-                            has_header.ok_or_else(|| de::Error::missing_field("has_header"))?;
-                        let quote = quote.ok_or_else(|| de::Error::missing_field("quote"))?;
-
-                        let json_config = DelimitedConfigJson {
-                            delimiter,
-                            has_header,
-                            quote,
-                        };
-                        let config = DelimitedConfig::try_from(json_config).map_err(|e| {
-                            de::Error::custom(format!("Invalid delimited config: {}", e))
-                        })?;
-
-                        if format == "csv" {
-                            Ok(FileFormat::Csv(config))
-                        } else {
-                            Ok(FileFormat::Tsv(config))
-                        }
-                    }
-                    "parquet" => Ok(FileFormat::Parquet(ParquetConfig::default())),
-                    _ => Err(de::Error::unknown_variant(
-                        &format,
-                        &["csv", "tsv", "parquet"],
-                    )),
-                }
-            }
-        }
-
-        deserializer.deserialize_map(FileFormatVisitor)
-    }
 }
 
 /// Information about a chunk to be processed
@@ -502,27 +367,30 @@ mod tests {
 
     #[test]
     fn test_file_format_deserialization() {
-        // Test CSV deserialization
+        // Test CSV deserialization with new nested structure
         let csv_json = r#"{
             "format": "csv",
-            "delimiter": ",",
-            "has_header": true,
-            "quote": "\""
+            "config": {
+                "delimiter": ",",
+                "has_header": true,
+                "quote": "\""
+            }
         }"#;
 
         let format: FileFormat = serde_json::from_str(csv_json).unwrap();
         match format {
             FileFormat::Csv(config) => {
-                assert_eq!(config.delimiter, b',');
+                assert_eq!(config.delimiter, ",");
                 assert!(config.has_header);
-                assert_eq!(config.quote, b'"');
+                assert_eq!(config.quote, "\"");
             }
             _ => panic!("Expected CSV format"),
         }
 
-        // Test Parquet deserialization
+        // Test Parquet deserialization with new nested structure
         let parquet_json = r#"{
-            "format": "parquet"
+            "format": "parquet",
+            "config": {}
         }"#;
 
         let format: FileFormat = serde_json::from_str(parquet_json).unwrap();
