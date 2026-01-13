@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+use rand::Rng;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::manifest::{ChunkResultFile, ChunkStatus, ClaimFile, ErrorRecord, ManifestStorage};
-use crate::config::{MAX_RETRIES, QUERY_TIMEOUT};
+use crate::config::{BASE_DELAY, MAX_DELAY, MAX_RETRIES, QUERY_TIMEOUT};
 use crate::db::Pool;
 use crate::formats::{FileReader, Record};
 use crate::telemetry::TelemetryEvent;
@@ -482,70 +484,76 @@ impl Worker {
         records: &[Record],
         schema: &Option<super::manifest::SchemaJson>,
     ) -> Result<()> {
+        let mut last_error = None;
+
         for attempt in 0..MAX_RETRIES {
-            // Acquire a connection from the pool
-            let mut conn = match pool.acquire().await {
-                Ok(conn) => conn,
+            let result = Self::try_execute(pool, insert_sql, records, schema).await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES - 1 => {
+                    let delay = Self::backoff_delay(attempt);
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_retries = MAX_RETRIES,
+                        delay_ms = delay.as_millis() as u64,
+                        "Batch insert failed, retrying: {e:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(e);
+                }
                 Err(e) => {
-                    if attempt < MAX_RETRIES - 1 {
-                        let delay_ms = 1000 * 2u64.pow(attempt);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                        continue;
-                    }
-                    return Err(e).context("Failed to acquire connection from pool");
-                }
-            };
-
-            // Branch based on connection type
-            let execute_result = match &mut conn {
-                crate::db::pool::PoolConnection::Postgres(_) => {
-                    // Postgres: Use existing complex type binding
-                    let mut query = sqlx::query(insert_sql);
-                    for record in records {
-                        query = Self::bind_record_fields(query, &record.fields, schema)?;
-                    }
-                    tokio::time::timeout(QUERY_TIMEOUT, query.execute(&mut *conn)).await
-                }
-                #[cfg(test)]
-                crate::db::pool::PoolConnection::Sqlite(sqlite_conn) => {
-                    // SQLite: Simple string binding for testing
-                    Self::execute_sqlite_batch(sqlite_conn, insert_sql, records).await
-                }
-            };
-
-            match execute_result {
-                Ok(Ok(_)) => return Ok(()),
-                Ok(Err(e)) => {
-                    let is_retryable = Self::is_retryable_error(&e);
-
-                    if is_retryable {
-                        if attempt < MAX_RETRIES - 1 {
-                            let delay_ms = 1000 * 2u64.pow(attempt);
-                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                            continue;
-                        }
-                        return Err(e).context(format!(
-                            "Failed to execute batch insert after {attempt} attempts"
-                        ));
-                    }
-                    return Err(e).context("Failed to execute batch insert");
-                }
-                Err(_) => {
-                    // Timeout occurred
-                    if attempt < MAX_RETRIES - 1 {
-                        let delay_ms = 100 * 2u64.pow(attempt);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                        continue;
-                    }
-                    return Err(anyhow!(
-                        "Query execution timed out after {} seconds",
-                        QUERY_TIMEOUT.as_secs()
+                    return Err(e).context(format!(
+                        "Failed to execute batch insert after {} attempts",
+                        attempt + 1
                     ));
                 }
             }
         }
 
-        unreachable!("Retry loop should always return");
+        Err(last_error.unwrap_or_else(|| anyhow!("Unknown error")))
+            .context(format!("Exhausted {MAX_RETRIES} retry attempts"))
+    }
+
+    /// Calculate exponential backoff delay with jitter
+    fn backoff_delay(attempt: u32) -> Duration {
+        let exp_delay = BASE_DELAY.as_millis().saturating_mul(2u128.pow(attempt));
+        let jitter = rand::thread_rng().gen_range(0.75..=1.25);
+        let delay_ms = (exp_delay as f64 * jitter) as u64;
+        Duration::from_millis(delay_ms).min(MAX_DELAY)
+    }
+
+    /// Attempt to execute a batch insert (single try, no retry logic)
+    async fn try_execute(
+        pool: &Pool,
+        insert_sql: &str,
+        records: &[Record],
+        schema: &Option<super::manifest::SchemaJson>,
+    ) -> Result<()> {
+        let mut conn = pool
+            .acquire()
+            .await
+            .context("Failed to acquire connection from pool")?;
+
+        let query_future = match &mut conn {
+            crate::db::pool::PoolConnection::Postgres(_) => {
+                let mut query = sqlx::query(insert_sql);
+                for record in records {
+                    query = Self::bind_record_fields(query, &record.fields, schema)?;
+                }
+                query.execute(&mut *conn)
+            }
+            #[cfg(test)]
+            crate::db::pool::PoolConnection::Sqlite(sqlite_conn) => {
+                return Self::execute_sqlite_batch(sqlite_conn, insert_sql, records).await;
+            }
+        };
+
+        tokio::time::timeout(QUERY_TIMEOUT, query_future)
+            .await
+            .map_err(|_| anyhow!("Query timed out after {}s", QUERY_TIMEOUT.as_secs()))?
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     /// Execute a batch insert for SQLite (simple string binding for testing)
@@ -554,8 +562,7 @@ impl Worker {
         conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
         insert_sql: &str,
         records: &[Record],
-    ) -> Result<Result<sqlx::postgres::PgQueryResult, sqlx::Error>, tokio::time::error::Elapsed>
-    {
+    ) -> Result<()> {
         // Convert Postgres placeholders ($1, $2) to SQLite placeholders (?, ?)
         let sqlite_sql = Self::convert_to_sqlite_placeholders(insert_sql);
 
@@ -568,13 +575,11 @@ impl Worker {
             }
         }
 
-        // Execute and convert result to match Postgres return type
-        let result = tokio::time::timeout(QUERY_TIMEOUT, query.execute(&mut **conn)).await;
-        match result {
-            Ok(Ok(_)) => Ok(Ok(sqlx::postgres::PgQueryResult::default())),
-            Ok(Err(e)) => Ok(Err(e)),
-            Err(e) => Err(e),
-        }
+        tokio::time::timeout(QUERY_TIMEOUT, query.execute(&mut **conn))
+            .await
+            .map_err(|_| anyhow!("Query timed out after {}s", QUERY_TIMEOUT.as_secs()))?
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     /// Convert Postgres-style placeholders ($1, $2, ...) to SQLite-style (?, ?, ...)
@@ -741,25 +746,56 @@ impl Worker {
     }
 
     /// Check if error is retriable (transient errors that may resolve with retry)
-    fn is_retryable_error(error: &sqlx::Error) -> bool {
+    fn is_retryable_error(error: &anyhow::Error) -> bool {
+        // Check for timeout errors (from tokio::time::timeout)
         let error_msg = error.to_string();
-
-        // Error code 42001 (specific DSQL error)
-        if error_msg.contains("42001") {
+        if error_msg.contains("timed out") {
             return true;
         }
 
-        // Server unavailable or connection errors
-        if error_msg.contains("server unavailable")
-            || error_msg.contains("OC")
-            || error_msg.contains("40001")
-            || error_msg.contains("connection")
-            || error_msg.contains("timeout")
-            || error_msg.contains("transaction age limit")
-            || error_msg.contains("Connection reset")
-            || error_msg.contains("broken pipe")
-        {
-            return true;
+        // Try to downcast to sqlx::Error for proper variant matching
+        if let Some(sqlx_error) = error.downcast_ref::<sqlx::Error>() {
+            match sqlx_error {
+                // Connection pool errors - always retryable
+                sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => return true,
+
+                // IO errors (network issues, broken pipes, etc.) - retryable
+                sqlx::Error::Io(_) => return true,
+
+                // Database-specific errors - check error codes
+                sqlx::Error::Database(db_err) => {
+                    if let Some(code) = db_err.code() {
+                        // PostgreSQL/DSQL error codes:
+                        // 40001 - serialization_failure (transaction conflicts)
+                        // 40P01 - deadlock_detected
+                        // 42001 - DSQL-specific transient error
+                        // 08xxx - Connection errors (08000, 08003, 08006, 08P01)
+                        // 53xxx - Insufficient resources (53000, 53100, 53200, 53300, 53400)
+                        // 57xxx - Operator intervention (57000, 57014, 57P01, 57P02, 57P03)
+                        if code.starts_with("08")
+                            || code.starts_with("53")
+                            || code.starts_with("57")
+                            || code == "40001"
+                            || code == "40P01"
+                            || code == "42001"
+                        {
+                            return true;
+                        }
+                    }
+
+                    // Fall back to message checking for specific patterns
+                    let db_msg = db_err.message();
+                    if db_msg.contains("server unavailable")
+                        || db_msg.contains("transaction age limit")
+                        || db_msg.contains("Connection reset")
+                    {
+                        return true;
+                    }
+                }
+
+                // All other errors are not retryable
+                _ => return false,
+            }
         }
 
         false

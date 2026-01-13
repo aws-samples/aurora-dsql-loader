@@ -26,5 +26,6 @@
 /manifest-*/
 *.manifest
 
-# Claude Code
+# Coding agents
+.kiro/
 **/.claude/**

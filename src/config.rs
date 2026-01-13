@@ -21,6 +21,10 @@ pub const TOKEN_VALIDITY_DURATION: Duration = Duration::from_secs(900); // 15 mi
 
 pub const MAX_RETRIES: u32 = 5;
 
+pub const BASE_DELAY: Duration = Duration::from_secs(1);
+
+pub const MAX_DELAY: Duration = Duration::from_secs(30);
+
 /// Timeout for individual database queries
 ///
 /// Set to 3 minutes because INSERT operations with large batches can take time,

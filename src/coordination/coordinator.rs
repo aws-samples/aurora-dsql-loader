@@ -12,10 +12,10 @@ use super::manifest::{
     ChunkInfo, ChunkResultFile, DsqlConfig, FileFormat, ManifestFile, ManifestStorage,
 };
 use super::worker::Worker;
-use crate::db::schema::{query_table_schema, validate_schema_exists, Schema};
+use crate::db::schema::{Schema, query_table_schema, validate_schema_exists};
 use crate::db::{Pool, SchemaInferrer};
-use crate::formats::reader::{Chunk, FileMetadata};
 use crate::formats::FileReader;
+use crate::formats::reader::{Chunk, FileMetadata};
 use crate::telemetry::{ProgressStats, TelemetryEvent};
 
 /// Maximum bytes to read for schema inference
@@ -98,7 +98,7 @@ impl Coordinator {
 
         // 1. Generate job ID
         let job_id = Uuid::new_v4().to_string();
-        info!("Starting load job: {}", job_id);
+        info!("Starting load job: {job_id}");
 
         // Validate that the schema exists before starting
         validate_schema_exists(&self.pool, &config.schema).await?;
