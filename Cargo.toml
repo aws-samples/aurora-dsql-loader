@@ -15,7 +15,7 @@ anyhow = { version = "1.0.100", features = ["backtrace"] }
 arrow = "57"
 async-stream = "0.3.6"
 async-trait = "0.1"
-aws-config = "1.5"
+aws-config = { version = "1.5", features = ["sso"] }
 aws-credential-types = "1.2"
 aws-sdk-dsql = "1.40"
 aws-sdk-s3 = "1.40"

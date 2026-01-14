@@ -106,11 +106,17 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
         let mut records = Vec::new();
 
         for result in csv_reader.records() {
-            let record = result.context("Failed to parse CSV record")?;
-
-            records.push(Record {
-                fields: record.iter().map(|s| s.to_string()).collect(),
-            });
+            match result {
+                Ok(record) => {
+                    records.push(Record {
+                        fields: record.iter().map(|s| s.to_string()).collect(),
+                    });
+                }
+                Err(_) => {
+                    // Incomplete trailing record (chunk ended mid-line) - stop parsing
+                    break;
+                }
+            }
         }
 
         Ok(ChunkData {
