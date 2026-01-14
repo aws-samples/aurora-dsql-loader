@@ -92,8 +92,10 @@ impl Worker {
 
     /// Run the worker loop until no more work is available
     pub async fn run(&self, job_id: &str, file_reader: Arc<dyn FileReader>) -> Result<()> {
+        use rand::seq::SliceRandom;
+
         loop {
-            let unclaimed = self
+            let mut unclaimed = self
                 .manifest_storage
                 .list_unclaimed_chunks(job_id)
                 .await
@@ -102,6 +104,9 @@ impl Worker {
             if unclaimed.is_empty() {
                 break;
             }
+
+            // Shuffle chunks to randomize processing order and avoid contention
+            unclaimed.shuffle(&mut rand::thread_rng());
 
             let mut claimed_any = false;
             for chunk_id in unclaimed {
@@ -602,12 +607,6 @@ impl Worker {
                 Ok(()) => return Ok(()),
                 Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES - 1 => {
                     let delay = Self::backoff_delay(attempt);
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max_retries = MAX_RETRIES,
-                        delay_ms = delay.as_millis() as u64,
-                        "Batch insert failed, retrying: {e:?}"
-                    );
                     tokio::time::sleep(delay).await;
                     last_error = Some(e);
                 }
