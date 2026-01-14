@@ -89,6 +89,10 @@ struct OutputArgs {
     /// Directory for manifest files (default: system temp directory)
     #[arg(long)]
     manifest_dir: Option<String>,
+
+    /// Resume an incomplete job by job ID (requires --manifest-dir)
+    #[arg(long, requires = "manifest_dir")]
+    resume_job_id: Option<String>,
 }
 
 #[derive(Clone, Subcommand)]
@@ -247,6 +251,7 @@ async fn run_loader(
         manifest_dir: output.manifest_dir.clone().map(PathBuf::from),
         quiet: output.quiet,
         column_mappings,
+        resume_job_id: output.resume_job_id.clone(),
     };
 
     // Run the load

@@ -152,6 +152,39 @@ impl Worker {
 
     /// Process a single chunk by reading data and loading it into the database
     /// Writes the result to manifest storage before returning
+    ///
+    /// # Cancellation Safety
+    ///
+    /// This function is **not cancellation-safe** in the strict sense: if the future is dropped
+    /// mid-execution, some database records may be committed while others are not. However, the
+    /// manifest tracking system provides recovery guarantees:
+    ///
+    /// ## What happens on cancellation/crash:
+    /// - **Partial batch commits**: Individual batches are committed independently via separate
+    ///   INSERT statements. If cancellation occurs after some batches complete, those records
+    ///   remain committed in the database.
+    /// - **No result file**: The chunk result file is only written at the end (after all batches
+    ///   complete). If cancelled before completion, no result file exists.
+    /// - **Chunk remains claimed**: The claim file was created before processing started and
+    ///   persists after cancellation.
+    ///
+    /// ## Recovery on retry:
+    /// - **Stuck chunks detection**: When resuming with `--resume-job-id`, the coordinator detects:
+    ///   - Chunks with claim files but no result files (worker crash/cancellation)
+    ///   - Chunks with result files where `records_failed > 0` (partial failures)
+    ///
+    ///   Both types are automatically retried by removing their claim/result files.
+    /// - **Re-processing with idempotency**: If the table has unique constraints
+    ///   (`has_unique_constraints = true`), re-processing the chunk will use `ON CONFLICT DO NOTHING`,
+    ///   making duplicate inserts safe. Already-committed records are silently skipped.
+    /// - **Without unique constraints**: Re-processing without unique constraints may insert
+    ///   duplicate records. Use unique constraints for safe retry, or manually deduplicate afterward.
+    ///
+    /// ## Design rationale:
+    /// - **Performance over strict ACID**: Batches are committed independently (not in a single
+    ///   transaction) to maximize throughput and avoid long-running transactions.
+    /// - **Resumability**: The chunk-level manifest tracking allows detecting and re-processing
+    ///   incomplete work, trading strict once-semantics for better fault tolerance and performance.
     async fn process_chunk(
         &self,
         job_id: &str,

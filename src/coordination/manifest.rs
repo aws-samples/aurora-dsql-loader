@@ -164,6 +164,15 @@ pub trait ManifestStorage: Send + Sync {
 
     /// List all chunk IDs that have not been claimed yet
     async fn list_unclaimed_chunks(&self, job_id: &str) -> Result<Vec<u32>>;
+
+    /// Clean up claim files for incomplete or failed chunks.
+    ///
+    /// ASSUMES: The previous load for this job_id has completely stopped.
+    /// This function is NOT safe for concurrent resume attempts.
+    ///
+    /// - Removes claims for chunks with no result file (worker crashed/stopped)
+    /// - Removes both claim and result for chunks with failures (records_failed > 0)
+    async fn cleanup_old_claims(&self, job_id: &str) -> Result<()>;
 }
 
 /// Local filesystem implementation of ManifestStorage
@@ -338,6 +347,65 @@ impl ManifestStorage for LocalManifestStorage {
         }
 
         Ok(unclaimed)
+    }
+
+    async fn cleanup_old_claims(&self, job_id: &str) -> Result<()> {
+        // Read the manifest to get the list of chunks
+        let manifest = self.read_manifest(job_id).await?;
+
+        for chunk in &manifest.chunks {
+            let claim_path = self.claim_path(job_id, chunk.chunk_id);
+            let result_path = self.result_path(job_id, chunk.chunk_id);
+
+            // Check if result file exists
+            if fs::try_exists(&result_path).await? {
+                // Result exists - check if it had failures
+                match self.read_result(job_id, chunk.chunk_id).await {
+                    Ok(result) => {
+                        if result.status == ChunkStatus::Failed || result.records_failed > 0 {
+                            // Chunk had failures - remove result and claim so it can be retried
+                            tracing::info!(
+                                "Removing failed chunk {} result (records_failed: {}) to allow retry",
+                                chunk.chunk_id,
+                                result.records_failed
+                            );
+                            fs::remove_file(&result_path).await.context(format!(
+                                "Failed to remove result file for failed chunk {}",
+                                chunk.chunk_id
+                            ))?;
+                            // Also remove claim if it exists
+                            if fs::try_exists(&claim_path).await? {
+                                fs::remove_file(&claim_path).await.ok();
+                            }
+                        }
+                        // If no failures, chunk is successfully completed - skip
+                    }
+                    Err(e) => {
+                        // Can't read result file - treat as incomplete
+                        tracing::warn!(
+                            "Unable to read result file for chunk {}: {}, will treat as incomplete",
+                            chunk.chunk_id,
+                            e
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // No result file - remove claim unconditionally (worker crashed/stopped)
+            if fs::try_exists(&claim_path).await? {
+                tracing::info!(
+                    "Removing incomplete claim for chunk {}",
+                    chunk.chunk_id
+                );
+                fs::remove_file(&claim_path).await.context(format!(
+                    "Failed to remove claim file for chunk {}",
+                    chunk.chunk_id
+                ))?;
+            }
+        }
+
+        Ok(())
     }
 }
 

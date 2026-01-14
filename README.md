@@ -73,9 +73,32 @@ aurora-dsql-loader load \
 
 - **Fast**: Parallel loading with configurable workers
 - **Smart**: Auto-detects file format and region
-- **Reliable**: Automatic retries and resumable loads
+- **Reliable**: Automatic retries and fault-tolerant loading
 - **Flexible**: Works with local files or S3 URIs
 - **Formats**: CSV, TSV, and Parquet support
+
+## Resuming Failed Loads
+
+If a load fails mid-execution, resume from where it left off using `--resume-job-id`:
+
+```bash
+# Initial load (note the Job ID in output)
+aurora-dsql-loader load \
+  --endpoint your-cluster.dsql.us-east-1.on.aws \
+  --source-uri large-file.csv \
+  --table my_table \
+  --manifest-dir ./my-load-manifest
+
+# Resume after failure
+aurora-dsql-loader load \
+  --endpoint your-cluster.dsql.us-east-1.on.aws \
+  --source-uri large-file.csv \
+  --table my_table \
+  --manifest-dir ./my-load-manifest \
+  --resume-job-id abc-123-def-456
+```
+
+Resume automatically retries failed chunks and skips completed ones. For safety against duplicates on retry, use unique constraints on your table—the loader will use `ON CONFLICT DO NOTHING` to skip duplicates.
 
 ## Requirements
 

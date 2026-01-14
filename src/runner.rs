@@ -80,6 +80,9 @@ pub struct LoadArgs {
     // Column mapping: source column name -> destination column name
     pub column_mappings: HashMap<String, String>,
 
+    // Resume options
+    pub resume_job_id: Option<String>,
+
     // Test-only: inject a pre-created pool (for SQLite testing)
     #[cfg(test)]
     pub test_pool: Option<crate::db::Pool>,
@@ -129,6 +132,7 @@ pub struct LoadResult {
 ///     manifest_dir: None,
 ///     column_mappings: HashMap::new(),
 ///     quiet: true,
+///     resume_job_id: None,
 /// };
 ///
 /// let result = run_load(args).await?;
@@ -218,6 +222,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         .file_format(file_format)
         .column_mappings(args.column_mappings)
         .quiet(args.quiet)
+        .resume_job_id(args.resume_job_id)
         .build()?;
 
     // Run the load

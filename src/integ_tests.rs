@@ -9,7 +9,7 @@ mod tests {
         coordination::{
             Coordinator, DsqlConfig, FileFormat, LoadConfigBuilder,
             coordinator::LoadResult,
-            manifest::{ChunkStatus, LocalManifestStorage},
+            manifest::{ChunkResultFile, ChunkStatus, LocalManifestStorage},
         },
         db::{Pool, SchemaInferrer, pool::PoolConnection},
         formats::{DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader},
@@ -474,6 +474,7 @@ mod tests {
             manifest_dir: None,
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
+            resume_job_id: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -560,6 +561,7 @@ mod tests {
             manifest_dir: None,
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
+            resume_job_id: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -695,6 +697,7 @@ mod tests {
             manifest_dir: None, // Don't specify manifest dir - this is key
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
+            resume_job_id: None,
             test_pool: Some(pool),
         };
 
@@ -960,6 +963,7 @@ mod tests {
             manifest_dir: None,
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
+            resume_job_id: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -1016,5 +1020,375 @@ mod tests {
 
         assert_eq!(result.records_loaded, 10);
         assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_resume_incomplete_job() {
+        use crate::db::pool::PoolConnection;
+        use tempfile::TempDir;
+        use tokio::fs;
+
+        // Create test CSV data
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = temp_dir.path().join("test.csv").display().to_string();
+
+        // Create CSV with 50 records
+        let mut csv_content = String::from("id,name,value\n");
+        for i in 1..=50 {
+            csv_content.push_str(&format!("{},name{},{}\n", i, i, i * 10));
+        }
+        fs::write(&csv_path, csv_content).await.unwrap();
+
+        // Set up SQLite table with primary key for idempotency
+        let pool =
+            setup_sqlite_table("test_resume", "id TEXT PRIMARY KEY, name TEXT, value TEXT").await;
+
+        // Create persistent manifest directory
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_path = manifest_dir.path().to_path_buf();
+
+        // First load - complete successfully
+        let args1 = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path.clone(),
+            target_table: "test_resume".to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            chunk_size_bytes: 500, // Small chunks to create multiple chunks
+            batch_size: 10,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: Some(manifest_path.clone()),
+            quiet: true,
+            column_mappings: std::collections::HashMap::new(),
+            resume_job_id: None,
+            test_pool: Some(pool.clone()),
+        };
+
+        let result1 = run_load(args1).await.unwrap();
+        let job_id = result1.job_id.clone();
+
+        // Verify first load completed
+        assert_eq!(result1.records_loaded, 50);
+        assert!(result1.chunks_processed > 1, "Should have multiple chunks");
+
+        // Count records after first load
+        let mut conn = pool.acquire().await.unwrap();
+        let count1 = if let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
+            let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM test_resume")
+                .fetch_one(&mut **sqlite_conn)
+                .await
+                .unwrap();
+            count
+        } else {
+            panic!("Expected SQLite connection");
+        };
+        assert_eq!(count1, 50);
+
+        // ===== CAPTURE MANIFEST STATE AFTER FIRST LOAD =====
+        let chunks_dir = manifest_path.join("jobs").join(&job_id).join("chunks");
+
+        // Read and verify all chunk result files
+        let mut first_load_results = Vec::new();
+        for chunk_id in 0..result1.chunks_processed {
+            let result_path = chunks_dir.join(format!("{:04}.result", chunk_id));
+
+            // Verify result file exists
+            assert!(
+                result_path.exists(),
+                "Chunk {} result file should exist after first load",
+                chunk_id
+            );
+
+            // Read and parse result file
+            let content = fs::read_to_string(&result_path).await.unwrap();
+            let result: ChunkResultFile = serde_json::from_str(&content).unwrap();
+
+            // Verify chunk succeeded
+            assert_eq!(
+                result.status,
+                ChunkStatus::Success,
+                "Chunk {} should have Success status",
+                chunk_id
+            );
+            assert_eq!(result.records_failed, 0);
+            assert!(result.records_loaded > 0);
+
+            first_load_results.push((chunk_id, result));
+        }
+
+        // Verify all chunks have claim files
+        for chunk_id in 0..result1.chunks_processed {
+            let claim_path = chunks_dir.join(format!("{:04}.claim", chunk_id));
+            assert!(
+                claim_path.exists(),
+                "Chunk {} claim file should exist after first load",
+                chunk_id
+            );
+        }
+
+        // Second load - resume the same job (should do nothing since already complete)
+        let args2 = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path.clone(),
+            target_table: "test_resume".to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            chunk_size_bytes: 500,
+            batch_size: 10,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: Some(manifest_path.clone()),
+            quiet: true,
+            column_mappings: std::collections::HashMap::new(),
+            resume_job_id: Some(job_id.clone()),
+            test_pool: Some(pool.clone()),
+        };
+
+        let result2 = run_load(args2).await.unwrap();
+
+        // Verify resume used same job_id
+        assert_eq!(result2.job_id, job_id);
+
+        // ===== VERIFY MANIFEST STATE AFTER RESUME =====
+        // Verify result files are unchanged (proves chunks weren't re-executed)
+        for (chunk_id, original_result) in &first_load_results {
+            let result_path = chunks_dir.join(format!("{:04}.result", chunk_id));
+
+            assert!(
+                result_path.exists(),
+                "Chunk {} result file should still exist after resume",
+                chunk_id
+            );
+
+            // Read and verify content is identical
+            let content = fs::read_to_string(&result_path).await.unwrap();
+            let current_result: ChunkResultFile = serde_json::from_str(&content).unwrap();
+
+            // Compare key fields - if timestamps match, file wasn't rewritten
+            assert_eq!(current_result.chunk_id, original_result.chunk_id);
+            assert_eq!(current_result.status, original_result.status);
+            assert_eq!(
+                current_result.records_loaded,
+                original_result.records_loaded
+            );
+            assert_eq!(current_result.worker_id, original_result.worker_id);
+            assert_eq!(
+                current_result.started_at, original_result.started_at,
+                "Chunk {} result file was rewritten (started_at changed)",
+                chunk_id
+            );
+            assert_eq!(
+                current_result.completed_at, original_result.completed_at,
+                "Chunk {} result file was rewritten (completed_at changed)",
+                chunk_id
+            );
+        }
+
+        // Verify claim files still exist
+        for chunk_id in 0..result1.chunks_processed {
+            let claim_path = chunks_dir.join(format!("{:04}.claim", chunk_id));
+            assert!(
+                claim_path.exists(),
+                "Chunk {} claim file should still exist after resume",
+                chunk_id
+            );
+        }
+
+        // Count records after resume - should still be 50 (no duplicates)
+        let mut conn = pool.acquire().await.unwrap();
+        let count2 = if let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
+            let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM test_resume")
+                .fetch_one(&mut **sqlite_conn)
+                .await
+                .unwrap();
+            count
+        } else {
+            panic!("Expected SQLite connection");
+        };
+        assert_eq!(count2, 50, "Resume should not create duplicates");
+
+        // All chunks should still be claimed (no new work done)
+        assert_eq!(
+            result2.chunks_processed,
+            result1.chunks_processed,
+            "Resume should process same number of chunks (no new work)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resume_retries_failed_chunks() {
+        use crate::db::pool::PoolConnection;
+        use tempfile::TempDir;
+        use tokio::fs;
+
+        // Create test CSV data - mix of valid and invalid values
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = temp_dir.path().join("test.csv").display().to_string();
+
+        // Create CSV with 40 records - some will fail due to CHECK constraint
+        let mut csv_content = String::from("id,name,value\n");
+        for i in 1..=40 {
+            csv_content.push_str(&format!("{},name{},{}\n", i, i, i * 10));
+        }
+        fs::write(&csv_path, csv_content).await.unwrap();
+
+        // Set up SQLite table with CHECK constraint that will fail for values > 300
+        let pool = setup_sqlite_table(
+            "test_resume_failures",
+            "id TEXT PRIMARY KEY, name TEXT, value INTEGER CHECK(value <= 300)",
+        )
+        .await;
+
+        // Create persistent manifest directory
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_path = manifest_dir.path().to_path_buf();
+
+        // First load - will have failures for records with value > 300 (ids 31-40)
+        let args1 = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path.clone(),
+            target_table: "test_resume_failures".to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            chunk_size_bytes: 200, // Small chunks to ensure multiple chunks
+            batch_size: 5,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: Some(manifest_path.clone()),
+            quiet: true,
+            column_mappings: std::collections::HashMap::new(),
+            resume_job_id: None,
+            test_pool: Some(pool.clone()),
+        };
+
+        let result1 = run_load(args1).await.unwrap();
+        let job_id = result1.job_id.clone();
+
+        // Verify first load had some successes and some failures
+        println!(
+            "First load: loaded={}, failed={}",
+            result1.records_loaded, result1.records_failed
+        );
+        assert!(result1.records_loaded < 40, "Should have some failures");
+        assert!(result1.records_failed > 0, "Should have failures");
+
+        // Count records after first load - should only have records with value <= 300
+        let mut conn = pool.acquire().await.unwrap();
+        let count1 = if let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
+            let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM test_resume_failures")
+                .fetch_one(&mut **sqlite_conn)
+                .await
+                .unwrap();
+            count
+        } else {
+            panic!("Expected SQLite connection");
+        };
+        println!("Records in DB after first load: {}", count1);
+        assert!(
+            count1 < 40,
+            "Should have fewer than 40 records due to failures"
+        );
+        assert!(count1 <= 30, "Should have at most 30 records (ids 1-30)");
+
+        // Fetch existing records before dropping table
+        let mut existing_records = Vec::new();
+        if let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
+            let rows: Vec<(String, String, i64)> =
+                sqlx::query_as("SELECT id, name, value FROM test_resume_failures")
+                    .fetch_all(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            existing_records = rows;
+        }
+        drop(conn);
+
+        // Now drop and recreate table WITHOUT the CHECK constraint
+        let mut conn = pool.acquire().await.unwrap();
+        if let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
+            sqlx::query("DROP TABLE test_resume_failures")
+                .execute(&mut **sqlite_conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE test_resume_failures (id TEXT PRIMARY KEY, name TEXT, value INTEGER)",
+            )
+            .execute(&mut **sqlite_conn)
+            .await
+            .unwrap();
+
+            // Re-insert the successfully loaded records
+            for (id, name, value) in existing_records {
+                sqlx::query("INSERT INTO test_resume_failures VALUES (?, ?, ?)")
+                    .bind(id)
+                    .bind(name)
+                    .bind(value)
+                    .execute(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            }
+        }
+        drop(conn);
+
+        // Resume the job - failed chunks should be retried without the constraint
+        let args2 = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path.clone(),
+            target_table: "test_resume_failures".to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            chunk_size_bytes: 200,
+            batch_size: 5,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: Some(manifest_path.clone()),
+            quiet: true,
+            column_mappings: std::collections::HashMap::new(),
+            resume_job_id: Some(job_id.clone()),
+            test_pool: Some(pool.clone()),
+        };
+
+        let result2 = run_load(args2).await.unwrap();
+
+        // Verify resume used same job_id
+        assert_eq!(result2.job_id, job_id);
+
+        println!(
+            "Second load: loaded={}, failed={}",
+            result2.records_loaded, result2.records_failed
+        );
+
+        // Verify resume retried the failed chunks and succeeded
+        assert_eq!(result2.records_failed, 0, "Resume should have no failures");
+        assert!(
+            result2.records_loaded > 0,
+            "Should have loaded some records on resume"
+        );
+
+        // Count records after resume - should have more than before
+        let mut conn = pool.acquire().await.unwrap();
+        let count2 = if let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
+            let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM test_resume_failures")
+                .fetch_one(&mut **sqlite_conn)
+                .await
+                .unwrap();
+            count
+        } else {
+            panic!("Expected SQLite connection");
+        };
+
+        assert_eq!(count2, 40);
     }
 }
