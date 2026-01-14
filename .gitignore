@@ -1,4 +1,31 @@
-box/
-*_venv/
-venv/
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo.lock should be committed for binary projects
+# but if you want to ignore it, uncomment:
+# Cargo.lock
+
+# IDE and editor files
+.idea/
 .vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing and data
+*.log
+*.csv
+*.tsv
+*.parquet
+/test-data/
+/.data/
+
+# Manifest files (temporary state)
+/manifest-*/
+*.manifest
+
+# Coding agents
+.kiro/
+**/.claude/**
