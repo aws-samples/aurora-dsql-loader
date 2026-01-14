@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::manifest::{
-    ChunkInfo, ChunkResultFile, DsqlConfig, FileFormat, ManifestFile, ManifestStorage,
+    ChunkInfo, ChunkResultFile, DsqlConfig, FileFormat, ManifestFile, ManifestStorage, OnConflict,
 };
 use super::worker::Worker;
 use crate::db::schema::{Schema, query_table_schema, validate_schema_exists};
@@ -46,6 +46,8 @@ pub struct LoadConfig {
     quiet: bool,
     #[builder(default)]
     resume_job_id: Option<String>,
+    #[builder(default)]
+    on_conflict: OnConflict,
 }
 
 /// Result of a completed data load operation
@@ -146,7 +148,7 @@ impl Coordinator {
                 Err(_) => {
                     // Chunk result may be missing if worker crashed before writing result file
                     // This is tracked in failure metrics and doesn't require hard failure
-                    tracing::warn!("Chunk {chunk_id} result missing");
+                    warn!("Chunk {chunk_id} result missing");
                 }
             }
         }
@@ -451,16 +453,35 @@ impl Coordinator {
         schema: Option<Schema>,
         table_created: bool,
     ) -> Result<()> {
-        // Detect unique constraints
+        // Detect unique constraints and get conflict columns if needed
         info!("Checking for unique constraints on table...");
         let has_unique_constraints = self
             .pool
             .has_unique_constraints(&config.schema, &config.target_table)
             .await
-            .unwrap_or(false);
+            .context("Failed to check for unique constraints")?;
+
+        // Fetch constraint columns if they exist, or validate DoUpdate requirements
+        let conflict_columns = if has_unique_constraints {
+            self.pool
+                .get_unique_constraint_columns(&config.schema, &config.target_table)
+                .await
+                .context("Failed to query constraint columns")?
+        } else {
+            if config.on_conflict == OnConflict::DoUpdate {
+                return Err(anyhow::anyhow!(
+                    "do-update mode requires table '{}' to have a primary key or unique constraint",
+                    config.target_table
+                ));
+            }
+            Vec::new()
+        };
 
         if has_unique_constraints {
-            info!("Table has unique constraints - will use ON CONFLICT DO NOTHING");
+            info!(
+                "Table has unique constraints on columns: {:?}",
+                conflict_columns
+            );
         }
 
         // Build manifest
@@ -481,6 +502,8 @@ impl Coordinator {
             schema: schema.map(|s| s.into()),
             was_created: table_created,
             has_unique_constraints,
+            on_conflict: config.on_conflict,
+            conflict_columns,
         };
 
         let manifest = ManifestFile {

@@ -5,6 +5,9 @@
 //!
 //! This is the primary API for external users and for the CLI.
 
+// Re-export OnConflict for external use
+pub use crate::coordination::manifest::OnConflict;
+
 use anyhow::Result;
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;
@@ -83,6 +86,9 @@ pub struct LoadArgs {
     // Resume options
     pub resume_job_id: Option<String>,
 
+    // Conflict resolution strategy
+    pub on_conflict: OnConflict,
+
     // Test-only: inject a pre-created pool (for SQLite testing)
     #[cfg(test)]
     pub test_pool: Option<crate::db::Pool>,
@@ -112,7 +118,7 @@ pub struct LoadResult {
 /// # Example
 ///
 /// ```no_run
-/// use aurora_dsql_loader::runner::{LoadArgs, Format, run_load};
+/// use aurora_dsql_loader::runner::{LoadArgs, Format, OnConflict, run_load};
 /// use std::collections::HashMap;
 ///
 /// # async fn example() -> anyhow::Result<()> {
@@ -133,6 +139,7 @@ pub struct LoadResult {
 ///     column_mappings: HashMap::new(),
 ///     quiet: true,
 ///     resume_job_id: None,
+///     on_conflict: OnConflict::DoNothing,
 /// };
 ///
 /// let result = run_load(args).await?;
@@ -223,6 +230,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         .column_mappings(args.column_mappings)
         .quiet(args.quiet)
         .resume_job_id(args.resume_job_id)
+        .on_conflict(args.on_conflict)
         .build()?;
 
     // Run the load

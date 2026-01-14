@@ -475,6 +475,7 @@ mod tests {
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
             test_pool: Some(pool.clone()),
         };
 
@@ -562,6 +563,7 @@ mod tests {
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
             test_pool: Some(pool.clone()),
         };
 
@@ -698,6 +700,7 @@ mod tests {
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
             test_pool: Some(pool),
         };
 
@@ -964,6 +967,7 @@ mod tests {
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
             test_pool: Some(pool.clone()),
         };
 
@@ -1065,6 +1069,7 @@ mod tests {
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
             test_pool: Some(pool.clone()),
         };
 
@@ -1148,6 +1153,7 @@ mod tests {
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: Some(job_id.clone()),
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
             test_pool: Some(pool.clone()),
         };
 
@@ -1216,8 +1222,7 @@ mod tests {
 
         // All chunks should still be claimed (no new work done)
         assert_eq!(
-            result2.chunks_processed,
-            result1.chunks_processed,
+            result2.chunks_processed, result1.chunks_processed,
             "Resume should process same number of chunks (no new work)"
         );
     }
@@ -1268,6 +1273,7 @@ mod tests {
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
             test_pool: Some(pool.clone()),
         };
 
@@ -1357,6 +1363,7 @@ mod tests {
             quiet: true,
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: Some(job_id.clone()),
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
             test_pool: Some(pool.clone()),
         };
 
@@ -1390,5 +1397,326 @@ mod tests {
         };
 
         assert_eq!(count2, 40);
+    }
+
+    #[tokio::test]
+    async fn test_on_conflict_do_update_with_primary_key() {
+        use crate::coordination::manifest::OnConflict;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create initial CSV with 3 rows
+        let csv_path1 = create_csv_with_content(
+            &temp_dir,
+            "initial.csv",
+            &[
+                "id,name,value\n",
+                "1,Alice,100\n",
+                "2,Bob,200\n",
+                "3,Charlie,300\n",
+            ],
+        )
+        .await;
+
+        // Setup table with primary key on id
+        let pool =
+            setup_sqlite_table("test_upsert", "id TEXT PRIMARY KEY, name TEXT, value TEXT").await;
+
+        // Load initial data with do-nothing mode
+        let byte_reader = LocalFileByteReader::new(&csv_path1);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let coordinator = Coordinator::new(
+            manifest_storage.clone(),
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path1.clone())
+            .target_table("test_upsert".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .build()
+            .unwrap();
+
+        let result1 = coordinator.run_load(&config).await.unwrap();
+        assert_eq!(result1.records_loaded, 3);
+
+        // Create second CSV with overlapping IDs but different values
+        let csv_path2 = create_csv_with_content(
+            &temp_dir,
+            "update.csv",
+            &[
+                "id,name,value\n",
+                "2,Bob_Updated,250\n",
+                "3,Charlie_Updated,350\n",
+                "4,David,400\n",
+            ],
+        )
+        .await;
+
+        // Load with do-update mode (upsert)
+        let byte_reader2 = LocalFileByteReader::new(&csv_path2);
+        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader2,
+            DelimitedConfig::csv(),
+        ));
+
+        let coordinator2 = Coordinator::new(
+            manifest_storage,
+            file_reader2,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config2 = LoadConfigBuilder::default()
+            .source_uri(csv_path2)
+            .target_table("test_upsert".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoUpdate)
+            .build()
+            .unwrap();
+
+        let result2 = coordinator2.run_load(&config2).await.unwrap();
+        assert_eq!(
+            result2.records_loaded, 3,
+            "All 3 records should be processed"
+        );
+
+        // Verify final state: should have 4 rows total, with updates applied
+        let count = get_table_count(&pool, "test_upsert").await;
+        assert_eq!(
+            count, 4,
+            "Should have 4 total rows (1 original + 2 updated + 1 new)"
+        );
+
+        // Verify Bob and Charlie were updated
+        let mut conn = pool.acquire().await.unwrap();
+        if let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
+            let (bob_name, bob_value): (String, String) =
+                sqlx::query_as("SELECT name, value FROM test_upsert WHERE id = '2'")
+                    .fetch_one(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            assert_eq!(bob_name, "Bob_Updated");
+            assert_eq!(bob_value, "250");
+
+            let (charlie_name,): (String,) =
+                sqlx::query_as("SELECT name FROM test_upsert WHERE id = '3'")
+                    .fetch_one(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            assert_eq!(charlie_name, "Charlie_Updated");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_conflict_error_mode() {
+        use crate::coordination::manifest::OnConflict;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create initial CSV
+        let csv_path1 = create_csv_with_content(
+            &temp_dir,
+            "initial.csv",
+            &["id,name\n", "1,Alice\n", "2,Bob\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_error_mode", "id TEXT PRIMARY KEY, name TEXT").await;
+
+        // Load initial data
+        let byte_reader = LocalFileByteReader::new(&csv_path1);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let coordinator = Coordinator::new(
+            manifest_storage.clone(),
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path1)
+            .target_table("test_error_mode".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::Error)
+            .build()
+            .unwrap();
+
+        let result1 = coordinator.run_load(&config).await.unwrap();
+        assert_eq!(result1.records_loaded, 2);
+
+        // Try to load duplicate data with Error mode - should fail
+        let csv_path2 = create_csv_with_content(
+            &temp_dir,
+            "duplicate.csv",
+            &["id,name\n", "1,Alice_Duplicate\n"],
+        )
+        .await;
+
+        let byte_reader2 = LocalFileByteReader::new(&csv_path2);
+        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader2,
+            DelimitedConfig::csv(),
+        ));
+
+        let coordinator2 = Coordinator::new(
+            manifest_storage,
+            file_reader2,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config2 = LoadConfigBuilder::default()
+            .source_uri(csv_path2)
+            .target_table("test_error_mode".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::Error)
+            .build()
+            .unwrap();
+
+        let result2 = coordinator2.run_load(&config2).await.unwrap();
+
+        // Should have failures due to constraint violation
+        assert_eq!(
+            result2.records_failed, 1,
+            "Duplicate should fail with Error mode"
+        );
+        assert_eq!(result2.records_loaded, 0);
+    }
+
+    #[tokio::test]
+    async fn test_on_conflict_do_update_without_constraints_fails() {
+        use crate::coordination::manifest::OnConflict;
+
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path =
+            create_csv_with_content(&temp_dir, "test.csv", &["id,name\n", "1,Alice\n"]).await;
+
+        // Table WITHOUT any unique constraints
+        let pool = setup_sqlite_table("test_no_constraints", "id TEXT, name TEXT").await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_no_constraints".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoUpdate)
+            .build()
+            .unwrap();
+
+        // Should fail with clear error message
+        let result = coordinator.run_load(&config).await;
+        assert!(
+            result.is_err(),
+            "DoUpdate mode should fail without unique constraints"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("do-update mode requires table")
+                && err_msg.contains("unique constraint"),
+            "Error message should explain the requirement: {}",
+            err_msg
+        );
     }
 }
