@@ -152,6 +152,39 @@ All pull requests run through GitHub Actions CI which:
 
 Ensure your code passes CI before requesting review.
 
+## Publishing a Release
+
+Releases are automated through GitHub Actions. When you push a version tag, the workflow will:
+1. Run all tests to ensure code quality
+2. Build binaries for multiple platforms
+3. Create a GitHub release with all artifacts
+
+### Creating a Release
+
+1. **Update version in Cargo.toml:**
+   ```bash
+   # Edit version field
+   vim Cargo.toml
+   ```
+
+2. **Commit version bump:**
+   ```bash
+   git add Cargo.toml
+   git commit -m "Bump version to X.Y.Z"
+   git push origin main
+   ```
+
+3. **Create and push a version tag:**
+   ```bash
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+4. **Monitor the release workflow:**
+   - Go to: https://github.com/aws-samples/aurora-dsql-loader/actions
+   - The release workflow will run automatically
+   - Check for any failures
+
 
 ## Finding contributions to work on
 Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
