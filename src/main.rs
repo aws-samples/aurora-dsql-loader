@@ -1,4 +1,4 @@
-use aurora_dsql_loader::runner::{Format, LoadArgs, run_load};
+use aurora_dsql_loader::runner::{Format, LoadArgs, OnConflict, run_load};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -70,6 +70,10 @@ struct LoadParams {
     /// Column mapping from source to destination (format: src:dest,src2:dest2)
     #[arg(long)]
     column_map: Option<String>,
+
+    /// Conflict resolution strategy (do-nothing, do-update, error)
+    #[arg(long, default_value = "do-nothing")]
+    on_conflict: String,
 }
 
 #[derive(Clone, ClapArgs)]
@@ -89,6 +93,10 @@ struct OutputArgs {
     /// Directory for manifest files (default: system temp directory)
     #[arg(long)]
     manifest_dir: Option<String>,
+
+    /// Resume an incomplete job by job ID (requires --manifest-dir)
+    #[arg(long, requires = "manifest_dir")]
+    resume_job_id: Option<String>,
 }
 
 #[derive(Clone, Subcommand)]
@@ -201,6 +209,12 @@ async fn run_loader(
         std::collections::HashMap::new()
     };
 
+    // Parse on_conflict mode
+    let on_conflict = load
+        .on_conflict
+        .parse::<OnConflict>()
+        .map_err(|e| anyhow::anyhow!("Invalid --on-conflict value: {}", e))?;
+
     // Parse chunk size
     let chunk_size_bytes = cli::parse_size_string(&load.chunk_size)
         .map_err(|e| anyhow::anyhow!("Invalid chunk size '{}': {}", load.chunk_size, e))?;
@@ -247,6 +261,8 @@ async fn run_loader(
         manifest_dir: output.manifest_dir.clone().map(PathBuf::from),
         quiet: output.quiet,
         column_mappings,
+        resume_job_id: output.resume_job_id.clone(),
+        on_conflict,
     };
 
     // Run the load

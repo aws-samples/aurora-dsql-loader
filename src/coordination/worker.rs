@@ -92,8 +92,10 @@ impl Worker {
 
     /// Run the worker loop until no more work is available
     pub async fn run(&self, job_id: &str, file_reader: Arc<dyn FileReader>) -> Result<()> {
+        use rand::seq::SliceRandom;
+
         loop {
-            let unclaimed = self
+            let mut unclaimed = self
                 .manifest_storage
                 .list_unclaimed_chunks(job_id)
                 .await
@@ -102,6 +104,9 @@ impl Worker {
             if unclaimed.is_empty() {
                 break;
             }
+
+            // Shuffle chunks to randomize processing order and avoid contention
+            unclaimed.shuffle(&mut rand::thread_rng());
 
             let mut claimed_any = false;
             for chunk_id in unclaimed {
@@ -152,6 +157,39 @@ impl Worker {
 
     /// Process a single chunk by reading data and loading it into the database
     /// Writes the result to manifest storage before returning
+    ///
+    /// # Cancellation Safety
+    ///
+    /// This function is **not cancellation-safe** in the strict sense: if the future is dropped
+    /// mid-execution, some database records may be committed while others are not. However, the
+    /// manifest tracking system provides recovery guarantees:
+    ///
+    /// ## What happens on cancellation/crash:
+    /// - **Partial batch commits**: Individual batches are committed independently via separate
+    ///   INSERT statements. If cancellation occurs after some batches complete, those records
+    ///   remain committed in the database.
+    /// - **No result file**: The chunk result file is only written at the end (after all batches
+    ///   complete). If cancelled before completion, no result file exists.
+    /// - **Chunk remains claimed**: The claim file was created before processing started and
+    ///   persists after cancellation.
+    ///
+    /// ## Recovery on retry:
+    /// - **Stuck chunks detection**: When resuming with `--resume-job-id`, the coordinator detects:
+    ///   - Chunks with claim files but no result files (worker crash/cancellation)
+    ///   - Chunks with result files where `records_failed > 0` (partial failures)
+    ///
+    ///   Both types are automatically retried by removing their claim/result files.
+    /// - **Re-processing with idempotency**: If the table has unique constraints
+    ///   (`has_unique_constraints = true`), re-processing the chunk will use `ON CONFLICT DO NOTHING`,
+    ///   making duplicate inserts safe. Already-committed records are silently skipped.
+    /// - **Without unique constraints**: Re-processing without unique constraints may insert
+    ///   duplicate records. Use unique constraints for safe retry, or manually deduplicate afterward.
+    ///
+    /// ## Design rationale:
+    /// - **Performance over strict ACID**: Batches are committed independently (not in a single
+    ///   transaction) to maximize throughput and avoid long-running transactions.
+    /// - **Resumability**: The chunk-level manifest tracking allows detecting and re-processing
+    ///   incomplete work, trading strict once-semantics for better fault tolerance and performance.
     async fn process_chunk(
         &self,
         job_id: &str,
@@ -235,7 +273,8 @@ impl Worker {
             let schema_name = manifest.table.schema_name.clone();
             let table_name = manifest.table.name.clone();
             let schema = manifest.table.schema.clone();
-            let has_unique_constraints = manifest.table.has_unique_constraints;
+            let on_conflict = manifest.table.on_conflict;
+            let conflict_columns = manifest.table.conflict_columns.clone();
             let line_offset = current_line;
             let batch_len = batch.len() as u64;
 
@@ -246,7 +285,8 @@ impl Worker {
                     &table_name,
                     &batch,
                     &schema,
-                    has_unique_constraints,
+                    on_conflict,
+                    &conflict_columns,
                     line_offset,
                 )
                 .await
@@ -326,13 +366,15 @@ impl Worker {
     /// Load a batch of records into the database using batch inserts
     /// Returns BatchResult with accurate counts of loaded/failed records
     /// Errors are captured in the result, not returned as Err
+    #[allow(clippy::too_many_arguments)]
     async fn load_batch(
         pool: &Pool,
         schema_name: &str,
         table_name: &str,
         records: &[Record],
         schema: &Option<super::manifest::SchemaJson>,
-        has_unique_constraints: bool,
+        on_conflict: super::manifest::OnConflict,
+        conflict_columns: &[String],
         line_offset: u64,
     ) -> BatchResult {
         // Check if we're using PostgreSQL (CAST needed) or SQLite (CAST causes issues)
@@ -395,11 +437,23 @@ impl Worker {
         }
 
         let values_clause = format!("VALUES {}", value_groups.join(", "));
-        let conflict_clause = if has_unique_constraints {
-            " ON CONFLICT DO NOTHING"
-        } else {
-            ""
-        };
+        let conflict_clause =
+            match Self::build_conflict_clause(on_conflict, conflict_columns, schema) {
+                Ok(clause) => clause,
+                Err(err) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    return BatchResult {
+                        records_loaded: 0,
+                        records_failed: records.len() as u64,
+                        errors: vec![ErrorRecord {
+                            line_number: line_offset,
+                            error_type: "conflict_clause_error".to_string(),
+                            error_message: err,
+                        }],
+                        duration_ms,
+                    };
+                }
+            };
 
         // Use Pool helper to generate the properly formatted table name
         let table_spec = pool.qualified_table_name(schema_name, table_name);
@@ -477,6 +531,66 @@ impl Worker {
         }
     }
 
+    /// Build the ON CONFLICT clause based on the conflict resolution mode
+    ///
+    /// Note: For DoUpdate mode, this updates ALL columns (including non-key columns).
+    /// The conflict key columns are included in the SET clause, though PostgreSQL
+    /// will effectively ignore updates to the constrained columns.
+    fn build_conflict_clause(
+        on_conflict: super::manifest::OnConflict,
+        conflict_columns: &[String],
+        schema: &Option<super::manifest::SchemaJson>,
+    ) -> Result<String, String> {
+        use super::manifest::OnConflict;
+        match on_conflict {
+            OnConflict::DoNothing => {
+                // Always use DO NOTHING
+                Ok(" ON CONFLICT DO NOTHING".to_string())
+            }
+            OnConflict::DoUpdate => {
+                // Build ON CONFLICT ... DO UPDATE SET ...
+                if conflict_columns.is_empty() {
+                    return Err(
+                        "do-update mode requires table with unique constraints or primary key"
+                            .to_string(),
+                    );
+                }
+
+                // Require schema information to build the SET clause
+                let Some(s) = schema else {
+                    return Err(
+                        "do-update mode requires schema information to build UPDATE clause"
+                            .to_string(),
+                    );
+                };
+
+                // Build conflict target: ON CONFLICT (col1, col2)
+                let conflict_target = conflict_columns
+                    .iter()
+                    .map(|c| format!("\"{}\"", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                // Build SET clause updating all columns
+                let set_clause = s
+                    .columns
+                    .iter()
+                    .map(|c| format!("\"{}\" = EXCLUDED.\"{}\"", c.name, c.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                Ok(format!(
+                    " ON CONFLICT ({}) DO UPDATE SET {}",
+                    conflict_target, set_clause
+                ))
+            }
+            OnConflict::Error => {
+                // No conflict clause - let database error on conflicts
+                Ok(String::new())
+            }
+        }
+    }
+
     /// Execute a batch insert with retry logic for transient errors
     async fn execute_with_retry(
         pool: &Pool,
@@ -493,12 +607,6 @@ impl Worker {
                 Ok(()) => return Ok(()),
                 Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES - 1 => {
                     let delay = Self::backoff_delay(attempt);
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max_retries = MAX_RETRIES,
-                        delay_ms = delay.as_millis() as u64,
-                        "Batch insert failed, retrying: {e:?}"
-                    );
                     tokio::time::sleep(delay).await;
                     last_error = Some(e);
                 }

@@ -328,6 +328,98 @@ impl Pool {
             }
         }
     }
+
+    /// Get columns involved in unique constraints (primary key first, then first unique constraint)
+    ///
+    /// Returns columns from the first constraint found, prioritizing primary keys over
+    /// unique constraints. If a primary key exists, returns all its columns. Otherwise,
+    /// returns all columns from the first unique constraint (ordered by constraint OID).
+    pub async fn get_unique_constraint_columns(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        match &self.inner {
+            PoolInner::Postgres(pool) => {
+                let mut conn = pool.get().await.map_err(|e| match e {
+                    bb8::RunError::User(e) => e,
+                    bb8::RunError::TimedOut => sqlx::Error::PoolTimedOut,
+                })?;
+
+                // Query for constraint columns, prioritizing primary key over unique constraints
+                // Returns all columns from the first matching constraint
+                let sql = r#"
+                    SELECT a.attname, c.contype
+                    FROM pg_constraint c
+                    JOIN pg_class t ON c.conrelid = t.oid
+                    JOIN pg_namespace n ON t.relnamespace = n.oid
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+                    WHERE n.nspname = $1
+                      AND t.relname = $2
+                      AND c.contype IN ('p', 'u')
+                    ORDER BY
+                      CASE WHEN c.contype = 'p' THEN 0 ELSE 1 END,
+                      c.oid,
+                      a.attnum
+                "#;
+
+                let rows: Vec<(String, String)> = sqlx::query_as(sql)
+                    .bind(schema_name)
+                    .bind(table_name)
+                    .fetch_all(&mut *conn)
+                    .await?;
+
+                // Take columns from the first constraint only (either primary key or first unique)
+                if rows.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let first_constraint_type = rows[0].1.clone();
+                let columns: Vec<String> = rows
+                    .into_iter()
+                    .take_while(|(_, contype)| contype == &first_constraint_type)
+                    .map(|(col, _)| col)
+                    .collect();
+
+                Ok(columns)
+            }
+            #[cfg(test)]
+            PoolInner::Sqlite(pool) => {
+                // Query SQLite's pragma_table_info for constraint information
+                let mut conn = pool.acquire().await?;
+
+                // First, check for primary key columns in table_info
+                let pk_sql = format!(
+                    "SELECT name FROM pragma_table_info('{}') WHERE pk > 0 ORDER BY pk",
+                    table_name
+                );
+                let pk_columns: Vec<(String,)> =
+                    sqlx::query_as(&pk_sql).fetch_all(&mut *conn).await?;
+
+                if !pk_columns.is_empty() {
+                    return Ok(pk_columns.into_iter().map(|(col,)| col).collect());
+                }
+
+                // If no primary key, look for unique indexes
+                let index_sql = format!(
+                    "SELECT name FROM pragma_index_list('{}') WHERE [unique] = 1",
+                    table_name
+                );
+                let indexes: Vec<(String,)> =
+                    sqlx::query_as(&index_sql).fetch_all(&mut *conn).await?;
+
+                // Get columns from first unique index
+                if let Some((index_name,)) = indexes.first() {
+                    let cols_sql = format!("SELECT name FROM pragma_index_info('{}')", index_name);
+                    let cols: Vec<(String,)> =
+                        sqlx::query_as(&cols_sql).fetch_all(&mut *conn).await?;
+                    return Ok(cols.into_iter().map(|(col,)| col).collect());
+                }
+
+                Ok(Vec::new())
+            }
+        }
+    }
 }
 
 // Wrap `Arc<connector::Postgres>` so that we can implement the bb8::ManageConnection trait.

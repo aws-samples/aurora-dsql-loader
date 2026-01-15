@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::manifest::{
-    ChunkInfo, ChunkResultFile, DsqlConfig, FileFormat, ManifestFile, ManifestStorage,
+    ChunkInfo, ChunkResultFile, DsqlConfig, FileFormat, ManifestFile, ManifestStorage, OnConflict,
 };
 use super::worker::Worker;
 use crate::db::schema::{Schema, query_table_schema, validate_schema_exists};
@@ -44,6 +44,10 @@ pub struct LoadConfig {
     #[builder(default)]
     column_mappings: std::collections::HashMap<String, String>,
     quiet: bool,
+    #[builder(default)]
+    resume_job_id: Option<String>,
+    #[builder(default)]
+    on_conflict: OnConflict,
 }
 
 /// Result of a completed data load operation
@@ -85,58 +89,27 @@ impl Coordinator {
 
     /// Run the complete data load operation
     ///
-    /// This method orchestrates the entire load process:
-    /// 1. Generate unique job ID
-    /// 2. Create chunks from the source file
-    /// 3. Optionally infer schema from sample data
-    /// 4. Optionally create the target table
-    /// 5. Write manifest file
-    /// 6. Spawn worker tasks to process chunks
-    /// 7. Wait for completion and aggregate results
+    /// This method orchestrates the entire load process locally
     pub async fn run_load(&self, config: &LoadConfig) -> Result<LoadResult> {
         let start_time = Instant::now();
 
-        // 1. Generate job ID
-        let job_id = Uuid::new_v4().to_string();
-        info!("Starting load job: {job_id}");
+        // Setup job (either resume existing or start new)
+        let (job_id, file_metadata, chunks) = match &config.resume_job_id {
+            Some(resume_id) => self.setup_resume_job(resume_id, config).await?,
+            None => self.setup_new_job(config).await?,
+        };
 
-        // Validate that the schema exists before starting
-        validate_schema_exists(&self.pool, &config.schema).await?;
-
-        // 2. Create chunks
-        let (file_metadata, chunks) = self.create_file_chunks(config.chunk_size_bytes).await?;
-
-        // 3. Resolve schema (infer or query)
-        let mut schema = self.resolve_table_schema(&config, &chunks).await?;
-
-        // Apply column mappings to schema if provided
-        Self::apply_column_mappings(&mut schema, &config.column_mappings);
-
-        // 4. Create table if needed
-        let table_created = self.ensure_table_exists(&config, &schema).await?;
-
-        // 5. Write manifest
-        self.create_and_write_manifest(
-            &job_id,
-            &config,
-            &file_metadata,
-            &chunks,
-            schema,
-            table_created,
-        )
-        .await?;
-
-        // 6. Create telemetry channel and spawn workers
+        // Create telemetry channel and spawn workers
         let (telemetry_tx, telemetry_rx) = mpsc::unbounded_channel::<TelemetryEvent>();
-        let worker_handles = self.spawn_worker_pool(&job_id, &config, telemetry_tx.clone());
+        let worker_handles = self.spawn_worker_pool(&job_id, config, telemetry_tx.clone());
 
         // Drop the coordinator's copy of the sender so the channel closes when workers finish
         drop(telemetry_tx);
 
-        // 7. Setup progress tracking
-        let prog_jh = Self::setup_progress_tracking(&config, &file_metadata, &chunks, telemetry_rx);
+        // Setup progress tracking
+        let prog_jh = Self::setup_progress_tracking(config, &file_metadata, &chunks, telemetry_rx);
 
-        // 8. Wait for all workers to complete
+        // Wait for all workers to complete
         let worker_results = futures::future::join_all(worker_handles).await;
 
         // Wait for the progress bar to finish so we don't collide output
@@ -157,7 +130,6 @@ impl Coordinator {
             }
         }
 
-        // 9. Aggregate results
         self.aggregate_final_results(&job_id, &chunks, start_time)
             .await
     }
@@ -176,7 +148,7 @@ impl Coordinator {
                 Err(_) => {
                     // Chunk result may be missing if worker crashed before writing result file
                     // This is tracked in failure metrics and doesn't require hard failure
-                    tracing::warn!("Chunk {chunk_id} result missing");
+                    warn!("Chunk {chunk_id} result missing");
                 }
             }
         }
@@ -247,7 +219,6 @@ impl Coordinator {
                 .await
                 .context("Failed to read sample data for schema inference")?;
 
-            // Convert Records to FieldValues (Vec<Vec<String>>)
             let field_values: Vec<Vec<String>> = sample_data
                 .records
                 .iter()
@@ -306,6 +277,131 @@ impl Coordinator {
         }
     }
 
+    /// Setup a new load job by creating chunks and manifest
+    async fn setup_new_job(
+        &self,
+        config: &LoadConfig,
+    ) -> Result<(String, FileMetadata, Vec<Chunk>)> {
+        let job_id = Uuid::new_v4().to_string();
+        info!("Starting load job: {job_id}");
+
+        validate_schema_exists(&self.pool, &config.schema).await?;
+
+        let (file_metadata, chunks) = self.create_file_chunks(config.chunk_size_bytes).await?;
+
+        let mut schema = self.resolve_table_schema(config, &chunks).await?;
+
+        Self::apply_column_mappings(&mut schema, &config.column_mappings);
+
+        let table_created = self.ensure_table_exists(config, &schema).await?;
+
+        self.create_and_write_manifest(
+            &job_id,
+            config,
+            &file_metadata,
+            &chunks,
+            schema,
+            table_created,
+        )
+        .await?;
+
+        Ok((job_id, file_metadata, chunks))
+    }
+
+    /// Setup a resumed job by reading the manifest and cleaning up old claims
+    async fn setup_resume_job(
+        &self,
+        resume_id: &str,
+        config: &LoadConfig,
+    ) -> Result<(String, FileMetadata, Vec<Chunk>)> {
+        info!("Resuming load job: {}", resume_id);
+
+        // Read existing manifest
+        let manifest = self
+            .manifest_storage
+            .read_manifest(resume_id)
+            .await
+            .context("Failed to read manifest for resume")?;
+
+        self.verify_resume_compatibility(&manifest, config).await?;
+
+        info!("Cleaning up incomplete claims...");
+        self.manifest_storage.cleanup_old_claims(resume_id).await?;
+
+        let file_metadata = FileMetadata {
+            file_size_bytes: manifest.total_size_bytes,
+            estimated_rows: manifest.estimated_rows,
+        };
+
+        let chunks: Vec<Chunk> = manifest
+            .chunks
+            .iter()
+            .map(|c| Chunk {
+                chunk_id: c.chunk_id,
+                start_offset: c.start_offset,
+                end_offset: c.end_offset,
+                estimated_rows: c.estimated_rows,
+            })
+            .collect();
+
+        Ok((resume_id.to_string(), file_metadata, chunks))
+    }
+
+    /// Verify that the manifest is compatible with the resume request
+    async fn verify_resume_compatibility(
+        &self,
+        manifest: &ManifestFile,
+        config: &LoadConfig,
+    ) -> Result<()> {
+        if manifest.source_uri != config.source_uri {
+            return Err(anyhow::anyhow!(
+                "Cannot resume: source URI mismatch\n\
+                 Manifest source: {}\n\
+                 Requested source: {}",
+                manifest.source_uri,
+                config.source_uri
+            ));
+        }
+
+        if manifest.table.name != config.target_table {
+            return Err(anyhow::anyhow!(
+                "Cannot resume: target table mismatch\n\
+                 Manifest table: {}\n\
+                 Requested table: {}",
+                manifest.table.name,
+                config.target_table
+            ));
+        }
+
+        if manifest.table.schema_name != config.schema {
+            return Err(anyhow::anyhow!(
+                "Cannot resume: schema mismatch\n\
+                 Manifest schema: {}\n\
+                 Requested schema: {}",
+                manifest.table.schema_name,
+                config.schema
+            ));
+        }
+
+        let current_metadata = self
+            .file_reader
+            .metadata()
+            .await
+            .context("Failed to get current file metadata")?;
+
+        if current_metadata.file_size_bytes != manifest.total_size_bytes {
+            return Err(anyhow::anyhow!(
+                "Cannot resume: source file size changed\n\
+                 Manifest size: {} bytes\n\
+                 Current size: {} bytes",
+                manifest.total_size_bytes,
+                current_metadata.file_size_bytes
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Create the table if it doesn't exist (when create_table_if_missing is true)
     async fn ensure_table_exists(
         &self,
@@ -357,16 +453,35 @@ impl Coordinator {
         schema: Option<Schema>,
         table_created: bool,
     ) -> Result<()> {
-        // Detect unique constraints
+        // Detect unique constraints and get conflict columns if needed
         info!("Checking for unique constraints on table...");
         let has_unique_constraints = self
             .pool
             .has_unique_constraints(&config.schema, &config.target_table)
             .await
-            .unwrap_or(false);
+            .context("Failed to check for unique constraints")?;
+
+        // Fetch constraint columns if they exist, or validate DoUpdate requirements
+        let conflict_columns = if has_unique_constraints {
+            self.pool
+                .get_unique_constraint_columns(&config.schema, &config.target_table)
+                .await
+                .context("Failed to query constraint columns")?
+        } else {
+            if config.on_conflict == OnConflict::DoUpdate {
+                return Err(anyhow::anyhow!(
+                    "do-update mode requires table '{}' to have a primary key or unique constraint",
+                    config.target_table
+                ));
+            }
+            Vec::new()
+        };
 
         if has_unique_constraints {
-            info!("Table has unique constraints - will use ON CONFLICT DO NOTHING");
+            info!(
+                "Table has unique constraints on columns: {:?}",
+                conflict_columns
+            );
         }
 
         // Build manifest
@@ -387,6 +502,8 @@ impl Coordinator {
             schema: schema.map(|s| s.into()),
             was_created: table_created,
             has_unique_constraints,
+            on_conflict: config.on_conflict,
+            conflict_columns,
         };
 
         let manifest = ManifestFile {
@@ -495,21 +612,18 @@ impl Coordinator {
                 .unwrap(),
         );
 
-        // Spawn telemetry processing task
         Some(tokio::spawn(async move {
             let mut stats = ProgressStats::new();
 
             while let Some(event) = telemetry_rx.recv().await {
                 stats.update(&event);
 
-                // Update progress bars
                 chunk_bar.set_position(stats.chunks_completed as u64);
                 if let Some(ref bar) = rows_bar {
                     bar.set_position(stats.records_loaded);
                 }
                 bytes_bar.set_position(stats.bytes_processed);
 
-                // Update batch timing percentiles
                 let (p50, p90, p99) = stats.get_percentiles();
                 if let (Some(p50), Some(p90), Some(p99)) = (p50, p90, p99) {
                     stats_bar
@@ -517,14 +631,12 @@ impl Coordinator {
                 }
             }
 
-            // Finish progress bars
             chunk_bar.finish_with_message("All chunks completed");
             if let Some(bar) = rows_bar {
                 bar.finish();
             }
             bytes_bar.finish();
 
-            // Final percentile stats
             let (p50, p90, p99) = stats.get_percentiles();
             if let (Some(p50), Some(p90), Some(p99)) = (p50, p90, p99) {
                 stats_bar
