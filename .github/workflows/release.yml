@@ -141,24 +141,17 @@ jobs:
           fi
         shell: bash
 
-      - name: Strip binary (Linux and macOS)
-        if: matrix.os != 'windows-latest'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-
       - name: Create archive (Linux and macOS)
         if: matrix.archive_ext == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ${{ matrix.asset_name }}.${{ matrix.archive_ext }} ${{ matrix.artifact_name }}
-          mv ${{ matrix.asset_name }}.${{ matrix.archive_ext }} ${{ github.workspace }}
+          tar czf ../../../${{ matrix.asset_name }}.${{ matrix.archive_ext }} ${{ matrix.artifact_name }}
 
       - name: Create archive (Windows)
         if: matrix.archive_ext == 'zip'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ${{ matrix.asset_name }}.${{ matrix.archive_ext }} ${{ matrix.artifact_name }}
-          mv ${{ matrix.asset_name }}.${{ matrix.archive_ext }} ${{ github.workspace }}
-        shell: bash
+          7z a ../../../${{ matrix.asset_name }}.${{ matrix.archive_ext }} ${{ matrix.artifact_name }}
 
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
