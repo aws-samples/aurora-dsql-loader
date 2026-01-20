@@ -8,6 +8,10 @@ Fast, parallel data loader for Aurora DSQL. Load CSV, TSV, and Parquet files int
 
 ### 1. Install
 
+**Download pre-built binary:** [Latest releases](https://github.com/aws-samples/aurora-dsql-loader/releases/latest)
+
+**Or build from source:**
+
 ```bash
 # Install Rust (if needed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
