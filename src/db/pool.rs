@@ -349,7 +349,7 @@ impl Pool {
                 // Query for constraint columns, prioritizing primary key over unique constraints
                 // Returns all columns from the first matching constraint
                 let sql = r#"
-                    SELECT a.attname, c.contype
+                    SELECT a.attname, c.contype::text
                     FROM pg_constraint c
                     JOIN pg_class t ON c.conrelid = t.oid
                     JOIN pg_namespace n ON t.relnamespace = n.oid
