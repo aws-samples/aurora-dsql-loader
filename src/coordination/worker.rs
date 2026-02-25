@@ -498,22 +498,66 @@ impl Worker {
                     })
                     .unwrap_or_else(|| "<empty>".to_string());
 
-                // Extract just the database error message (root cause)
-                let db_error = e
-                    .source()
-                    .and_then(|s| s.source())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| e.to_string());
+                // Extract the full error chain to get the actual database error
+                let mut error_chain = Vec::new();
+                let mut current_error: &dyn std::error::Error = &*e;
+
+                // Collect all errors in the chain
+                error_chain.push(current_error.to_string());
+                while let Some(source) = current_error.source() {
+                    error_chain.push(source.to_string());
+                    current_error = source;
+                }
+
+                // Show both first and last errors for complete context
+                let db_error = match (error_chain.first(), error_chain.last()) {
+                    (Some(first), Some(last)) if first != last => {
+                        // Multiple errors: show immediate cause and root cause
+                        format!("{}\n(Root cause: {})", first, last)
+                    }
+                    (Some(single_error), _) => {
+                        // Single error or first == last: just show it
+                        single_error.clone()
+                    }
+                    (None, _) => {
+                        // Empty chain (shouldn't happen, but handle gracefully)
+                        "Unknown database error".to_string()
+                    }
+                };
+
+                // Build detailed error message with full chain for debugging
+                let full_error_chain = if error_chain.len() > 1 {
+                    format!(
+                        "\n\nFull error chain:\n{}",
+                        error_chain
+                            .iter()
+                            .enumerate()
+                            .map(|(i, err)| format!("  {}. {}", i + 1, err))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                } else {
+                    String::new()
+                };
+
+                // Check if this is a parameter limit error and add helpful hint
+                let parameter_limit_hint =
+                    Self::get_parameter_limit_hint(&db_error, records.len(), num_columns);
 
                 let error_message = format!(
                     "Database error: {}\n\
                      \n\
                      Batch context:\n\
                      - Batch size: {} records\n\
-                     - First record sample: {}",
+                     - First record sample: {}\n\
+                     - SQL statement: INSERT INTO {} {} VALUES ...{}{}",
                     db_error,
                     records.len(),
-                    first_record_sample
+                    first_record_sample,
+                    pool.qualified_table_name(schema_name, table_name),
+                    column_list,
+                    full_error_chain,
+                    parameter_limit_hint
                 );
 
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -851,6 +895,41 @@ impl Worker {
     /// Parse boolean value
     fn parse_bool(value: &str) -> bool {
         value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("t") || value == "1"
+    }
+
+    /// Generate a helpful hint if the error is related to parameter limits
+    fn get_parameter_limit_hint(error_msg: &str, batch_size: usize, num_columns: usize) -> String {
+        let error_lower = error_msg.to_lowercase();
+
+        // Check for parameter limit related errors
+        // PostgreSQL/DSQL: "too many arguments for query"
+        // SQLite: "too many SQL variables"
+        let is_param_limit_error = error_lower.contains("too many arguments")
+            || error_lower.contains("too many sql variables");
+
+        if !is_param_limit_error {
+            return String::new();
+        }
+
+        let total_params = batch_size * num_columns;
+
+        // PostgreSQL/DSQL limit: 65,535, SQLite limit: 32,766
+        // Suggest a batch size that keeps us well under both limits
+        let suggested_batch_size = if num_columns > 0 {
+            // Target ~20,000 parameters to stay safely under both limits
+            let safe_batch = 20000 / num_columns;
+            safe_batch.max(1).min(batch_size - 1)
+        } else {
+            batch_size / 2
+        };
+
+        format!(
+            "\n\n\
+            Hint: This error is caused by exceeding the database parameter limit.\n\
+            - Current batch: {} records × {} columns = {} parameters\n\
+            - Try reducing --batch-size to {} or lower to stay under the limit.",
+            batch_size, num_columns, total_params, suggested_batch_size
+        )
     }
 
     /// Check if error is retriable (transient errors that may resolve with retry)

@@ -790,4 +790,27 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_aurora_mysql_timestamp_format() {
+        // This test specifically checks the Aurora MySQL export format
+        // which uses milliseconds: "YYYY-MM-DD HH:MM:SS.fff"
+        let aurora_timestamps = [
+            "2025-01-01 12:34:56.000",
+            "2025-01-01 12:34:56.123",
+            "2025-01-01 12:34:56.999",
+            "2024-12-31 23:59:59.500",
+        ];
+
+        for timestamp in &aurora_timestamps {
+            let result = SchemaInferrer::infer_value_type(timestamp);
+            assert_eq!(
+                result,
+                Some(SqlType::Timestamp),
+                "Aurora MySQL timestamp '{}' should be recognized as Timestamp, got {:?}",
+                timestamp,
+                result
+            );
+        }
+    }
 }

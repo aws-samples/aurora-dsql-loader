@@ -9,7 +9,7 @@ mod tests {
         coordination::{
             Coordinator, DsqlConfig, FileFormat, LoadConfigBuilder,
             coordinator::LoadResult,
-            manifest::{ChunkResultFile, ChunkStatus, LocalManifestStorage},
+            manifest::{ChunkResultFile, ChunkStatus, LocalManifestStorage, ManifestStorage},
         },
         db::{Pool, SchemaInferrer, pool::PoolConnection},
         formats::{DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader},
@@ -18,7 +18,7 @@ mod tests {
     };
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::fs::File;
+    use tokio::fs::{self, File};
     use tokio::io::AsyncWriteExt;
 
     // ============ Test Helpers ============
@@ -87,7 +87,7 @@ mod tests {
         ));
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let coordinator = Coordinator::new(
@@ -135,7 +135,7 @@ mod tests {
         ));
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let coordinator = Coordinator::new(
@@ -290,7 +290,7 @@ mod tests {
         let file_reader: Arc<dyn FileReader> = Arc::new(parquet_reader);
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let schema_inferrer = SchemaInferrer { has_header: true };
@@ -595,7 +595,7 @@ mod tests {
         ));
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let coordinator = Coordinator::new(
@@ -665,7 +665,7 @@ mod tests {
         // Create table with CHECK constraint that will cause failures
         let pool = Pool::sqlite_in_memory().await.unwrap();
         if let Ok(mut conn) = pool.acquire().await
-            && let crate::db::pool::PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
         {
             let sql =
                 "CREATE TABLE test_persist_manifest (id INTEGER, value INTEGER CHECK(value > 0))";
@@ -781,7 +781,7 @@ mod tests {
         // Create table with CHECK constraint that will cause failures
         let pool = Pool::sqlite_in_memory().await.unwrap();
         if let Ok(mut conn) = pool.acquire().await
-            && let crate::db::pool::PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
         {
             // Create table with CHECK constraint requiring value > 0
             let sql = "CREATE TABLE test_check_constraint (id INTEGER, name TEXT, value INTEGER CHECK(value > 0))";
@@ -808,7 +808,7 @@ mod tests {
         ));
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let coordinator = Coordinator::new(
@@ -905,7 +905,7 @@ mod tests {
         ));
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let schema_inferrer = SchemaInferrer { has_header: true };
@@ -993,7 +993,7 @@ mod tests {
         ));
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let schema_inferrer = SchemaInferrer { has_header: true };
@@ -1028,10 +1028,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_resume_incomplete_job() {
-        use crate::db::pool::PoolConnection;
-        use tempfile::TempDir;
-        use tokio::fs;
-
         // Create test CSV data
         let temp_dir = TempDir::new().unwrap();
         let csv_path = temp_dir.path().join("test.csv").display().to_string();
@@ -1229,10 +1225,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_resume_retries_failed_chunks() {
-        use crate::db::pool::PoolConnection;
-        use tempfile::TempDir;
-        use tokio::fs;
-
         // Create test CSV data - mix of valid and invalid values
         let temp_dir = TempDir::new().unwrap();
         let csv_path = temp_dir.path().join("test.csv").display().to_string();
@@ -1430,7 +1422,7 @@ mod tests {
         ));
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let coordinator = Coordinator::new(
@@ -1569,7 +1561,7 @@ mod tests {
         ));
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let coordinator = Coordinator::new(
@@ -1673,7 +1665,7 @@ mod tests {
         ));
 
         let manifest_dir = TempDir::new().unwrap();
-        let manifest_storage: Arc<dyn crate::coordination::manifest::ManifestStorage> =
+        let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let coordinator = Coordinator::new(
@@ -1717,6 +1709,272 @@ mod tests {
                 && err_msg.contains("unique constraint"),
             "Error message should explain the requirement: {}",
             err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parameter_limit_error_surfaced() {
+        // This test verifies that when we exceed SQLite's parameter limit (32,766),
+        // the error message is properly surfaced with helpful context.
+        // We use 100 columns * 400 rows per batch = 40,000 parameters to exceed the limit.
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a CSV with 100 columns
+        let mut header = String::new();
+        for i in 0..100 {
+            if i > 0 {
+                header.push(',');
+            }
+            header.push_str(&format!("col{}", i));
+        }
+        header.push('\n');
+
+        let mut csv_content = header.clone();
+
+        // Add 500 rows (100 columns * 500 rows = 50,000 values total)
+        for row in 0..500 {
+            for col in 0..100 {
+                if col > 0 {
+                    csv_content.push(',');
+                }
+                csv_content.push_str(&format!("v{}_{}", row, col));
+            }
+            csv_content.push('\n');
+        }
+
+        let csv_path = temp_dir.path().join("wide_table.csv");
+        tokio::fs::write(&csv_path, csv_content).await.unwrap();
+        let csv_path_str = csv_path.to_str().unwrap().to_string();
+
+        // Create table with 100 TEXT columns
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        if let Ok(mut conn) = pool.acquire().await
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let mut columns = String::new();
+            for i in 0..100 {
+                if i > 0 {
+                    columns.push_str(", ");
+                }
+                columns.push_str(&format!("col{} TEXT", i));
+            }
+            let sql = format!("CREATE TABLE test_param_limit ({})", columns);
+            sqlx::query(&sql).execute(&mut **sqlite_conn).await.unwrap();
+        }
+
+        let byte_reader = LocalFileByteReader::new(&csv_path_str);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path_str)
+            .target_table("test_param_limit".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(10_000_000) // Very large chunk to ensure all 500 rows in one chunk
+            .batch_size(400) // 100 columns * 400 rows = 40,000 parameters (exceeds SQLite's 32,766 limit)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+
+        // The load should complete but with failures due to parameter limit
+        assert!(
+            result.records_failed > 0,
+            "Should have failed records due to parameter limit. Got loaded={}, failed={}",
+            result.records_loaded,
+            result.records_failed
+        );
+
+        // Verify error message contains helpful information
+        let chunk_result = &result.chunk_results[0];
+        assert!(!chunk_result.errors.is_empty(), "Should have error records");
+
+        let error_msg = &chunk_result.errors[0].error_message;
+
+        // Verify error message contains batch context
+        assert!(
+            error_msg.contains("Batch context"),
+            "Error should contain batch context. Got: {}",
+            error_msg
+        );
+
+        assert!(
+            error_msg.contains("Batch size:"),
+            "Error should show batch size. Got: {}",
+            error_msg
+        );
+
+        // Verify error message contains first record sample
+        assert!(
+            error_msg.contains("First record sample:"),
+            "Error should show first record sample. Got: {}",
+            error_msg
+        );
+
+        // Verify error mentions "too many" (parameter limit error)
+        assert!(
+            error_msg.to_lowercase().contains("too many"),
+            "Error should mention parameter limit issue. Got: {}",
+            error_msg
+        );
+
+        // Verify the helpful hint is present
+        assert!(
+            error_msg
+                .contains("Hint: This error is caused by exceeding the database parameter limit."),
+            "Error should contain helpful hint about parameter limit. Got: {}",
+            error_msg
+        );
+
+        // Verify hint shows current batch parameters
+        assert!(
+            error_msg.contains("400 records × 100 columns = 40000 parameters"),
+            "Hint should show current batch calculation. Got: {}",
+            error_msg
+        );
+
+        // Verify hint suggests reducing batch size
+        assert!(
+            error_msg.contains("Try reducing --batch-size"),
+            "Hint should suggest reducing batch size. Got: {}",
+            error_msg
+        );
+
+        // Verify suggested batch size is reasonable (20000/100 columns = 200)
+        assert!(
+            error_msg.contains("to 200 or lower"),
+            "Hint should suggest batch size of 200 or lower (20000 target params / 100 columns = 200). Got: {}",
+            error_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_chain_formatting_in_batch_errors() {
+        // This test verifies that error chains are properly formatted
+        // when batch operations fail
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create CSV with data that will cause a CHECK constraint violation
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "constraint_violation.csv",
+            &[
+                "id,value\n",
+                "1,-100\n", // Negative value violates CHECK constraint
+            ],
+        )
+        .await;
+
+        // Create table with CHECK constraint
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        if let Ok(mut conn) = pool.acquire().await
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let sql = "CREATE TABLE test_error_chain (id INTEGER, value INTEGER CHECK(value > 0))";
+            sqlx::query(sql).execute(&mut **sqlite_conn).await.unwrap();
+        }
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_error_chain".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(std::collections::HashMap::new())
+            .quiet(true)
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+
+        // Should have failures
+        assert_eq!(result.records_failed, 1, "Should have 1 failed record");
+        assert_eq!(result.records_loaded, 0, "Should load 0 records");
+
+        // Verify error message structure
+        let chunk_result = &result.chunk_results[0];
+        assert!(!chunk_result.errors.is_empty(), "Should have error records");
+
+        let error_msg = &chunk_result.errors[0].error_message;
+
+        // Verify error message contains the database error
+        assert!(
+            error_msg.contains("Database error:"),
+            "Error should start with 'Database error:'. Got: {}",
+            error_msg
+        );
+
+        // Verify error message contains batch context
+        assert!(
+            error_msg.contains("Batch context"),
+            "Error should contain batch context. Got: {}",
+            error_msg
+        );
+
+        // Verify error message contains first record sample
+        assert!(
+            error_msg.contains("First record sample:"),
+            "Error should show first record sample. Got: {}",
+            error_msg
+        );
+
+        // Verify the error message shows the problematic value
+        assert!(
+            error_msg.contains("-100") || error_msg.contains("[1, -100]"),
+            "Error should show the problematic value. Got: {}",
+            error_msg
         );
     }
 }
