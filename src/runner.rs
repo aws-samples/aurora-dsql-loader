@@ -139,6 +139,7 @@ pub struct LoadResult {
 ///     manifest_dir: None,
 ///     column_mappings: HashMap::new(),
 ///     quiet: true,
+///     debug: false,
 ///     resume_job_id: None,
 ///     on_conflict: OnConflict::DoNothing,
 /// };
