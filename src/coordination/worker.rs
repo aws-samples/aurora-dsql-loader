@@ -506,7 +506,9 @@ impl Worker {
 
                 let chain: Vec<_> = e.chain().collect();
                 // Show both first and last errors for complete context
-                let db_error = if chain.len() > 1 && chain[0].to_string() != chain[chain.len() - 1].to_string() {
+                let db_error = if chain.len() > 1
+                    && chain[0].to_string() != chain[chain.len() - 1].to_string()
+                {
                     format!("{}\n(Root cause: {})", chain[0], chain[chain.len() - 1])
                 } else {
                     chain[0].to_string()
@@ -549,9 +551,7 @@ impl Worker {
 
                 let error_message = format!(
                     "Database error: {}{}{}",
-                    db_error,
-                    verbose_details,
-                    parameter_limit_hint
+                    db_error, verbose_details, parameter_limit_hint
                 );
 
                 let duration_ms = start.elapsed().as_millis() as u64;

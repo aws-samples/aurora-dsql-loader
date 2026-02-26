@@ -1988,7 +1988,8 @@ mod tests {
 
         // Verify parameter limit hint is NOT present (this is a CHECK constraint error, not parameter limit)
         assert!(
-            !error_msg.contains("Hint: This error is caused by exceeding the database parameter limit"),
+            !error_msg
+                .contains("Hint: This error is caused by exceeding the database parameter limit"),
             "Parameter limit hint should not appear for CHECK constraint errors. Got: {}",
             error_msg
         );
