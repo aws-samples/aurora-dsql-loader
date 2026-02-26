@@ -82,6 +82,10 @@ struct OutputArgs {
     #[arg(short, long)]
     quiet: bool,
 
+    /// Debug mode - show verbose error traces and diagnostic information
+    #[arg(long)]
+    debug: bool,
+
     /// Validate schema and show plan without loading data
     #[arg(long)]
     dry_run: bool,
@@ -260,6 +264,7 @@ async fn run_loader(
         create_table_if_missing: load.if_not_exists,
         manifest_dir: output.manifest_dir.clone().map(PathBuf::from),
         quiet: output.quiet,
+        debug: output.debug,
         column_mappings,
         resume_job_id: output.resume_job_id.clone(),
         on_conflict,

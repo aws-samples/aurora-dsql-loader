@@ -45,6 +45,8 @@ pub struct LoadConfig {
     column_mappings: std::collections::HashMap<String, String>,
     quiet: bool,
     #[builder(default)]
+    debug: bool,
+    #[builder(default)]
     resume_job_id: Option<String>,
     #[builder(default)]
     on_conflict: OnConflict,
@@ -544,6 +546,7 @@ impl Coordinator {
                 self.pool.clone(),
                 config.batch_size,
                 config.batch_concurrency,
+                config.debug,
                 telemetry_tx.clone(),
             );
 

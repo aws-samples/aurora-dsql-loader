@@ -59,6 +59,7 @@ pub struct Worker {
     pub pool: Pool,
     pub batch_size: usize,
     pub batch_concurrency: usize,
+    pub debug: bool,
     pub telemetry_tx: mpsc::UnboundedSender<TelemetryEvent>,
 }
 
@@ -69,6 +70,7 @@ impl Worker {
         pool: Pool,
         batch_size: usize,
         batch_concurrency: usize,
+        debug: bool,
         telemetry_tx: mpsc::UnboundedSender<TelemetryEvent>,
     ) -> Self {
         Self {
@@ -77,6 +79,7 @@ impl Worker {
             pool,
             batch_size,
             batch_concurrency,
+            debug,
             telemetry_tx,
         }
     }
@@ -277,6 +280,7 @@ impl Worker {
             let conflict_columns = manifest.table.conflict_columns.clone();
             let line_offset = current_line;
             let batch_len = batch.len() as u64;
+            let debug = self.debug;
 
             join_set.spawn(async move {
                 Self::load_batch(
@@ -288,6 +292,7 @@ impl Worker {
                     on_conflict,
                     &conflict_columns,
                     line_offset,
+                    debug,
                 )
                 .await
             });
@@ -376,6 +381,7 @@ impl Worker {
         on_conflict: super::manifest::OnConflict,
         conflict_columns: &[String],
         line_offset: u64,
+        debug: bool,
     ) -> BatchResult {
         // Check if we're using PostgreSQL (CAST needed) or SQLite (CAST causes issues)
         let use_pg_cast = pool.is_postgres();
@@ -498,44 +504,22 @@ impl Worker {
                     })
                     .unwrap_or_else(|| "<empty>".to_string());
 
-                // Extract the full error chain to get the actual database error
-                let mut error_chain = Vec::new();
-                let mut current_error: &dyn std::error::Error = &*e;
-
-                // Collect all errors in the chain
-                error_chain.push(current_error.to_string());
-                while let Some(source) = current_error.source() {
-                    error_chain.push(source.to_string());
-                    current_error = source;
-                }
-
+                let chain: Vec<_> = e.chain().collect();
                 // Show both first and last errors for complete context
-                let db_error = match (error_chain.first(), error_chain.last()) {
-                    (Some(first), Some(last)) if first != last => {
-                        // Multiple errors: show immediate cause and root cause
-                        format!("{}\n(Root cause: {})", first, last)
-                    }
-                    (Some(single_error), _) => {
-                        // Single error or first == last: just show it
-                        single_error.clone()
-                    }
-                    (None, _) => {
-                        // Empty chain (shouldn't happen, but handle gracefully)
-                        "Unknown database error".to_string()
-                    }
+                let db_error = if chain.len() > 1 && chain[0].to_string() != chain[chain.len() - 1].to_string() {
+                    format!("{}\n(Root cause: {})", chain[0], chain[chain.len() - 1])
+                } else {
+                    chain[0].to_string()
                 };
-
                 // Build detailed error message with full chain for debugging
-                let full_error_chain = if error_chain.len() > 1 {
-                    format!(
-                        "\n\nFull error chain:\n{}",
-                        error_chain
-                            .iter()
-                            .enumerate()
-                            .map(|(i, err)| format!("  {}. {}", i + 1, err))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    )
+                let full_error_chain = if chain.len() > 1 {
+                    let chain_str = chain
+                        .iter()
+                        .enumerate()
+                        .map(|(i, err)| format!("  {}. {}", i + 1, err))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("\n\nFull error chain:\n{}", chain_str)
                 } else {
                     String::new()
                 };
@@ -544,19 +528,29 @@ impl Worker {
                 let parameter_limit_hint =
                     Self::get_parameter_limit_hint(&db_error, records.len(), num_columns);
 
+                // Gate verbose output behind debug flag
+                let verbose_details = if debug {
+                    format!(
+                        "\n\
+                         \n\
+                         Batch context:\n\
+                         - Batch size: {} records\n\
+                         - First record sample: {}\n\
+                         - SQL statement: INSERT INTO {} {} VALUES ...{}",
+                        records.len(),
+                        first_record_sample,
+                        pool.qualified_table_name(schema_name, table_name),
+                        column_list,
+                        full_error_chain
+                    )
+                } else {
+                    String::new()
+                };
+
                 let error_message = format!(
-                    "Database error: {}\n\
-                     \n\
-                     Batch context:\n\
-                     - Batch size: {} records\n\
-                     - First record sample: {}\n\
-                     - SQL statement: INSERT INTO {} {} VALUES ...{}{}",
+                    "Database error: {}{}{}",
                     db_error,
-                    records.len(),
-                    first_record_sample,
-                    pool.qualified_table_name(schema_name, table_name),
-                    column_list,
-                    full_error_chain,
+                    verbose_details,
                     parameter_limit_hint
                 );
 
