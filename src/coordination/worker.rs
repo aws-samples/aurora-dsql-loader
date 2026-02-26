@@ -59,6 +59,7 @@ pub struct Worker {
     pub pool: Pool,
     pub batch_size: usize,
     pub batch_concurrency: usize,
+    pub debug: bool,
     pub telemetry_tx: mpsc::UnboundedSender<TelemetryEvent>,
 }
 
@@ -69,6 +70,7 @@ impl Worker {
         pool: Pool,
         batch_size: usize,
         batch_concurrency: usize,
+        debug: bool,
         telemetry_tx: mpsc::UnboundedSender<TelemetryEvent>,
     ) -> Self {
         Self {
@@ -77,6 +79,7 @@ impl Worker {
             pool,
             batch_size,
             batch_concurrency,
+            debug,
             telemetry_tx,
         }
     }
@@ -277,6 +280,7 @@ impl Worker {
             let conflict_columns = manifest.table.conflict_columns.clone();
             let line_offset = current_line;
             let batch_len = batch.len() as u64;
+            let debug = self.debug;
 
             join_set.spawn(async move {
                 Self::load_batch(
@@ -288,6 +292,7 @@ impl Worker {
                     on_conflict,
                     &conflict_columns,
                     line_offset,
+                    debug,
                 )
                 .await
             });
@@ -376,6 +381,7 @@ impl Worker {
         on_conflict: super::manifest::OnConflict,
         conflict_columns: &[String],
         line_offset: u64,
+        debug: bool,
     ) -> BatchResult {
         // Check if we're using PostgreSQL (CAST needed) or SQLite (CAST causes issues)
         let use_pg_cast = pool.is_postgres();
@@ -498,22 +504,54 @@ impl Worker {
                     })
                     .unwrap_or_else(|| "<empty>".to_string());
 
-                // Extract just the database error message (root cause)
-                let db_error = e
-                    .source()
-                    .and_then(|s| s.source())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| e.to_string());
+                let chain: Vec<_> = e.chain().collect();
+                // Show both first and last errors for complete context
+                let db_error = if chain.len() > 1
+                    && chain[0].to_string() != chain[chain.len() - 1].to_string()
+                {
+                    format!("{}\n(Root cause: {})", chain[0], chain[chain.len() - 1])
+                } else {
+                    chain[0].to_string()
+                };
+                // Build detailed error message with full chain for debugging
+                let full_error_chain = if chain.len() > 1 {
+                    let chain_str = chain
+                        .iter()
+                        .enumerate()
+                        .map(|(i, err)| format!("  {}. {}", i + 1, err))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("\n\nFull error chain:\n{}", chain_str)
+                } else {
+                    String::new()
+                };
+
+                // Check if this is a parameter limit error and add helpful hint
+                let parameter_limit_hint =
+                    Self::get_parameter_limit_hint(&db_error, records.len(), num_columns);
+
+                // Gate verbose output behind debug flag
+                let verbose_details = if debug {
+                    format!(
+                        "\n\
+                         \n\
+                         Batch context:\n\
+                         - Batch size: {} records\n\
+                         - First record sample: {}\n\
+                         - SQL statement: INSERT INTO {} {} VALUES ...{}",
+                        records.len(),
+                        first_record_sample,
+                        pool.qualified_table_name(schema_name, table_name),
+                        column_list,
+                        full_error_chain
+                    )
+                } else {
+                    String::new()
+                };
 
                 let error_message = format!(
-                    "Database error: {}\n\
-                     \n\
-                     Batch context:\n\
-                     - Batch size: {} records\n\
-                     - First record sample: {}",
-                    db_error,
-                    records.len(),
-                    first_record_sample
+                    "Database error: {}{}{}",
+                    db_error, verbose_details, parameter_limit_hint
                 );
 
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -851,6 +889,41 @@ impl Worker {
     /// Parse boolean value
     fn parse_bool(value: &str) -> bool {
         value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("t") || value == "1"
+    }
+
+    /// Generate a helpful hint if the error is related to parameter limits
+    fn get_parameter_limit_hint(error_msg: &str, batch_size: usize, num_columns: usize) -> String {
+        let error_lower = error_msg.to_lowercase();
+
+        // Check for parameter limit related errors
+        // PostgreSQL/DSQL: "too many arguments for query"
+        // SQLite: "too many SQL variables"
+        let is_param_limit_error = error_lower.contains("too many arguments")
+            || error_lower.contains("too many sql variables");
+
+        if !is_param_limit_error {
+            return String::new();
+        }
+
+        let total_params = batch_size * num_columns;
+
+        // PostgreSQL/DSQL limit: 65,535, SQLite limit: 32,766
+        // Suggest a batch size that keeps us well under both limits
+        let suggested_batch_size = if num_columns > 0 {
+            // Target ~20,000 parameters to stay safely under both limits
+            let safe_batch = 20000 / num_columns;
+            safe_batch.max(1).min(batch_size - 1)
+        } else {
+            batch_size / 2
+        };
+
+        format!(
+            "\n\n\
+            Hint: This error is caused by exceeding the database parameter limit.\n\
+            - Current batch: {} records × {} columns = {} parameters\n\
+            - Try reducing --batch-size to {} or lower to stay under the limit.",
+            batch_size, num_columns, total_params, suggested_batch_size
+        )
     }
 
     /// Check if error is retriable (transient errors that may resolve with retry)

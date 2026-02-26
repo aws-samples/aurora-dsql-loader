@@ -220,7 +220,7 @@ fn convert_timestamp(array: &dyn Array, unit: &TimeUnit, strings: &mut Vec<Strin
                     let seconds = arr.value(i);
                     let datetime = chrono::DateTime::from_timestamp(seconds, 0)
                         .context("Invalid timestamp")?;
-                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                    datetime.format("%Y-%m-%d %H:%M:%S%.f").to_string()
                 });
             }
         }
@@ -233,7 +233,7 @@ fn convert_timestamp(array: &dyn Array, unit: &TimeUnit, strings: &mut Vec<Strin
                     let millis = arr.value(i);
                     let datetime = chrono::DateTime::from_timestamp_millis(millis)
                         .context("Invalid timestamp")?;
-                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                    datetime.format("%Y-%m-%d %H:%M:%S%.f").to_string()
                 });
             }
         }
@@ -246,7 +246,7 @@ fn convert_timestamp(array: &dyn Array, unit: &TimeUnit, strings: &mut Vec<Strin
                     let micros = arr.value(i);
                     let datetime = chrono::DateTime::from_timestamp_micros(micros)
                         .context("Invalid timestamp")?;
-                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                    datetime.format("%Y-%m-%d %H:%M:%S%.f").to_string()
                 });
             }
         }
@@ -258,7 +258,7 @@ fn convert_timestamp(array: &dyn Array, unit: &TimeUnit, strings: &mut Vec<Strin
                 } else {
                     let nanos = arr.value(i);
                     let datetime = chrono::DateTime::from_timestamp_nanos(nanos);
-                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                    datetime.format("%Y-%m-%d %H:%M:%S%.f").to_string()
                 });
             }
         }

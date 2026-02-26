@@ -79,6 +79,7 @@ pub struct LoadArgs {
     pub create_table_if_missing: bool,
     pub manifest_dir: Option<PathBuf>,
     pub quiet: bool,
+    pub debug: bool,
 
     // Column mapping: source column name -> destination column name
     pub column_mappings: HashMap<String, String>,
@@ -138,6 +139,7 @@ pub struct LoadResult {
 ///     manifest_dir: None,
 ///     column_mappings: HashMap::new(),
 ///     quiet: true,
+///     debug: false,
 ///     resume_job_id: None,
 ///     on_conflict: OnConflict::DoNothing,
 /// };
@@ -229,6 +231,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         .file_format(file_format)
         .column_mappings(args.column_mappings)
         .quiet(args.quiet)
+        .debug(args.debug)
         .resume_job_id(args.resume_job_id)
         .on_conflict(args.on_conflict)
         .build()?;
