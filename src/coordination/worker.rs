@@ -15,11 +15,8 @@ use crate::telemetry::TelemetryEvent;
 /// Type category for SQL type conversion strategy
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TypeCategory {
-    /// Native numeric types parsed to Rust types (i16, i32, i64, f32, f64, bool)
-    NativeNumeric,
-    /// Complex types parsed to native Rust types (UUID, NaiveDateTime)
-    NativeParsed,
-    /// Complex types requiring CAST in PostgreSQL (DATE, TIME, INTERVAL, BYTEA, TIMESTAMP WITH TIME ZONE)
+    /// All types except text - bind as string and use CAST() in SQL for type conversion
+    /// This ensures PostgreSQL is the single source of truth for type validation
     StringCast,
     /// Text types with direct string binding (TEXT, VARCHAR, CHAR)
     DirectString,
@@ -29,16 +26,8 @@ impl TypeCategory {
     /// Classify a SQL type into its conversion category
     fn from_sql_type(col_type: &str) -> Self {
         match col_type {
-            "BOOLEAN" | "SMALLINT" | "INTEGER" | "BIGINT" | "REAL" | "DOUBLE PRECISION"
-            | "NUMERIC" => TypeCategory::NativeNumeric,
-            "UUID" | "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => TypeCategory::NativeParsed,
-            "TIMESTAMP WITH TIME ZONE"
-            | "DATE"
-            | "TIME"
-            | "TIME WITHOUT TIME ZONE"
-            | "INTERVAL"
-            | "BYTEA" => TypeCategory::StringCast,
-            _ => TypeCategory::DirectString,
+            "TEXT" | "VARCHAR" | "CHAR" => TypeCategory::DirectString,
+            _ => TypeCategory::StringCast,
         }
     }
 }
@@ -753,142 +742,21 @@ impl Worker {
     fn bind_record_fields<'q>(
         mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
         fields: &'q [String],
-        schema: &Option<super::manifest::SchemaJson>,
+        _schema: &Option<super::manifest::SchemaJson>,
     ) -> Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>> {
-        // If no schema, bind as TEXT (old behavior)
-        if schema.is_none() {
-            for field in fields {
-                query = query.bind(field);
+        for field in fields.iter() {
+            let trimmed = field.trim();
+
+            // Handle NULL values (empty strings become NULL)
+            if trimmed.is_empty() {
+                query = query.bind(None::<String>);
+            } else {
+                // All types bound as strings - PostgreSQL CAST() validates and converts
+                query = query.bind(field.as_str());
             }
-            return Ok(query);
-        }
-
-        let schema = schema.as_ref().unwrap();
-
-        for (idx, field) in fields.iter().enumerate() {
-            let col_type = schema
-                .columns
-                .get(idx)
-                .map(|c| c.col_type.as_str())
-                .unwrap_or("TEXT");
-
-            query = Self::bind_typed_value(query, field, col_type)?;
         }
 
         Ok(query)
-    }
-
-    /// Bind a single value with proper type conversion
-    fn bind_typed_value<'q>(
-        query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-        value: &'q str,
-        col_type: &str,
-    ) -> Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>> {
-        let trimmed = value.trim();
-
-        // Handle NULL values
-        if trimmed.is_empty() {
-            return Ok(Self::bind_null(query, col_type));
-        }
-
-        // Parse and bind based on type
-        Ok(match col_type {
-            // Numeric types - parse for type safety and validation
-            "BOOLEAN" => query.bind(Self::parse_bool(trimmed)),
-            "SMALLINT" => query.bind(Self::parse::<i16>(trimmed, col_type)?),
-            "INTEGER" => query.bind(Self::parse::<i32>(trimmed, col_type)?),
-            "BIGINT" => query.bind(Self::parse::<i64>(trimmed, col_type)?),
-            "REAL" => query.bind(Self::parse::<f32>(trimmed, col_type)?),
-            "DOUBLE PRECISION" => query.bind(Self::parse::<f64>(trimmed, col_type)?),
-            "NUMERIC" => query.bind(Self::parse::<f64>(trimmed, col_type)?),
-
-            // UUID type with native sqlx support
-            "UUID" => {
-                let uuid = uuid::Uuid::parse_str(trimmed).context(format!(
-                    "Type mismatch: Cannot convert value to UUID.\n\
-                     - Expected: UUID format (e.g., '550e8400-e29b-41d4-a716-446655440000')\n\
-                     - Got: '{}'\n\
-                     \n\
-                     Suggestion: Check your source data for invalid UUID values.",
-                    trimmed
-                ))?;
-                query.bind(uuid)
-            }
-
-            // TIMESTAMP - parse common formats
-            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => {
-                let timestamp = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
-                    .or_else(|_| {
-                        chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S")
-                    })
-                    .context(format!(
-                        "Type mismatch: Cannot convert value to TIMESTAMP.\n\
-                         - Expected: TIMESTAMP format (e.g., '2024-01-15 14:30:00' or '2024-01-15T14:30:00')\n\
-                         - Got: '{}'\n\
-                         \n\
-                         Suggestion: Check your source data for invalid timestamp values.",
-                        trimmed
-                    ))?;
-                query.bind(timestamp)
-            }
-
-            // All other types - bind as string, use CAST() in SQL
-            // Includes: TIMESTAMP WITH TIME ZONE, DATE, TIME, INTERVAL, BYTEA, TEXT, VARCHAR, CHAR
-            _ => query.bind(value),
-        })
-    }
-
-    /// Bind NULL value for the appropriate type
-    fn bind_null<'q>(
-        query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-        col_type: &str,
-    ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-        match col_type {
-            // Numeric types - use typed NULL for proper parameter binding
-            "BOOLEAN" => query.bind(None::<bool>),
-            "SMALLINT" => query.bind(None::<i16>),
-            "INTEGER" => query.bind(None::<i32>),
-            "BIGINT" => query.bind(None::<i64>),
-            "REAL" => query.bind(None::<f32>),
-            "DOUBLE PRECISION" => query.bind(None::<f64>),
-            "NUMERIC" => query.bind(None::<f64>),
-
-            // UUID and TIMESTAMP - typed NULL for native types we parse
-            "UUID" => query.bind(None::<uuid::Uuid>),
-            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => {
-                query.bind(None::<chrono::NaiveDateTime>)
-            }
-
-            // All other types - bind as NULL string, SQL CAST will handle type conversion
-            // This includes: TIMESTAMP WITH TIME ZONE, DATE, TIME, INTERVAL, BYTEA, TEXT, VARCHAR, CHAR
-            _ => query.bind(None::<String>),
-        }
-    }
-
-    /// Parse a value from string
-    fn parse<T: std::str::FromStr>(value: &str, type_name: &str) -> Result<T>
-    where
-        <T as std::str::FromStr>::Err: std::fmt::Display,
-    {
-        value.parse().map_err(|e| {
-            anyhow!(
-                "Type mismatch: Cannot convert value to {}.\n\
-                 - Expected: Valid {} value\n\
-                 - Got: '{}'\n\
-                 - Error: {}\n\
-                 \n\
-                 Suggestion: Check your source data for non-numeric values in numeric columns.",
-                type_name,
-                type_name,
-                value,
-                e
-            )
-        })
-    }
-
-    /// Parse boolean value
-    fn parse_bool(value: &str) -> bool {
-        value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("t") || value == "1"
     }
 
     /// Generate a helpful hint if the error is related to parameter limits
