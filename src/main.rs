@@ -74,6 +74,23 @@ struct LoadParams {
     /// Conflict resolution strategy (do-nothing, do-update, error)
     #[arg(long, default_value = "do-nothing")]
     on_conflict: String,
+
+    // Delimited file options (CSV/TSV)
+    /// Field delimiter (Default "," for CSV, and "\t" for TSV)
+    #[arg(long)]
+    delimiter: Option<String>,
+
+    /// Quote character
+    #[arg(long, default_value = "\"")]
+    quote: Option<String>,
+
+    /// Escape character to use for escaping content
+    #[arg(long)]
+    escape: Option<String>,
+
+    /// File has no header row
+    #[arg(long)]
+    no_header: bool,
 }
 
 #[derive(Clone, ClapArgs)]
@@ -268,6 +285,10 @@ async fn run_loader(
         column_mappings,
         resume_job_id: output.resume_job_id.clone(),
         on_conflict,
+        delimiter: load.delimiter.clone(),
+        quote: load.quote.clone(),
+        escape: load.escape.clone(),
+        has_header: if load.no_header { Some(false) } else { None },
     };
 
     // Run the load

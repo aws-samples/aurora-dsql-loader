@@ -478,6 +478,10 @@ mod tests {
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -567,6 +571,10 @@ mod tests {
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -705,6 +713,10 @@ mod tests {
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
             test_pool: Some(pool),
         };
 
@@ -974,6 +986,10 @@ mod tests {
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -1073,6 +1089,10 @@ mod tests {
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -1158,6 +1178,10 @@ mod tests {
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: Some(job_id.clone()),
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -1275,6 +1299,10 @@ mod tests {
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -1366,6 +1394,10 @@ mod tests {
             column_mappings: std::collections::HashMap::new(),
             resume_job_id: Some(job_id.clone()),
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
             test_pool: Some(pool.clone()),
         };
 
@@ -1993,5 +2025,110 @@ mod tests {
             "Parameter limit hint should not appear for CHECK constraint errors. Got: {}",
             error_msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_csv_config_all_parameters() {
+        // Comprehensive test for all 4 CSV configuration parameters:
+        // delimiter, quote, escape, and has_header
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a custom-formatted file:
+        // - Pipe-delimited (|)
+        // - Single quote as quote character (')
+        // - Backslash as escape character (\)
+        // - No header row
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "custom_format.txt",
+            &[
+                "1|'Alice\\'s Data'|100\n",
+                "2|'Bob said: \\'Hi\\''|200\n",
+                "3|'Charlie, Jr.'|300\n",
+                "4|'Dave | likes | pipes | '|400",
+            ],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_all_params", "col1 TEXT, col2 TEXT, col3 TEXT").await;
+
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path,
+            target_table: "test_all_params".to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            chunk_size_bytes: 1000,
+            batch_size: 10,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: std::collections::HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter: Some("|".to_string()),
+            quote: Some("'".to_string()),
+            escape: Some("\\".to_string()),
+            has_header: Some(false),
+            test_pool: Some(pool.clone()),
+        };
+
+        let result = run_load(args).await.unwrap();
+
+        assert_eq!(result.records_loaded, 4, "Should load all 4 records");
+        assert_eq!(result.records_failed, 0, "Should have no failures");
+        assert_eq!(get_table_count(&pool, "test_all_params").await, 4);
+
+        // Verify data was parsed correctly with all custom parameters
+        let mut conn = pool.acquire().await.unwrap();
+        if let PoolConnection::Sqlite(ref mut sqlite_conn) = conn {
+            // Verify first record - escape character in quoted field
+            let (col1, col2, col3): (String, String, String) =
+                sqlx::query_as("SELECT col1, col2, col3 FROM test_all_params WHERE col1 = '1'")
+                    .fetch_one(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            assert_eq!(col1, "1");
+            assert_eq!(col2, "Alice's Data", "Escaped quotes should be unescaped");
+            assert_eq!(col3, "100");
+
+            // Verify second record - multiple escaped quotes
+            let (col2_2,): (String,) =
+                sqlx::query_as("SELECT col2 FROM test_all_params WHERE col1 = '2'")
+                    .fetch_one(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                col2_2, "Bob said: 'Hi'",
+                "Multiple escaped quotes should be handled"
+            );
+
+            // Verify third record - comma inside quoted field (shouldn't be confused with delimiter)
+            let (col2_3,): (String,) =
+                sqlx::query_as("SELECT col2 FROM test_all_params WHERE col1 = '3'")
+                    .fetch_one(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                col2_3, "Charlie, Jr.",
+                "Comma in quoted field should be preserved"
+            );
+
+            // Verify fourth record - delimiter (pipe) inside quoted field
+            let (col2_4,): (String,) =
+                sqlx::query_as("SELECT col2 FROM test_all_params WHERE col1 = '4'")
+                    .fetch_one(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                col2_4, "Dave | likes | pipes | ",
+                "Delimiter (pipe) inside quoted field should be preserved and not treated as field separator"
+            );
+        }
     }
 }

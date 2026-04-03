@@ -57,6 +57,7 @@ pub struct DelimitedConfig {
     pub delimiter: String,
     pub has_header: bool,
     pub quote: String,
+    pub escape: Option<String>,
 }
 
 impl Default for DelimitedConfig {
@@ -65,6 +66,7 @@ impl Default for DelimitedConfig {
             delimiter: ",".to_string(),
             has_header: true,
             quote: "\"".to_string(),
+            escape: None,
         }
     }
 }
@@ -79,6 +81,7 @@ impl DelimitedConfig {
             delimiter: "\\t".to_string(),
             has_header: true,
             quote: "\"".to_string(),
+            escape: None,
         }
     }
 }
@@ -104,15 +107,18 @@ impl ReaderFactory {
     }
 
     /// Create a FileReader based on source URI and format
+    ///
+    /// If delimited_config is provided for CSV/TSV formats, it will be used instead of defaults
     pub async fn create_reader(
         &self,
         source_uri: &SourceUri,
         format: Format,
+        delimited_config: Option<DelimitedConfig>,
     ) -> Result<Arc<dyn FileReader>> {
         match (source_uri, format) {
             // Local CSV
             (SourceUri::Local(path), Format::Csv) => {
-                let config = DelimitedConfig::csv();
+                let config = delimited_config.unwrap_or_else(DelimitedConfig::csv);
                 let byte_reader = LocalFileByteReader::new(path);
                 let reader = GenericDelimitedReader::new(byte_reader, config);
                 Ok(Arc::new(reader) as Arc<dyn FileReader>)
@@ -120,7 +126,7 @@ impl ReaderFactory {
 
             // Local TSV
             (SourceUri::Local(path), Format::Tsv) => {
-                let config = DelimitedConfig::tsv();
+                let config = delimited_config.unwrap_or_else(DelimitedConfig::tsv);
                 let byte_reader = LocalFileByteReader::new(path);
                 let reader = GenericDelimitedReader::new(byte_reader, config);
                 Ok(Arc::new(reader) as Arc<dyn FileReader>)
@@ -128,7 +134,7 @@ impl ReaderFactory {
 
             // S3 CSV
             (SourceUri::S3 { bucket, key }, Format::Csv) => {
-                let config = DelimitedConfig::csv();
+                let config = delimited_config.unwrap_or_else(DelimitedConfig::csv);
                 let byte_reader =
                     S3ByteReader::new(Arc::clone(&self.s3_client), bucket.clone(), key.clone());
                 let reader = GenericDelimitedReader::new(byte_reader, config);
@@ -137,7 +143,7 @@ impl ReaderFactory {
 
             // S3 TSV
             (SourceUri::S3 { bucket, key }, Format::Tsv) => {
-                let config = DelimitedConfig::tsv();
+                let config = delimited_config.unwrap_or_else(DelimitedConfig::tsv);
                 let byte_reader =
                     S3ByteReader::new(Arc::clone(&self.s3_client), bucket.clone(), key.clone());
                 let reader = GenericDelimitedReader::new(byte_reader, config);
