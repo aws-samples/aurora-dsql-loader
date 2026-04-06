@@ -165,7 +165,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         test_pool
     } else {
         let pool_args = PoolArgsBuilder::default()
-            .region(Region::new(args.region.clone()))
+            .region(&args.region)
             .endpoint(&args.endpoint)
             .username(&args.username)
             .build()?;
@@ -175,7 +175,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     #[cfg(not(test))]
     let pool = {
         let pool_args = PoolArgsBuilder::default()
-            .region(Region::new(args.region.clone()))
+            .region(&args.region)
             .endpoint(&args.endpoint)
             .username(&args.username)
             .build()?;
