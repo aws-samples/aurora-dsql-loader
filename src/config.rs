@@ -6,16 +6,6 @@
 use std::time::Duration;
 
 // ============================================================================
-// Connection Pool Configuration
-// ============================================================================
-
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
-
-pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub const TOKEN_VALIDITY_DURATION: Duration = Duration::from_secs(900); // 15 minutes
-
-// ============================================================================
 // Worker Configuration
 // ============================================================================
 
