@@ -53,6 +53,11 @@ impl Format {
             Format::Parquet => crate::formats::Format::Parquet,
         }
     }
+
+    /// Check if this format is a delimited text format (CSV/TSV)
+    pub fn is_delimited(self) -> bool {
+        matches!(self, Format::Csv | Format::Tsv)
+    }
 }
 
 /// Arguments for running a data load operation
@@ -104,13 +109,6 @@ pub struct LoadArgs {
     #[cfg(test)]
     pub test_pool: Option<crate::db::Pool>,
 }
-
-impl LoadArgs {
-    pub fn is_delimited(&self) -> bool {
-        self.format == Format::Csv || self.format == Format::Tsv
-    }
-}
-
 /// Result of a completed data load operation
 #[derive(Debug)]
 pub struct LoadResult {
@@ -293,7 +291,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
 
 // Build custom delimited config if provided
 fn maybe_delimited_config(args: &LoadArgs) -> Option<DelimitedConfig> {
-    if args.is_delimited() {
+    if args.format.is_delimited() {
         let mut config = if args.format == Format::Csv {
             DelimitedConfig::csv()
         } else {
