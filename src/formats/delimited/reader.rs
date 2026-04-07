@@ -89,17 +89,24 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
             .context("Failed to read chunk data")?;
 
         // Parse the CSV data
-        // Convert string delimiter to byte (handle \t specially)
-        let delimiter_byte = if self.config.delimiter == "\\t" {
-            b'\t'
+        // Convert string delimiter to byte (handle escape sequences)
+        let delimiter_byte =
+            parse_escape_sequence(&self.config.delimiter).context("Invalid delimiter")?;
+
+        let quote_byte =
+            parse_escape_sequence(&self.config.quote).context("Invalid quote character")?;
+
+        // Convert escape string to optional byte
+        let escape_byte = if let Some(ref escape_str) = self.config.escape {
+            Some(parse_escape_sequence(escape_str).context("Invalid escape character")?)
         } else {
-            self.config.delimiter.as_bytes()[0]
+            None
         };
-        let quote_byte = self.config.quote.as_bytes()[0];
 
         let mut csv_reader = csv::ReaderBuilder::new()
             .delimiter(delimiter_byte)
             .quote(quote_byte)
+            .escape(escape_byte)
             .has_headers(false) // We handle headers at the file level
             .from_reader(buffer.as_slice());
 
@@ -123,5 +130,33 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
             records,
             bytes_read: chunk.end_offset - chunk.start_offset,
         })
+    }
+}
+
+/// Parse a string that may contain escape sequences into a single byte
+/// Supports: \\, \t, \n, \r, \", \'
+fn parse_escape_sequence(s: &str) -> Result<u8> {
+    if s.len() == 1 {
+        // Single character, no escape sequence
+        return Ok(s.as_bytes()[0]);
+    }
+
+    if s.len() == 2 && s.starts_with('\\') {
+        // Two-character escape sequence
+        match s.chars().nth(1) {
+            Some('\\') => Ok(b'\\'),
+            Some('t') => Ok(b'\t'),
+            Some('n') => Ok(b'\n'),
+            Some('r') => Ok(b'\r'),
+            Some('"') => Ok(b'"'),
+            Some('\'') => Ok(b'\''),
+            Some(c) => anyhow::bail!("Unknown escape sequence: \\{}", c),
+            None => anyhow::bail!("Invalid escape sequence"),
+        }
+    } else {
+        anyhow::bail!(
+            "Character must be exactly one character (got {} bytes). Use escape sequences like \\t, \\n, or \\\\",
+            s.len()
+        )
     }
 }

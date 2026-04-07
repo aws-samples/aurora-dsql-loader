@@ -53,6 +53,11 @@ impl Format {
             Format::Parquet => crate::formats::Format::Parquet,
         }
     }
+
+    /// Check if this format is a delimited text format (CSV/TSV)
+    pub fn is_delimited(self) -> bool {
+        matches!(self, Format::Csv | Format::Tsv)
+    }
 }
 
 /// Arguments for running a data load operation
@@ -90,11 +95,20 @@ pub struct LoadArgs {
     // Conflict resolution strategy
     pub on_conflict: OnConflict,
 
+    // Delimited file options (CSV/TSV)
+    /// Field delimiter (default: "," for CSV, "\t" for TSV)
+    pub delimiter: Option<String>,
+    /// Quote character (default: "\"")
+    pub quote: Option<String>,
+    /// Escape character for escaping quotes (default: None)
+    pub escape: Option<String>,
+    /// Whether file has a header row (default: true)
+    pub has_header: Option<bool>,
+
     // Test-only: inject a pre-created pool (for SQLite testing)
     #[cfg(test)]
     pub test_pool: Option<crate::db::Pool>,
 }
-
 /// Result of a completed data load operation
 #[derive(Debug)]
 pub struct LoadResult {
@@ -142,6 +156,10 @@ pub struct LoadResult {
 ///     debug: false,
 ///     resume_job_id: None,
 ///     on_conflict: OnConflict::DoNothing,
+///     delimiter: None,
+///     quote: None,
+///     escape: None,
+///     has_header: None,
 /// };
 ///
 /// let result = run_load(args).await?;
@@ -150,6 +168,8 @@ pub struct LoadResult {
 /// # }
 /// ```
 pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
+    let delimited_config = maybe_delimited_config(&args);
+
     // Set up manifest directory (use temp dir if not provided)
     let (mut temp_dir, manifest_dir_path) = if let Some(dir) = args.manifest_dir {
         (None, dir)
@@ -194,13 +214,23 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     // Create reader factory and file reader
     let reader_factory = ReaderFactory::new(&aws_config);
     let file_reader = reader_factory
-        .create_reader(&parsed_uri, args.format.to_internal())
+        .create_reader(
+            &parsed_uri,
+            args.format.to_internal(),
+            delimited_config.clone(),
+        )
         .await?;
 
     // Determine file format config based on format
     let (has_header, file_format) = match args.format {
-        Format::Csv => (true, FileFormat::Csv(DelimitedConfig::csv())),
-        Format::Tsv => (true, FileFormat::Tsv(DelimitedConfig::tsv())),
+        Format::Csv => {
+            let config = delimited_config.unwrap_or_else(DelimitedConfig::csv);
+            (config.has_header, FileFormat::Csv(config))
+        }
+        Format::Tsv => {
+            let config = delimited_config.unwrap_or_else(DelimitedConfig::tsv);
+            (config.has_header, FileFormat::Tsv(config))
+        }
         Format::Parquet => (false, FileFormat::Parquet(ParquetConfig::default())),
     };
 
@@ -257,4 +287,32 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         duration: result.duration,
         persisted_manifest_dir,
     })
+}
+
+// Build custom delimited config if provided
+fn maybe_delimited_config(args: &LoadArgs) -> Option<DelimitedConfig> {
+    if args.format.is_delimited() {
+        let mut config = if args.format == Format::Csv {
+            DelimitedConfig::csv()
+        } else {
+            DelimitedConfig::tsv()
+        };
+
+        if let Some(delimiter) = args.delimiter.clone() {
+            config.delimiter = delimiter;
+        }
+        if let Some(quote) = args.quote.clone() {
+            config.quote = quote;
+        }
+        if let Some(escape) = args.escape.clone() {
+            config.escape = Some(escape);
+        }
+        if let Some(has_header) = args.has_header {
+            config.has_header = has_header;
+        }
+
+        Some(config)
+    } else {
+        None
+    }
 }

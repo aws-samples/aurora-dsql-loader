@@ -1,5 +1,5 @@
 use aurora_dsql_loader::runner::{Format, LoadArgs, OnConflict, run_load};
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
@@ -24,6 +24,7 @@ struct ConnectionArgs {
 }
 
 #[derive(Clone, ClapArgs)]
+#[command(group = ArgGroup::new("delimited").multiple(true))]
 struct SourceArgs {
     /// Path to source data file or S3 URI (local path, s3://bucket/key)
     #[arg(short, long)]
@@ -32,6 +33,23 @@ struct SourceArgs {
     /// File format (csv, tsv, parquet) - auto-detected from extension if not specified
     #[arg(short, long)]
     format: Option<String>,
+
+    // Delimited file options (CSV/TSV only)
+    /// Field delimiter (Default "," for CSV, and "\t" for TSV)
+    #[arg(long, group = "delimited")]
+    delimiter: Option<String>,
+
+    /// Quote character
+    #[arg(long, default_value = "\"", group = "delimited")]
+    quote: Option<String>,
+
+    /// Escape character to use for escaping content
+    #[arg(long, group = "delimited")]
+    escape: Option<String>,
+
+    /// File has no header row
+    #[arg(long, group = "delimited")]
+    no_header: bool,
 }
 
 #[derive(Clone, ClapArgs)]
@@ -226,6 +244,20 @@ async fn run_loader(
     // Parse format
     let format_enum = Format::parse(&format)?;
 
+    // Validate delimited options are only used with CSV/TSV
+    let has_delimited_options = source.delimiter.is_some()
+        || source.quote.is_some()
+        || source.escape.is_some()
+        || source.no_header;
+
+    if has_delimited_options && !format_enum.is_delimited() {
+        return Err(anyhow::anyhow!(
+            "Delimited file options (--delimiter, --quote, --escape, --no-header) \
+             can only be used with CSV or TSV formats, not {}",
+            format
+        ));
+    }
+
     // Handle dry-run mode
     if output.dry_run {
         println!("DRY RUN MODE - No data will be loaded");
@@ -253,7 +285,7 @@ async fn run_loader(
         endpoint: connection.endpoint,
         region,
         username: connection.username,
-        source_uri: source.source_uri,
+        source_uri: source.source_uri.clone(),
         target_table: target.table.clone(),
         schema: target.schema,
         format: format_enum,
@@ -268,6 +300,10 @@ async fn run_loader(
         column_mappings,
         resume_job_id: output.resume_job_id.clone(),
         on_conflict,
+        delimiter: source.delimiter.clone(),
+        quote: source.quote.clone(),
+        escape: source.escape.clone(),
+        has_header: if source.no_header { Some(false) } else { None },
     };
 
     // Run the load
