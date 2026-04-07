@@ -1,5 +1,5 @@
 use aurora_dsql_loader::runner::{Format, LoadArgs, OnConflict, run_load};
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
@@ -24,7 +24,7 @@ struct ConnectionArgs {
 }
 
 #[derive(Clone, ClapArgs)]
-#[command(group = clap::ArgGroup::new("delimited").multiple(true))]
+#[command(group = ArgGroup::new("delimited").multiple(true))]
 struct SourceArgs {
     /// Path to source data file or S3 URI (local path, s3://bucket/key)
     #[arg(short, long)]
