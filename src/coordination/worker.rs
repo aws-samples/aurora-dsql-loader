@@ -408,7 +408,10 @@ impl Worker {
         let mut value_groups = Vec::new();
 
         for record in records {
-            let values: Vec<String> = record.fields.iter().enumerate()
+            let values: Vec<String> = record
+                .fields
+                .iter()
+                .enumerate()
                 .map(|(col_idx, field)| {
                     let trimmed = field.trim();
 
@@ -632,10 +635,7 @@ impl Worker {
     }
 
     /// Execute a batch insert with retry logic for transient errors
-    async fn execute_with_retry(
-        pool: &Pool,
-        insert_sql: &str,
-    ) -> Result<()> {
+    async fn execute_with_retry(pool: &Pool, insert_sql: &str) -> Result<()> {
         let mut last_error = None;
 
         for attempt in 0..MAX_RETRIES {
@@ -670,10 +670,7 @@ impl Worker {
     }
 
     /// Attempt to execute a batch insert (single try, no retry logic)
-    async fn try_execute(
-        pool: &Pool,
-        insert_sql: &str,
-    ) -> Result<()> {
+    async fn try_execute(pool: &Pool, insert_sql: &str) -> Result<()> {
         let mut conn = pool
             .acquire()
             .await
