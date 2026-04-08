@@ -94,7 +94,8 @@ pub async fn pool(args: PoolArgs) -> anyhow::Result<Pool> {
     let pool_options = sqlx::postgres::PgPoolOptions::new()
         .min_connections(min_idle)
         .max_connections(max_pool_size)
-        .max_lifetime(Duration::from_secs(60 * 55));
+        .max_lifetime(Duration::from_secs(60 * 55))
+        .acquire_timeout(Duration::from_secs(60));
 
     let sqlx_pool = dsql_pool::connect_with(&config, pool_options)
         .await

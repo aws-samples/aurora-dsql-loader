@@ -35,6 +35,8 @@ pub struct Record {
 pub struct ChunkData {
     pub records: Vec<Record>,
     pub bytes_read: u64,
+    /// Number of records that failed to parse
+    pub parse_errors: u64,
 }
 
 /// Trait for reading different file formats with chunking support

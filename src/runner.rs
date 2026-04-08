@@ -116,6 +116,8 @@ pub struct LoadResult {
     pub chunks_processed: usize,
     pub records_loaded: u64,
     pub records_failed: u64,
+    /// Estimated row count from file size (for mismatch detection)
+    pub estimated_rows: Option<u64>,
     pub duration: Duration,
     /// Path to persisted manifest directory (if errors occurred and temp dir was used)
     pub persisted_manifest_dir: Option<PathBuf>,
@@ -284,6 +286,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         chunks_processed: result.chunks_processed,
         records_loaded: result.records_loaded,
         records_failed: result.records_failed,
+        estimated_rows: result.estimated_rows,
         duration: result.duration,
         persisted_manifest_dir,
     })

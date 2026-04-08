@@ -305,6 +305,19 @@ impl Worker {
         let mut records_failed = 0u64;
         let mut errors = Vec::new();
 
+        // Include CSV/TSV parse errors as failed records
+        if chunk_data.parse_errors > 0 {
+            records_failed += chunk_data.parse_errors;
+            errors.push(ErrorRecord {
+                line_number: 0,
+                error_type: "parse_error".to_string(),
+                error_message: format!(
+                    "{} record(s) failed to parse from source file. Check delimiter, quote, and escape settings.",
+                    chunk_data.parse_errors
+                ),
+            });
+        }
+
         for result in results {
             records_loaded += result.records_loaded;
             records_failed += result.records_failed;
