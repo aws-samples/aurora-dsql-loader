@@ -403,19 +403,29 @@ impl Worker {
             String::new()
         };
 
-        // Build batch INSERT statement: INSERT INTO table (col1, col2) VALUES ($1, $2), ($3, $4), ...
-        // For types that PostgreSQL won't auto-cast from text, add explicit CAST
+        // Build batch INSERT statement: INSERT INTO table (col1, col2) VALUES ('val1', 'val2'), ('val3', 'val4'), ...
+        // Values are embedded directly in the SQL string with proper escaping
         let mut value_groups = Vec::new();
-        let mut param_idx = 1;
 
-        for _ in 0..records.len() {
-            let placeholders: Vec<String> = (0..num_columns)
-                .map(|col_idx| {
-                    let placeholder = format!("${}", param_idx);
-                    param_idx += 1;
+        for record in records {
+            let values: Vec<String> = record
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(col_idx, field)| {
+                    let trimmed = field.trim();
 
-                    // Add CAST() for types we bind as strings (not parsed to native Rust types)
+                    // Handle NULL values (empty strings become NULL)
+                    if trimmed.is_empty() {
+                        return "NULL".to_string();
+                    }
+
+                    // Escape the field value for SQL
+                    let escaped = Self::escape_sql_string(field);
+
+                    // Add CAST() for types that need it
                     // Only for PostgreSQL - SQLite doesn't handle CAST() well for DATE/TIME types
+                    let value_expr = format!("'{}'", escaped);
                     schema
                         .as_ref()
                         .and_then(|s| s.columns.get(col_idx))
@@ -424,11 +434,11 @@ impl Worker {
                                 && TypeCategory::from_sql_type(&col.col_type)
                                     == TypeCategory::StringCast
                         })
-                        .map(|col| format!("CAST({} AS {})", placeholder, col.col_type))
-                        .unwrap_or(placeholder)
+                        .map(|col| format!("CAST({} AS {})", value_expr, col.col_type))
+                        .unwrap_or(value_expr)
                 })
                 .collect();
-            value_groups.push(format!("({})", placeholders.join(", ")));
+            value_groups.push(format!("({})", values.join(", ")));
         }
 
         let values_clause = format!("VALUES {}", value_groups.join(", "));
@@ -458,7 +468,7 @@ impl Worker {
         );
 
         // Execute with retry on error code 42001
-        match Self::execute_with_retry(pool, &insert_sql, records, schema).await {
+        match Self::execute_with_retry(pool, &insert_sql).await {
             Ok(_) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 BatchResult {
@@ -558,6 +568,12 @@ impl Worker {
         }
     }
 
+    /// Escape a string value for use in SQL
+    /// Handles single quotes by doubling them (SQL standard escaping)
+    fn escape_sql_string(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+
     /// Build the ON CONFLICT clause based on the conflict resolution mode
     ///
     /// Note: For DoUpdate mode, this updates ALL columns (including non-key columns).
@@ -619,16 +635,11 @@ impl Worker {
     }
 
     /// Execute a batch insert with retry logic for transient errors
-    async fn execute_with_retry(
-        pool: &Pool,
-        insert_sql: &str,
-        records: &[Record],
-        schema: &Option<super::manifest::SchemaJson>,
-    ) -> Result<()> {
+    async fn execute_with_retry(pool: &Pool, insert_sql: &str) -> Result<()> {
         let mut last_error = None;
 
         for attempt in 0..MAX_RETRIES {
-            let result = Self::try_execute(pool, insert_sql, records, schema).await;
+            let result = Self::try_execute(pool, insert_sql).await;
 
             match result {
                 Ok(()) => return Ok(()),
@@ -659,12 +670,7 @@ impl Worker {
     }
 
     /// Attempt to execute a batch insert (single try, no retry logic)
-    async fn try_execute(
-        pool: &Pool,
-        insert_sql: &str,
-        records: &[Record],
-        schema: &Option<super::manifest::SchemaJson>,
-    ) -> Result<()> {
+    async fn try_execute(pool: &Pool, insert_sql: &str) -> Result<()> {
         let mut conn = pool
             .acquire()
             .await
@@ -672,15 +678,11 @@ impl Worker {
 
         let query_future = match &mut conn {
             crate::db::pool::PoolConnection::Postgres(_) => {
-                let mut query = sqlx::query(insert_sql);
-                for record in records {
-                    query = Self::bind_record_fields(query, &record.fields, schema)?;
-                }
-                query.execute(&mut *conn)
+                sqlx::query(insert_sql).execute(&mut *conn)
             }
             #[cfg(test)]
             crate::db::pool::PoolConnection::Sqlite(sqlite_conn) => {
-                return Self::execute_sqlite_batch(sqlite_conn, insert_sql, records).await;
+                return Self::execute_sqlite_simple(sqlite_conn, insert_sql).await;
             }
         };
 
@@ -691,72 +693,17 @@ impl Worker {
             .map_err(Into::into)
     }
 
-    /// Execute a batch insert for SQLite (simple string binding for testing)
+    /// Execute a simple SQL statement for SQLite (no parameter binding)
     #[cfg(test)]
-    async fn execute_sqlite_batch(
+    async fn execute_sqlite_simple(
         conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
         insert_sql: &str,
-        records: &[Record],
     ) -> Result<()> {
-        // Convert Postgres placeholders ($1, $2) to SQLite placeholders (?, ?)
-        let sqlite_sql = Self::convert_to_sqlite_placeholders(insert_sql);
-
-        let mut query = sqlx::query(&sqlite_sql);
-
-        // Bind all fields as strings (simple approach for testing)
-        for record in records {
-            for field in &record.fields {
-                query = query.bind(field);
-            }
-        }
-
-        tokio::time::timeout(QUERY_TIMEOUT, query.execute(&mut **conn))
+        tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(insert_sql).execute(&mut **conn))
             .await
             .map_err(|_| anyhow!("Query timed out after {}s", QUERY_TIMEOUT.as_secs()))?
             .map(|_| ())
             .map_err(Into::into)
-    }
-
-    /// Convert Postgres-style placeholders ($1, $2, ...) to SQLite-style (?, ?, ...)
-    #[cfg(test)]
-    fn convert_to_sqlite_placeholders(sql: &str) -> String {
-        let mut result = String::new();
-        let mut chars = sql.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            if ch == '$' {
-                // Skip the dollar sign and any following digits
-                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
-                    chars.next();
-                }
-                result.push('?');
-            } else {
-                result.push(ch);
-            }
-        }
-
-        result
-    }
-
-    /// Bind record fields to query with proper types based on schema
-    fn bind_record_fields<'q>(
-        mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-        fields: &'q [String],
-        _schema: &Option<super::manifest::SchemaJson>,
-    ) -> Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>> {
-        for field in fields.iter() {
-            let trimmed = field.trim();
-
-            // Handle NULL values (empty strings become NULL)
-            if trimmed.is_empty() {
-                query = query.bind(None::<String>);
-            } else {
-                // All types bound as strings - PostgreSQL CAST() validates and converts
-                query = query.bind(field.as_str());
-            }
-        }
-
-        Ok(query)
     }
 
     /// Generate a helpful hint if the error is related to parameter limits
