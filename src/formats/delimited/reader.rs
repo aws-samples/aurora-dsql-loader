@@ -111,17 +111,31 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
             .from_reader(buffer.as_slice());
 
         let mut records = Vec::new();
+        let mut parse_errors = 0u64;
+        let mut expected_columns: Option<usize> = None;
 
         for result in csv_reader.records() {
             match result {
                 Ok(record) => {
+                    let field_count = record.len();
+                    // Establish expected column count from first record
+                    if expected_columns.is_none() {
+                        expected_columns = Some(field_count);
+                    }
+                    // Reject records with mismatched column count (catches unclosed quotes)
+                    if Some(field_count) != expected_columns {
+                        parse_errors += 1;
+                        continue;
+                    }
                     records.push(Record {
                         fields: record.iter().map(|s| s.to_string()).collect(),
                     });
                 }
-                Err(_) => {
-                    // Incomplete trailing record (chunk ended mid-line) - stop parsing
-                    break;
+                Err(e) => {
+                    if e.is_io_error() {
+                        break;
+                    }
+                    parse_errors += 1;
                 }
             }
         }
@@ -129,6 +143,7 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
         Ok(ChunkData {
             records,
             bytes_read: chunk.end_offset - chunk.start_offset,
+            parse_errors,
         })
     }
 }

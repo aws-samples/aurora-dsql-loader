@@ -322,6 +322,23 @@ async fn run_loader(
         result.records_loaded as f64 / result.duration.as_secs_f64()
     );
 
+    // Warn if significantly fewer records were loaded than estimated
+    let mut row_count_mismatch = false;
+    if let Some(estimated) = result.estimated_rows {
+        let total_processed = result.records_loaded + result.records_failed;
+        if estimated > 0 && total_processed < estimated * 3 / 4 {
+            row_count_mismatch = true;
+            println!();
+            println!(
+                "WARNING: Only {} records processed out of ~{} estimated from file size.",
+                total_processed, estimated
+            );
+            println!(
+                "This may indicate silent parse errors. Check --delimiter, --quote, and --escape settings."
+            );
+        }
+    }
+
     // If errors occurred and manifest was persisted, tell the user where to find them
     if let Some(ref persisted_path) = result.persisted_manifest_dir {
         println!();
@@ -348,6 +365,10 @@ async fn run_loader(
         println!();
         println!("Warning: --keep-manifest is only effective with --manifest-dir.");
         println!("Manifest was stored in a temporary directory and has been cleaned up.");
+    }
+
+    if result.records_failed > 0 || row_count_mismatch {
+        std::process::exit(1);
     }
 
     Ok(())

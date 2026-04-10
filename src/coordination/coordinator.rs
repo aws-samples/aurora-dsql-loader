@@ -59,6 +59,8 @@ pub struct LoadResult {
     pub chunks_processed: usize,
     pub records_loaded: u64,
     pub records_failed: u64,
+    /// Estimated row count from file size (for mismatch detection)
+    pub estimated_rows: Option<u64>,
     pub duration: Duration,
     /// Detailed results for each chunk (accessed in integration tests)
     #[cfg_attr(not(test), allow(dead_code))]
@@ -667,6 +669,18 @@ impl Coordinator {
         let total_records_failed: u64 = chunk_results.iter().map(|r| r.records_failed).sum();
         let duration = start_time.elapsed();
 
+        // Warn if significantly fewer records were processed than estimated
+        let total_estimated: u64 = chunks.iter().filter_map(|c| c.estimated_rows).sum();
+        let total_processed = total_records_loaded + total_records_failed;
+        if total_estimated > 0 && total_processed < total_estimated / 2 {
+            warn!(
+                "Only {} records processed out of ~{} estimated. \
+                 This may indicate parse errors in the source file. \
+                 Check delimiter, quote, and escape settings.",
+                total_processed, total_estimated
+            );
+        }
+
         info!(
             "Load complete: {} chunks, {} records loaded, {} records failed in {:.2}s",
             chunk_results.len(),
@@ -680,6 +694,7 @@ impl Coordinator {
             chunks_processed: chunk_results.len(),
             records_loaded: total_records_loaded,
             records_failed: total_records_failed,
+            estimated_rows: Some(total_estimated).filter(|&e| e > 0),
             duration,
             chunk_results,
         })

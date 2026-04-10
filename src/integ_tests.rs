@@ -1972,4 +1972,403 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_parse_errors_detected_for_inconsistent_columns() {
+        // Verify that records with mismatched column counts are reported as parse errors
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "bad_columns.csv",
+            &[
+                "id,name,value\n",
+                "1,alice,100\n",
+                "2,bob\n", // missing column
+                "3,charlie,300\n",
+                "4,diana,400,extra\n", // extra column
+                "5,eve,500\n",
+            ],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_parse_errors", "col1 TEXT, col2 TEXT, col3 TEXT").await;
+
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_parse_errors",
+            &csv_path,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result.records_loaded, 3,
+            "Should load only the 3 records with correct column count"
+        );
+        assert_eq!(
+            result.records_failed, 2,
+            "Should report 2 failed records (one missing column, one extra)"
+        );
+        assert_eq!(get_table_count(&pool, "test_parse_errors").await, 3);
+    }
+
+    #[tokio::test]
+    async fn test_parse_errors_detected_for_csv_errors() {
+        // Verify that unclosed quotes result in fewer records loaded
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "malformed.csv",
+            &[
+                "id,name,value\n",
+                "1,alice,100\n",
+                "2,\"unclosed quote,200\n",
+                "3,charlie,300\n",
+                "4,diana,400\n",
+            ],
+        )
+        .await;
+
+        let pool =
+            setup_sqlite_table("test_csv_parse_errors", "col1 TEXT, col2 TEXT, col3 TEXT").await;
+
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_csv_parse_errors",
+            &csv_path,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.records_loaded < 4,
+            "Should load fewer records than the 4 data rows due to unclosed quote. Got: {}",
+            result.records_loaded
+        );
+    }
+
+    // ============ RFC 4180 Compliance Tests ============
+
+    /// Helper to run a CSV load through the runner API with optional delimited config overrides
+    async fn run_csv_load_with_opts(
+        pool: &Pool,
+        table_name: &str,
+        csv_path: &str,
+        delimiter: Option<String>,
+        quote: Option<String>,
+        escape: Option<String>,
+        has_header: Option<bool>,
+    ) -> crate::runner::LoadResult {
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path.to_string(),
+            target_table: table_name.to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: std::collections::HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            delimiter,
+            quote,
+            escape,
+            has_header,
+            test_pool: Some(pool.clone()),
+        };
+        run_load(args).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_rfc4180_crlf_line_endings() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "crlf.csv",
+            &["id,name\r\n", "1,alice\r\n", "2,bob\r\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_crlf", "col1 TEXT, col2 TEXT").await;
+        let result =
+            run_csv_load_with_opts(&pool, "test_crlf", &csv_path, None, None, None, None).await;
+
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rfc4180_no_trailing_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "no_trailing.csv",
+            &["id,name\n", "1,alice\n", "2,bob"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_no_trailing", "col1 TEXT, col2 TEXT").await;
+        let result =
+            run_csv_load_with_opts(&pool, "test_no_trailing", &csv_path, None, None, None, None)
+                .await;
+
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rfc4180_spaces_preserved() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "spaces.csv",
+            &["id,name\n", "1, alice \n", "2, bob \n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_spaces", "col1 TEXT, col2 TEXT").await;
+        let result =
+            run_csv_load_with_opts(&pool, "test_spaces", &csv_path, None, None, None, None).await;
+
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rfc4180_quoted_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "quoted.csv",
+            &["id,name\n", "1,\"alice\"\n", "2,\"bob\"\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_quoted", "col1 TEXT, col2 TEXT").await;
+        let result =
+            run_csv_load_with_opts(&pool, "test_quoted", &csv_path, None, None, None, None).await;
+
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rfc4180_embedded_newline_in_quoted_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "embedded_newline.csv",
+            &["id,name\n", "1,\"line1\nline2\"\n", "2,bob\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_embedded_nl", "col1 TEXT, col2 TEXT").await;
+        let result =
+            run_csv_load_with_opts(&pool, "test_embedded_nl", &csv_path, None, None, None, None)
+                .await;
+
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rfc4180_embedded_comma_in_quoted_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "embedded_comma.csv",
+            &["id,name\n", "1,\"last, first\"\n", "2,bob\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_embedded_comma", "col1 TEXT, col2 TEXT").await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_embedded_comma",
+            &csv_path,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rfc4180_doubled_quote_escape() {
+        // RFC 4180 rule 7: double-quote inside quoted field escaped by doubling
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "doubled_quote.csv",
+            &["id,name\n", "1,\"she said \"\"hello\"\"\"\n", "2,bob\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_doubled_quote", "col1 TEXT, col2 TEXT").await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_doubled_quote",
+            &csv_path,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    // ============ Real-World Edge Case Tests ============
+
+    #[tokio::test]
+    async fn test_backslash_escape_with_flag() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "backslash.csv",
+            &[
+                "id,keyword\n",
+                "1,\"normal\"\n",
+                "2,\"marc-\\\"pete\\\"-mitscher\"\n",
+                "3,\"clean\"\n",
+            ],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_backslash", "col1 TEXT, col2 TEXT").await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_backslash",
+            &csv_path,
+            None,
+            None,
+            Some("\\".to_string()),
+            None,
+        )
+        .await;
+
+        assert_eq!(result.records_loaded, 3);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_empty_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "empty_fields.csv",
+            &["id,name,value\n", "1,,100\n", "2,bob,\n", "3,,\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_empty_fields", "col1 TEXT, col2 TEXT, col3 TEXT").await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_empty_fields",
+            &csv_path,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.records_loaded, 3);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_no_header_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "no_header.csv",
+            &["1,alice,100\n", "2,bob,200\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_no_header", "col1 TEXT, col2 TEXT, col3 TEXT").await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_no_header",
+            &csv_path,
+            None,
+            None,
+            None,
+            Some(false),
+        )
+        .await;
+
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_unicode_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "unicode.csv",
+            &[
+                "id,name\n",
+                "1,\"café résumé\"\n",
+                "2,\"日本語\"\n",
+                "3,\"emoji 🎉\"\n",
+            ],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_unicode", "col1 TEXT, col2 TEXT").await;
+        let result =
+            run_csv_load_with_opts(&pool, "test_unicode", &csv_path, None, None, None, None).await;
+
+        assert_eq!(result.records_loaded, 3);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mixed_line_endings() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "mixed_endings.csv",
+            &["id,name\n", "1,alice\r\n", "2,bob\n", "3,charlie\r\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table("test_mixed_endings", "col1 TEXT, col2 TEXT").await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_mixed_endings",
+            &csv_path,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.records_loaded, 3);
+        assert_eq!(result.records_failed, 0);
+    }
 }

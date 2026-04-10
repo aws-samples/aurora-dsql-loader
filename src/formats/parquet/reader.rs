@@ -95,6 +95,7 @@ impl<R: ByteReader + Clone + 'static> GenericParquetReader<R> {
         Ok(ChunkData {
             records: all_records,
             bytes_read,
+            parse_errors: 0,
         })
     }
 }
