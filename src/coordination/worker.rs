@@ -737,12 +737,10 @@ impl Worker {
 
         // PostgreSQL/DSQL limit: 65,535, SQLite limit: 32,766
         // Suggest a batch size that keeps us well under both limits
-        let suggested_batch_size = if num_columns > 0 {
+        let suggested_batch_size = match 20000usize.checked_div(num_columns) {
             // Target ~20,000 parameters to stay safely under both limits
-            let safe_batch = 20000 / num_columns;
-            safe_batch.max(1).min(batch_size - 1)
-        } else {
-            batch_size / 2
+            Some(safe_batch) => safe_batch.max(1).min(batch_size - 1),
+            None => batch_size / 2,
         };
 
         format!(
