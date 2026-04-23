@@ -689,8 +689,8 @@ impl Worker {
             .await
             .context("Failed to acquire connection from pool")?;
 
-        // We use raw_sql to batch insert here because prepared statements 
-        // don't improve performance (it's a very simple query plan) and 
+        // We use raw_sql to batch insert here because prepared statements
+        // don't improve performance (it's a very simple query plan) and
         // increase memory usage of QPs. The indirection of the helpers is
         // to help convince the compiler that our lifetimes are right.
         let execute = async {
@@ -700,7 +700,9 @@ impl Worker {
                 }
                 #[cfg(test)]
                 crate::db::pool::PoolConnection::Sqlite(sqlite_conn) => {
-                    run_raw_sql_sqlite(sqlite_conn, insert_sql).await.map(|_| ())
+                    run_raw_sql_sqlite(sqlite_conn, insert_sql)
+                        .await
+                        .map(|_| ())
                 }
             }
         };
