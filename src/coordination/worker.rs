@@ -689,33 +689,25 @@ impl Worker {
             .await
             .context("Failed to acquire connection from pool")?;
 
-        let query_future = match &mut conn {
-            crate::db::pool::PoolConnection::Postgres(_) => {
-                sqlx::query(insert_sql).execute(&mut *conn)
-            }
-            #[cfg(test)]
-            crate::db::pool::PoolConnection::Sqlite(sqlite_conn) => {
-                return Self::execute_sqlite_simple(sqlite_conn, insert_sql).await;
+        // We use raw_sql to batch insert here because prepared statements 
+        // don't improve performance (it's a very simple query plan) and 
+        // increase memory usage of QPs. The indirection of the helpers is
+        // to help convince the compiler that our lifetimes are right.
+        let execute = async {
+            match &mut conn {
+                crate::db::pool::PoolConnection::Postgres(pg_conn) => {
+                    run_raw_sql_pg(pg_conn, insert_sql).await.map(|_| ())
+                }
+                #[cfg(test)]
+                crate::db::pool::PoolConnection::Sqlite(sqlite_conn) => {
+                    run_raw_sql_sqlite(sqlite_conn, insert_sql).await.map(|_| ())
+                }
             }
         };
 
-        tokio::time::timeout(QUERY_TIMEOUT, query_future)
+        tokio::time::timeout(QUERY_TIMEOUT, execute)
             .await
             .map_err(|_| anyhow!("Query timed out after {}s", QUERY_TIMEOUT.as_secs()))?
-            .map(|_| ())
-            .map_err(Into::into)
-    }
-
-    /// Execute a simple SQL statement for SQLite (no parameter binding)
-    #[cfg(test)]
-    async fn execute_sqlite_simple(
-        conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
-        insert_sql: &str,
-    ) -> Result<()> {
-        tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(insert_sql).execute(&mut **conn))
-            .await
-            .map_err(|_| anyhow!("Query timed out after {}s", QUERY_TIMEOUT.as_secs()))?
-            .map(|_| ())
             .map_err(Into::into)
     }
 
@@ -807,4 +799,21 @@ impl Worker {
 
         false
     }
+}
+
+async fn run_raw_sql_pg(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    sql: &str,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    use sqlx::Executor;
+    (&mut **conn).execute(sqlx::raw_sql(sql)).await
+}
+
+#[cfg(test)]
+async fn run_raw_sql_sqlite(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    sql: &str,
+) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
+    use sqlx::Executor;
+    (&mut **conn).execute(sqlx::raw_sql(sql)).await
 }
