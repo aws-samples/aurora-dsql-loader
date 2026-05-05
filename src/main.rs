@@ -39,8 +39,8 @@ struct SourceArgs {
     #[arg(long, group = "delimited")]
     delimiter: Option<String>,
 
-    /// Quote character
-    #[arg(long, default_value = "\"", group = "delimited")]
+    /// Quote character (default: "\"")
+    #[arg(long, group = "delimited")]
     quote: Option<String>,
 
     /// Escape character to use for escaping content
@@ -205,8 +205,8 @@ async fn run_loader(
     };
 
     // Auto-detect format from file extension if not provided
-    let format = if let Some(f) = source.format {
-        f
+    let format = if let Some(f) = &source.format {
+        f.as_str()
     } else {
         cli::detect_format_from_path(&source.source_uri).ok_or_else(|| {
             anyhow::anyhow!(
@@ -242,21 +242,8 @@ async fn run_loader(
         .map_err(|e| anyhow::anyhow!("Invalid chunk size '{}': {}", load.chunk_size, e))?;
 
     // Parse format
-    let format_enum = Format::parse(&format)?;
-
-    // Validate delimited options are only used with CSV/TSV
-    let has_delimited_options = source.delimiter.is_some()
-        || source.quote.is_some()
-        || source.escape.is_some()
-        || source.no_header;
-
-    if has_delimited_options && !format_enum.is_delimited() {
-        return Err(anyhow::anyhow!(
-            "Delimited file options (--delimiter, --quote, --escape, --no-header) \
-             can only be used with CSV or TSV formats, not {}",
-            format
-        ));
-    }
+    let format_enum = Format::parse(format)?;
+    validate_delimited_options(format, format_enum, &source)?;
 
     // Handle dry-run mode
     if output.dry_run {
@@ -374,6 +361,26 @@ async fn run_loader(
     Ok(())
 }
 
+fn validate_delimited_options(
+    format: &str,
+    format_enum: Format,
+    source: &SourceArgs,
+) -> anyhow::Result<()> {
+    let has_delimited_options = source.delimiter.is_some()
+        || source.quote.is_some()
+        || source.escape.is_some()
+        || source.no_header;
+
+    if has_delimited_options && !format_enum.is_delimited() {
+        return Err(anyhow::anyhow!(
+            "Delimited file options (--delimiter, --quote, --escape, --no-header) \
+             can only be used with CSV or TSV formats, not {}",
+            format
+        ));
+    }
+    Ok(())
+}
+
 /// CLI utility functions for parsing command-line arguments
 mod cli {
     use std::collections::HashMap;
@@ -428,15 +435,15 @@ mod cli {
     }
 
     /// Auto-detect file format from path/URI
-    pub fn detect_format_from_path(path: &str) -> Option<String> {
+    pub fn detect_format_from_path(path: &str) -> Option<&'static str> {
         let lower = path.to_lowercase();
 
         if lower.ends_with(".csv") {
-            Some("csv".to_string())
+            Some("csv")
         } else if lower.ends_with(".tsv") {
-            Some("tsv".to_string())
+            Some("tsv")
         } else if lower.ends_with(".parquet") {
-            Some("parquet".to_string())
+            Some("parquet")
         } else {
             None
         }
@@ -481,5 +488,31 @@ mod cli {
         }
 
         Ok(mappings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parquet_without_delimited_options_parses_successfully() {
+        let args = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "test_file.parquet",
+            "--table",
+            "my_table",
+            "--dry-run",
+        ])
+        .expect("args should parse");
+
+        let Command::Load { source, .. } = args.command;
+        validate_delimited_options("parquet", Format::Parquet, &source)
+            .expect("parquet load should not trigger the delimited-options error");
     }
 }
