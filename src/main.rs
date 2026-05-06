@@ -1,8 +1,11 @@
 use aurora_dsql_loader::runner::{Format, LoadArgs, OnConflict, run_load};
-use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{ArgGroup, ArgMatches, Args as ClapArgs, CommandFactory, FromArgMatches, Subcommand};
 use std::path::PathBuf;
 
-#[derive(Parser, Clone)]
+const DELIMITED_OPTION_FLAGS: &[&str] = &["delimiter", "quote", "escape", "no_header"];
+
+#[derive(clap::Parser, Clone)]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -143,7 +146,9 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches)
+        .map_err(|e| anyhow::anyhow!("Failed to parse arguments: {}", e))?;
 
     match args.command {
         Command::Load {
@@ -153,7 +158,10 @@ async fn main() -> anyhow::Result<()> {
             load,
             output,
         } => {
-            run_loader(connection, source, target, load, output).await?;
+            let load_matches = matches
+                .subcommand_matches("load")
+                .expect("parsed Load command must have matching subcommand matches");
+            run_loader(connection, source, target, load, output, load_matches).await?;
         }
     }
     Ok(())
@@ -165,6 +173,7 @@ async fn run_loader(
     target: TargetArgs,
     load: LoadParams,
     output: OutputArgs,
+    load_matches: &ArgMatches,
 ) -> anyhow::Result<()> {
     // Initialize tracing based on quiet mode
     // RUST_LOG environment variable takes precedence if set
@@ -243,7 +252,7 @@ async fn run_loader(
 
     // Parse format
     let format_enum = Format::parse(format)?;
-    validate_delimited_options(format, format_enum, &source)?;
+    validate_delimited_options(format, format_enum, load_matches)?;
 
     // Handle dry-run mode
     if output.dry_run {
@@ -364,14 +373,13 @@ async fn run_loader(
 fn validate_delimited_options(
     format: &str,
     format_enum: Format,
-    source: &SourceArgs,
+    matches: &ArgMatches,
 ) -> anyhow::Result<()> {
-    let has_delimited_options = source.delimiter.is_some()
-        || source.quote.is_some()
-        || source.escape.is_some()
-        || source.no_header;
+    let user_provided_delimited_option = DELIMITED_OPTION_FLAGS
+        .iter()
+        .any(|id| matches.value_source(id) == Some(ValueSource::CommandLine));
 
-    if has_delimited_options && !format_enum.is_delimited() {
+    if user_provided_delimited_option && !format_enum.is_delimited() {
         return Err(anyhow::anyhow!(
             "Delimited file options (--delimiter, --quote, --escape, --no-header) \
              can only be used with CSV or TSV formats, not {}",
@@ -494,25 +502,146 @@ mod cli {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
 
-    #[test]
-    fn parquet_without_delimited_options_parses_successfully() {
-        let args = Args::try_parse_from([
+    fn load_matches(extra: &[&str]) -> ArgMatches {
+        let mut argv: Vec<&str> = vec![
             "aurora-dsql-loader",
             "load",
             "--endpoint",
             "xxxx.dsql.us-east-1.on.aws",
             "--source-uri",
-            "test_file.parquet",
+            "file.dat",
             "--table",
             "my_table",
             "--dry-run",
-        ])
-        .expect("args should parse");
+        ];
+        argv.extend_from_slice(extra);
+        let matches = Args::command()
+            .try_get_matches_from(argv)
+            .expect("args should parse");
+        matches
+            .subcommand_matches("load")
+            .expect("load subcommand")
+            .clone()
+    }
 
-        let Command::Load { source, .. } = args.command;
-        validate_delimited_options("parquet", Format::Parquet, &source)
-            .expect("parquet load should not trigger the delimited-options error");
+    #[test]
+    fn parquet_without_delimited_options_parses_successfully() {
+        let m = load_matches(&[]);
+        validate_delimited_options("parquet", Format::Parquet, &m)
+            .expect("parquet load with no user-provided delimited flags must pass");
+    }
+
+    // Covers {csv, tsv, parquet} x each delimited flag. Catches future
+    // regressions from a new delimited option not being registered in
+    // DELIMITED_OPTION_FLAGS, or a new format not being added to
+    // Format::is_delimited.
+    #[test]
+    fn delimited_options_matrix() {
+        struct Case {
+            flags: &'static [&'static str],
+            format_name: &'static str,
+            format: Format,
+            should_pass: bool,
+        }
+
+        let cases = [
+            Case {
+                flags: &[],
+                format_name: "csv",
+                format: Format::Csv,
+                should_pass: true,
+            },
+            Case {
+                flags: &[],
+                format_name: "tsv",
+                format: Format::Tsv,
+                should_pass: true,
+            },
+            Case {
+                flags: &[],
+                format_name: "parquet",
+                format: Format::Parquet,
+                should_pass: true,
+            },
+            Case {
+                flags: &["--delimiter", ","],
+                format_name: "csv",
+                format: Format::Csv,
+                should_pass: true,
+            },
+            Case {
+                flags: &["--quote", "\""],
+                format_name: "csv",
+                format: Format::Csv,
+                should_pass: true,
+            },
+            Case {
+                flags: &["--escape", "\\"],
+                format_name: "csv",
+                format: Format::Csv,
+                should_pass: true,
+            },
+            Case {
+                flags: &["--no-header"],
+                format_name: "tsv",
+                format: Format::Tsv,
+                should_pass: true,
+            },
+            Case {
+                flags: &["--delimiter", ","],
+                format_name: "parquet",
+                format: Format::Parquet,
+                should_pass: false,
+            },
+            Case {
+                flags: &["--quote", "\""],
+                format_name: "parquet",
+                format: Format::Parquet,
+                should_pass: false,
+            },
+            Case {
+                flags: &["--escape", "\\"],
+                format_name: "parquet",
+                format: Format::Parquet,
+                should_pass: false,
+            },
+            Case {
+                flags: &["--no-header"],
+                format_name: "parquet",
+                format: Format::Parquet,
+                should_pass: false,
+            },
+        ];
+
+        for case in &cases {
+            let m = load_matches(case.flags);
+            let result = validate_delimited_options(case.format_name, case.format, &m);
+            assert_eq!(
+                result.is_ok(),
+                case.should_pass,
+                "flags={:?} format={} expected_pass={} got={:?}",
+                case.flags,
+                case.format_name,
+                case.should_pass,
+                result,
+            );
+        }
+    }
+
+    // A flag with a default must not count as user-provided for validation.
+    #[test]
+    fn defaults_do_not_count_as_user_provided() {
+        // Sanity: the real CLI (no defaults on these fields today) accepts parquet + no flags.
+        let m = load_matches(&[]);
+        for flag in DELIMITED_OPTION_FLAGS {
+            assert_ne!(
+                m.value_source(flag),
+                Some(ValueSource::CommandLine),
+                "{flag} must not be reported as user-provided when absent from argv",
+            );
+        }
+        validate_delimited_options("parquet", Format::Parquet, &m)
+            .expect("parquet load must pass when no delimited flag is on the command line");
     }
 }
