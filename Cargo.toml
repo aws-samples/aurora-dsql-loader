@@ -47,3 +47,4 @@ strip = true
 lto = true
 
 [dev-dependencies]
+proptest = "1"

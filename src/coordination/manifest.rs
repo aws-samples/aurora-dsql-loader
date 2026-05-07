@@ -122,6 +122,15 @@ pub struct TableInfo {
     /// Columns involved in unique constraints (for ON CONFLICT targeting)
     #[serde(default)]
     pub conflict_columns: Vec<String>,
+    /// Original column names excluded from INSERT. Used for logging and as the
+    /// authoritative set on resume (compared against a user-supplied
+    /// --exclude-columns). Invariant: `excluded_columns.len() == excluded_positions.len()`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_columns: Vec<String>,
+    /// Zero-based indices of excluded columns in the schema captured at manifest-write time.
+    /// Workers use these positions to skip fields in source records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_positions: Vec<usize>,
 }
 
 /// The manifest file structure written by the coordinator
@@ -172,7 +181,11 @@ pub struct ChunkResultFile {
     pub errors: Vec<ErrorRecord>,
 }
 
-/// Record of an error that occurred during processing
+/// Record of an error that occurred during processing.
+///
+/// `line_number == 0` is a sentinel indicating a chunk-level error not tied to
+/// a specific source-file line (e.g. `parse_error` and `field_count_mismatch`
+/// are aggregated across the chunk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorRecord {
     pub line_number: u64,
@@ -509,6 +522,65 @@ mod tests {
     }
 
     #[test]
+    fn test_table_info_backward_compat_no_exclusion_fields() {
+        let json = r#"{
+            "name": "t",
+            "schema_name": "public",
+            "was_created": false,
+            "has_unique_constraints": false,
+            "on_conflict": "do-nothing",
+            "conflict_columns": []
+        }"#;
+        let table: TableInfo = serde_json::from_str(json).unwrap();
+        assert!(table.excluded_columns.is_empty());
+        assert!(table.excluded_positions.is_empty());
+    }
+
+    #[test]
+    fn test_table_info_excluded_fields_roundtrip() {
+        let table = TableInfo {
+            name: "users".to_string(),
+            schema_name: "public".to_string(),
+            schema: None,
+            was_created: false,
+            has_unique_constraints: false,
+            on_conflict: OnConflict::DoNothing,
+            conflict_columns: Vec::new(),
+            excluded_columns: vec!["id".to_string(), "created_at".to_string()],
+            excluded_positions: vec![0, 3],
+        };
+        let json = serde_json::to_string(&table).unwrap();
+        let round: TableInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.excluded_columns, table.excluded_columns);
+        assert_eq!(round.excluded_positions, table.excluded_positions);
+    }
+
+    // Feature: loader-column-exclusion, Property 4: Manifest serialization round-trip
+    proptest::proptest! {
+        #[test]
+        fn prop_table_info_exclusion_roundtrip(
+            excluded in proptest::collection::vec("[a-zA-Z_][a-zA-Z0-9_]*", 0..8),
+            positions in proptest::collection::vec(0usize..64, 0..8),
+        ) {
+            let table = TableInfo {
+                name: "t".to_string(),
+                schema_name: "public".to_string(),
+                schema: None,
+                was_created: false,
+                has_unique_constraints: false,
+                on_conflict: OnConflict::DoNothing,
+                conflict_columns: Vec::new(),
+                excluded_columns: excluded.clone(),
+                excluded_positions: positions.clone(),
+            };
+            let json = serde_json::to_string(&table).unwrap();
+            let round: TableInfo = serde_json::from_str(&json).unwrap();
+            proptest::prop_assert_eq!(round.excluded_columns, excluded);
+            proptest::prop_assert_eq!(round.excluded_positions, positions);
+        }
+    }
+
+    #[test]
     fn test_manifest_with_file_format() {
         let manifest = ManifestFile {
             job_id: "test-job".to_string(),
@@ -522,6 +594,8 @@ mod tests {
                 has_unique_constraints: false,
                 on_conflict: OnConflict::DoNothing,
                 conflict_columns: Vec::new(),
+                excluded_columns: Vec::new(),
+                excluded_positions: Vec::new(),
             },
             file_format: FileFormat::Csv(DelimitedConfig::csv()),
             dsql_config: DsqlConfig {

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use derive_builder::Builder;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -17,6 +18,93 @@ use crate::db::{Pool, SchemaInferrer};
 use crate::formats::FileReader;
 use crate::formats::reader::{Chunk, FileMetadata};
 use crate::telemetry::{ProgressStats, TelemetryEvent};
+
+/// Validate that every excluded name exists in the schema and that at least
+/// one column would remain after exclusion.
+fn validate_excluded_columns(schema: &Schema, exclude: &[String]) -> Result<()> {
+    for name in exclude {
+        if !schema.columns.iter().any(|c| &c.name == name) {
+            let available: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+            return Err(anyhow::anyhow!(
+                "Column '{}' not found in table schema. Available columns: {:?}",
+                name,
+                available
+            ));
+        }
+    }
+    if exclude.len() >= schema.columns.len() {
+        return Err(anyhow::anyhow!(
+            "Cannot exclude all columns - at least one column must remain for insertion"
+        ));
+    }
+    Ok(())
+}
+
+/// Reject any column name present in both --exclude-columns and --column-map.
+fn validate_no_exclude_rename_conflict(
+    exclude: &[String],
+    mappings: &HashMap<String, String>,
+) -> Result<()> {
+    for name in exclude {
+        if mappings.contains_key(name) {
+            return Err(anyhow::anyhow!(
+                "Column '{}' cannot be both excluded and renamed",
+                name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return the indices of excluded columns, walking the schema in its original
+/// order. Output is naturally sorted because `enumerate` yields strictly
+/// increasing indices.
+fn compute_excluded_positions(schema: &Schema, exclude: &[String]) -> Vec<usize> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| exclude.contains(&c.name).then_some(i))
+        .collect()
+}
+
+/// Remove excluded columns from the schema in place, preserving original column order.
+fn filter_schema(schema: &mut Schema, exclude: &[String]) {
+    schema.columns.retain(|c| !exclude.contains(&c.name));
+}
+
+/// Error if ALL conflict columns are excluded under do-update (ON CONFLICT can never match),
+/// warn if SOME are excluded.
+fn validate_conflict_columns_not_all_excluded(
+    exclude: &[String],
+    conflict_columns: &[String],
+    on_conflict: OnConflict,
+) -> Result<()> {
+    if on_conflict != OnConflict::DoUpdate || conflict_columns.is_empty() {
+        return Ok(());
+    }
+
+    let excluded_conflict: Vec<&String> = conflict_columns
+        .iter()
+        .filter(|c| exclude.contains(c))
+        .collect();
+
+    if excluded_conflict.len() == conflict_columns.len() {
+        return Err(anyhow::anyhow!(
+            "All conflict columns are excluded. ON CONFLICT can never match — \
+             use --on-conflict do-nothing or remove conflicting columns from --exclude-columns"
+        ));
+    }
+
+    if !excluded_conflict.is_empty() {
+        warn!(
+            "Some conflict columns are excluded: {:?}. ON CONFLICT may not behave as expected.",
+            excluded_conflict
+        );
+    }
+
+    Ok(())
+}
 
 /// Maximum bytes to read for schema inference
 ///
@@ -42,7 +130,7 @@ pub struct LoadConfig {
     create_table_if_missing: bool,
     file_format: FileFormat,
     #[builder(default)]
-    column_mappings: std::collections::HashMap<String, String>,
+    column_mappings: HashMap<String, String>,
     quiet: bool,
     #[builder(default)]
     debug: bool,
@@ -50,6 +138,8 @@ pub struct LoadConfig {
     resume_job_id: Option<String>,
     #[builder(default)]
     on_conflict: OnConflict,
+    #[builder(default)]
+    exclude_columns: Vec<String>,
 }
 
 /// Result of a completed data load operation
@@ -267,7 +357,7 @@ impl Coordinator {
     /// Apply column mappings to schema if provided
     fn apply_column_mappings(
         schema: &mut Option<Schema>,
-        column_mappings: &std::collections::HashMap<String, String>,
+        column_mappings: &HashMap<String, String>,
     ) {
         if !column_mappings.is_empty()
             && let Some(s) = schema
@@ -289,11 +379,39 @@ impl Coordinator {
         let job_id = Uuid::new_v4().to_string();
         info!("Starting load job: {job_id}");
 
+        // Reject --exclude-columns combined with --if-not-exists before any I/O: the loader
+        // would otherwise generate a CREATE TABLE that silently omits the excluded columns
+        // entirely, producing a broken table with no DEFAULT to fall back to.
+        if !config.exclude_columns.is_empty() && config.create_table_if_missing {
+            return Err(anyhow::anyhow!(
+                "--exclude-columns is not supported with --if-not-exists. \
+                 The table must already exist with DEFAULT expressions on the excluded columns \
+                 (e.g. `pk_id UUID DEFAULT gen_random_uuid()`)."
+            ));
+        }
+
         validate_schema_exists(&self.pool, &config.schema).await?;
 
         let (file_metadata, chunks) = self.create_file_chunks(config.chunk_size_bytes).await?;
 
         let mut schema = self.resolve_table_schema(config, &chunks).await?;
+
+        // Apply --exclude-columns before renames. Produces the effective schema
+        // that downstream code uses for INSERT generation.
+        let excluded_positions = if !config.exclude_columns.is_empty() {
+            let s = schema.as_mut().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Internal error: table schema is missing while --exclude-columns is active"
+                )
+            })?;
+            validate_excluded_columns(s, &config.exclude_columns)?;
+            validate_no_exclude_rename_conflict(&config.exclude_columns, &config.column_mappings)?;
+            let positions = compute_excluded_positions(s, &config.exclude_columns);
+            filter_schema(s, &config.exclude_columns);
+            positions
+        } else {
+            Vec::new()
+        };
 
         Self::apply_column_mappings(&mut schema, &config.column_mappings);
 
@@ -306,6 +424,7 @@ impl Coordinator {
             &chunks,
             schema,
             table_created,
+            excluded_positions,
         )
         .await?;
 
@@ -328,6 +447,13 @@ impl Coordinator {
             .context("Failed to read manifest for resume")?;
 
         self.verify_resume_compatibility(&manifest, config).await?;
+
+        if !manifest.table.excluded_columns.is_empty() {
+            info!(
+                "Resuming with excluded columns from manifest: {:?}",
+                manifest.table.excluded_columns
+            );
+        }
 
         info!("Cleaning up incomplete claims...");
         self.manifest_storage.cleanup_old_claims(resume_id).await?;
@@ -403,6 +529,74 @@ impl Coordinator {
             ));
         }
 
+        // Manifest integrity: the two exclusion fields are written together and must
+        // stay in lock-step (length parity), and every position must be strictly
+        // increasing (implying unique + sorted) and satisfy
+        // `p < schema.columns.len() + excluded_positions.len()` (the reconstructed
+        // original arity). A mismatch indicates a corrupted or hand-edited manifest
+        // and would cause silent data misalignment at worker field-mapping time.
+        if manifest.table.excluded_columns.len() != manifest.table.excluded_positions.len() {
+            return Err(anyhow::anyhow!(
+                "Cannot resume: manifest exclusion fields disagree \
+                 (excluded_columns.len() = {}, excluded_positions.len() = {})",
+                manifest.table.excluded_columns.len(),
+                manifest.table.excluded_positions.len()
+            ));
+        }
+        if !manifest.table.excluded_positions.is_empty() {
+            let schema = manifest.table.schema.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot resume: manifest has excluded_positions but no stored schema"
+                )
+            })?;
+            let full_len = schema.columns.len() + manifest.table.excluded_positions.len();
+            let mut prev: Option<usize> = None;
+            for &p in &manifest.table.excluded_positions {
+                if p >= full_len {
+                    return Err(anyhow::anyhow!(
+                        "Cannot resume: manifest excluded_position {} is out of range \
+                         for original schema size {}",
+                        p,
+                        full_len
+                    ));
+                }
+                if let Some(prev) = prev
+                    && p <= prev
+                {
+                    return Err(anyhow::anyhow!(
+                        "Cannot resume: manifest excluded_positions are not strictly \
+                         increasing (saw {} after {})",
+                        p,
+                        prev
+                    ));
+                }
+                prev = Some(p);
+            }
+        }
+
+        // --exclude-columns on resume must match the original job's exclusion set;
+        // the manifest is authoritative and silently dropping the flag would hide bugs.
+        // Compare as sets (sorted) because the manifest stores the list in schema order
+        // while the user-passed list is in CLI order - semantically equivalent lists
+        // should not trip the check.
+        if !config.exclude_columns.is_empty() {
+            let mut requested = config.exclude_columns.clone();
+            let mut stored = manifest.table.excluded_columns.clone();
+            requested.sort();
+            stored.sort();
+            if requested != stored {
+                return Err(anyhow::anyhow!(
+                    "Cannot resume: --exclude-columns mismatch\n\
+                     Manifest excluded_columns: {:?}\n\
+                     Requested exclude_columns: {:?}\n\
+                     To resume an existing job, either omit --exclude-columns (the manifest value is used) \
+                     or pass the same list as the original job.",
+                    manifest.table.excluded_columns,
+                    config.exclude_columns
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -448,6 +642,7 @@ impl Coordinator {
     }
 
     /// Create and write the manifest file
+    #[allow(clippy::too_many_arguments)]
     async fn create_and_write_manifest(
         &self,
         job_id: &str,
@@ -456,6 +651,7 @@ impl Coordinator {
         chunks: &[Chunk],
         schema: Option<Schema>,
         table_created: bool,
+        excluded_positions: Vec<usize>,
     ) -> Result<()> {
         // Detect unique constraints and get conflict columns if needed
         info!("Checking for unique constraints on table...");
@@ -488,6 +684,14 @@ impl Coordinator {
             );
         }
 
+        // Conflict-column validation must run after `conflict_columns` is fetched
+        // from the database (it requires a DB query).
+        validate_conflict_columns_not_all_excluded(
+            &config.exclude_columns,
+            &conflict_columns,
+            config.on_conflict,
+        )?;
+
         // Build manifest
         let chunk_infos: Vec<ChunkInfo> = chunks
             .iter()
@@ -508,7 +712,21 @@ impl Coordinator {
             has_unique_constraints,
             on_conflict: config.on_conflict,
             conflict_columns,
+            excluded_columns: config.exclude_columns.clone(),
+            excluded_positions,
         };
+        // TableInfo invariant: the two exclusion vectors are written together and
+        // must stay in lock-step. Promoted from debug_assert to a real guard so a
+        // release-mode regression can't ship a corrupted manifest that the resume
+        // path would then reject only on the next run.
+        if table.excluded_columns.len() != table.excluded_positions.len() {
+            return Err(anyhow::anyhow!(
+                "Internal error: TableInfo exclusion fields disagree \
+                 (excluded_columns.len() = {}, excluded_positions.len() = {})",
+                table.excluded_columns.len(),
+                table.excluded_positions.len()
+            ));
+        }
 
         let manifest = ManifestFile {
             job_id: job_id.to_string(),
@@ -698,5 +916,215 @@ impl Coordinator {
             duration,
             chunk_results,
         })
+    }
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+    use crate::db::schema::{Column, Schema, SqlType};
+    use std::collections::HashSet;
+
+    fn mk_schema(names: &[&str]) -> Schema {
+        Schema {
+            columns: names
+                .iter()
+                .map(|n| Column {
+                    name: n.to_string(),
+                    sql_type: SqlType::Text,
+                    nullable: true,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validate_excluded_columns_ok() {
+        let s = mk_schema(&["id", "name", "email"]);
+        validate_excluded_columns(&s, &["id".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn validate_excluded_columns_unknown_name() {
+        let s = mk_schema(&["id", "name"]);
+        let err = validate_excluded_columns(&s, &["nope".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Column 'nope' not found"));
+        assert!(err.contains("\"id\""));
+    }
+
+    #[test]
+    fn validate_excluded_columns_all_excluded_errors() {
+        let s = mk_schema(&["id", "name"]);
+        let err = validate_excluded_columns(&s, &["id".to_string(), "name".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Cannot exclude all columns"));
+    }
+
+    #[test]
+    fn validate_no_exclude_rename_conflict_detects_overlap() {
+        let mut map = HashMap::new();
+        map.insert("id".to_string(), "new_id".to_string());
+        let err = validate_no_exclude_rename_conflict(&["id".to_string()], &map)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Column 'id' cannot be both excluded and renamed"));
+    }
+
+    #[test]
+    fn validate_no_exclude_rename_conflict_disjoint_ok() {
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), "full_name".to_string());
+        validate_no_exclude_rename_conflict(&["id".to_string()], &map).unwrap();
+    }
+
+    #[test]
+    fn exclude_then_rename_ordering_applies_rename_to_remaining_columns() {
+        // Design invariant: exclusion uses ORIGINAL schema names; rename is applied
+        // to the effective schema (post-exclusion). This verifies the compose:
+        //   filter(pk_id) then rename(name -> full_name) == [full_name, email]
+        let mut schema = Some(mk_schema(&["pk_id", "name", "email"]));
+
+        // Step 1: exclusion (matches setup_new_job order)
+        let exclude = vec!["pk_id".to_string()];
+        let s = schema.as_mut().unwrap();
+        validate_excluded_columns(s, &exclude).unwrap();
+        let positions = compute_excluded_positions(s, &exclude);
+        filter_schema(s, &exclude);
+        assert_eq!(positions, vec![0]);
+
+        // Step 2: rename
+        let mut mappings = HashMap::new();
+        mappings.insert("name".to_string(), "full_name".to_string());
+        Coordinator::apply_column_mappings(&mut schema, &mappings);
+
+        let names: Vec<&str> = schema
+            .as_ref()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["full_name", "email"]);
+    }
+
+    #[test]
+    fn compute_excluded_positions_returns_sorted_indices_in_schema_order() {
+        let s = mk_schema(&["id", "name", "email", "created_at"]);
+        let positions =
+            compute_excluded_positions(&s, &["created_at".to_string(), "id".to_string()]);
+        assert_eq!(positions, vec![0, 3]);
+    }
+
+    #[test]
+    fn filter_schema_preserves_order_and_types() {
+        let mut s = mk_schema(&["id", "name", "email", "created_at"]);
+        filter_schema(&mut s, &["id".to_string(), "created_at".to_string()]);
+        let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["name", "email"]);
+    }
+
+    #[test]
+    fn validate_conflict_columns_all_excluded_do_update_errors() {
+        let err = validate_conflict_columns_not_all_excluded(
+            &["pk_id".to_string()],
+            &["pk_id".to_string()],
+            OnConflict::DoUpdate,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("All conflict columns are excluded"));
+        assert!(err.contains("--on-conflict do-nothing"));
+    }
+
+    #[test]
+    fn validate_conflict_columns_some_excluded_do_update_warns_but_ok() {
+        // Warn path: should succeed
+        validate_conflict_columns_not_all_excluded(
+            &["a".to_string()],
+            &["a".to_string(), "b".to_string()],
+            OnConflict::DoUpdate,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_conflict_columns_none_excluded_do_update_ok() {
+        validate_conflict_columns_not_all_excluded(
+            &["x".to_string()],
+            &["a".to_string(), "b".to_string()],
+            OnConflict::DoUpdate,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_conflict_columns_all_excluded_do_nothing_skipped() {
+        // do-nothing: validation should be a no-op even when all conflict cols excluded
+        validate_conflict_columns_not_all_excluded(
+            &["pk_id".to_string()],
+            &["pk_id".to_string()],
+            OnConflict::DoNothing,
+        )
+        .unwrap();
+    }
+
+    // Feature: loader-column-exclusion, Property 2: Schema filtering preserves order
+    proptest::proptest! {
+        #[test]
+        fn prop_filter_schema_preserves_non_excluded_in_order(
+            names in proptest::collection::vec("[a-z][a-z0-9]{0,7}", 2..10),
+            // which indices to exclude (by position) — always leave at least one
+            exclude_mask in proptest::collection::vec(proptest::bool::ANY, 2..10),
+        ) {
+            // Dedup names (schema columns are unique)
+            let mut seen = HashSet::new();
+            let unique_names: Vec<String> = names.into_iter().filter(|n| seen.insert(n.clone())).collect();
+            proptest::prop_assume!(unique_names.len() >= 2);
+
+            // Build exclusion list; ensure we don't exclude everything
+            let n = unique_names.len();
+            let mask: Vec<bool> = exclude_mask.into_iter().take(n).chain(std::iter::repeat(false)).take(n).collect();
+            let exclude: Vec<String> = unique_names.iter().zip(&mask).filter_map(|(name, &ex)| if ex { Some(name.clone()) } else { None }).collect();
+            proptest::prop_assume!(!exclude.is_empty() && exclude.len() < n);
+
+            let mut schema = Schema {
+                columns: unique_names.iter().map(|n| Column {
+                    name: n.clone(),
+                    sql_type: SqlType::Text,
+                    nullable: true,
+                }).collect(),
+            };
+            filter_schema(&mut schema, &exclude);
+
+            // Expected: non-excluded names in original order
+            let expected: Vec<String> = unique_names.iter().filter(|n| !exclude.contains(n)).cloned().collect();
+            let actual: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            proptest::prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn prop_validate_excluded_columns_rejects_unknown(
+            names in proptest::collection::vec("[a-z][a-z0-9]{0,7}", 2..8),
+            bogus in "[A-Z][A-Z0-9]{0,7}",
+        ) {
+            // `bogus` starts uppercase so it can't collide with lowercase `names`
+            let mut seen = HashSet::new();
+            let unique_names: Vec<String> = names.into_iter().filter(|n| seen.insert(n.clone())).collect();
+            proptest::prop_assume!(unique_names.len() >= 2);
+
+            let schema = Schema {
+                columns: unique_names.iter().map(|n| Column {
+                    name: n.clone(),
+                    sql_type: SqlType::Text,
+                    nullable: true,
+                }).collect(),
+            };
+
+            let result = validate_excluded_columns(&schema, &[bogus]);
+            proptest::prop_assert!(result.is_err());
+        }
     }
 }

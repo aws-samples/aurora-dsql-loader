@@ -73,6 +73,16 @@ aurora-dsql-loader load \
   --dry-run
 ```
 
+**Use DB-side defaults (e.g. server-generated UUIDs):**
+```bash
+aurora-dsql-loader load \
+  --endpoint your-cluster.dsql.us-east-1.on.aws \
+  --source-uri data.csv \
+  --table my_table \
+  --exclude-columns pk_id,created_at
+```
+Listed columns are dropped from the INSERT so DSQL applies the column's `DEFAULT` expression (e.g. `gen_random_uuid()`, `CURRENT_TIMESTAMP`). Source records must still contain these columns in their original positions.
+
 ## Key Features
 
 - **Fast**: Parallel loading with configurable workers

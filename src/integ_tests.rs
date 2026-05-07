@@ -9,13 +9,16 @@ mod tests {
         coordination::{
             Coordinator, DsqlConfig, FileFormat, LoadConfigBuilder,
             coordinator::LoadResult,
-            manifest::{ChunkResultFile, ChunkStatus, LocalManifestStorage, ManifestStorage},
+            manifest::{
+                ChunkResultFile, ChunkStatus, LocalManifestStorage, ManifestStorage, OnConflict,
+            },
         },
         db::{Pool, SchemaInferrer, pool::PoolConnection},
         formats::{DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader},
         io::LocalFileByteReader,
         runner::{Format, LoadArgs, run_load},
     };
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::fs::{self, File};
@@ -112,7 +115,7 @@ mod tests {
             .batch_concurrency(2)
             .create_table_if_missing(true)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .debug(true) // Enable debug for tests to verify verbose output
             .build()
@@ -161,7 +164,7 @@ mod tests {
             .batch_concurrency(2)
             .create_table_if_missing(true)
             .file_format(FileFormat::Tsv(DelimitedConfig::tsv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .build()
             .unwrap();
@@ -214,7 +217,7 @@ mod tests {
         assert_eq!(result.records_failed, 0);
 
         // Verify work was distributed across multiple workers
-        let unique_workers: std::collections::HashSet<_> =
+        let unique_workers: HashSet<_> =
             result.chunk_results.iter().map(|r| &r.worker_id).collect();
         assert!(
             unique_workers.len() >= 2,
@@ -313,7 +316,7 @@ mod tests {
             .batch_concurrency(2)
             .create_table_if_missing(false) // Table already created
             .file_format(FileFormat::Parquet(ParquetConfig::default()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .build()
             .unwrap();
@@ -475,9 +478,10 @@ mod tests {
             manifest_dir: None,
             quiet: true,
             debug: true,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
             escape: None,
@@ -568,9 +572,10 @@ mod tests {
             manifest_dir: None,
             quiet: true,
             debug: true,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
             escape: None,
@@ -631,7 +636,7 @@ mod tests {
             .batch_concurrency(1)
             .create_table_if_missing(false) // This is the key - not creating the table
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .build()
             .unwrap();
@@ -710,9 +715,10 @@ mod tests {
             manifest_dir: None, // Don't specify manifest dir - this is key
             quiet: true,
             debug: true,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
             escape: None,
@@ -849,7 +855,7 @@ mod tests {
             .batch_concurrency(1)
             .create_table_if_missing(false)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .debug(true) // Enable debug mode to get verbose output
             .build()
@@ -944,7 +950,7 @@ mod tests {
             .batch_concurrency(2)
             .create_table_if_missing(false)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .build()
             .unwrap();
@@ -983,9 +989,10 @@ mod tests {
             manifest_dir: None,
             quiet: true,
             debug: true,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
             escape: None,
@@ -1037,7 +1044,7 @@ mod tests {
             .batch_concurrency(1)
             .create_table_if_missing(true)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .build()
             .unwrap();
@@ -1086,9 +1093,10 @@ mod tests {
             manifest_dir: Some(manifest_path.clone()),
             quiet: true,
             debug: true,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
             escape: None,
@@ -1175,9 +1183,10 @@ mod tests {
             manifest_dir: Some(manifest_path.clone()),
             quiet: true,
             debug: true,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: Some(job_id.clone()),
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
             escape: None,
@@ -1296,9 +1305,10 @@ mod tests {
             manifest_dir: Some(manifest_path.clone()),
             quiet: true,
             debug: true,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
             escape: None,
@@ -1391,9 +1401,10 @@ mod tests {
             manifest_dir: Some(manifest_path.clone()),
             quiet: true,
             debug: true,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: Some(job_id.clone()),
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
             escape: None,
@@ -1435,8 +1446,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_conflict_do_update_with_primary_key() {
-        use crate::coordination::manifest::OnConflict;
-
         let temp_dir = TempDir::new().unwrap();
 
         // Create initial CSV with 3 rows
@@ -1489,7 +1498,7 @@ mod tests {
             .batch_concurrency(1)
             .create_table_if_missing(false)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
             .build()
@@ -1540,7 +1549,7 @@ mod tests {
             .batch_concurrency(1)
             .create_table_if_missing(false)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoUpdate)
             .build()
@@ -1581,8 +1590,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_conflict_error_mode() {
-        use crate::coordination::manifest::OnConflict;
-
         let temp_dir = TempDir::new().unwrap();
 
         // Create initial CSV
@@ -1628,7 +1635,7 @@ mod tests {
             .batch_concurrency(1)
             .create_table_if_missing(false)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::Error)
             .build()
@@ -1673,7 +1680,7 @@ mod tests {
             .batch_concurrency(1)
             .create_table_if_missing(false)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::Error)
             .build()
@@ -1691,8 +1698,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_conflict_do_update_without_constraints_fails() {
-        use crate::coordination::manifest::OnConflict;
-
         let temp_dir = TempDir::new().unwrap();
         let csv_path =
             create_csv_with_content(&temp_dir, "test.csv", &["id,name\n", "1,Alice\n"]).await;
@@ -1732,7 +1737,7 @@ mod tests {
             .batch_concurrency(1)
             .create_table_if_missing(false)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoUpdate)
             .build()
@@ -1813,7 +1818,7 @@ mod tests {
             .batch_concurrency(1)
             .create_table_if_missing(false)
             .file_format(FileFormat::Csv(DelimitedConfig::csv()))
-            .column_mappings(std::collections::HashMap::new())
+            .column_mappings(HashMap::new())
             .quiet(true)
             .debug(true) // Enable debug mode to verify verbose output
             .build()
@@ -1909,9 +1914,10 @@ mod tests {
             manifest_dir: None,
             quiet: true,
             debug: false,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter: Some("|".to_string()),
             quote: Some("'".to_string()),
             escape: Some("\\".to_string()),
@@ -2081,9 +2087,10 @@ mod tests {
             manifest_dir: None,
             quiet: true,
             debug: false,
-            column_mappings: std::collections::HashMap::new(),
+            column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
             delimiter,
             quote,
             escape,
@@ -2370,5 +2377,1283 @@ mod tests {
 
         assert_eq!(result.records_loaded, 3);
         assert_eq!(result.records_failed, 0);
+    }
+
+    // ============ --exclude-columns integration tests ============
+
+    /// End-to-end: CSV has all columns including the excluded PK. Loader skips
+    /// the excluded position and lets the DB apply DEFAULT. Mirrors the customer
+    /// scenario (UUID PK with gen_random_uuid() default).
+    #[tokio::test]
+    async fn test_exclude_columns_skip_mode_end_to_end() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "with_pk.csv",
+            &[
+                "pk_id,name,email\n",
+                "1,Alice,alice@ex.com\n",
+                "2,Bob,bob@ex.com\n",
+                "3,Charlie,charlie@ex.com\n",
+            ],
+        )
+        .await;
+
+        // pk_id gets a server-generated default; customer's table uses
+        // `DEFAULT (lower(hex(randomblob(16))))` as a SQLite-compatible analog
+        // to `DEFAULT gen_random_uuid()`.
+        let pool = setup_sqlite_table(
+            "test_exclude",
+            "pk_id TEXT DEFAULT (lower(hex(randomblob(16)))) PRIMARY KEY, name TEXT, email TEXT",
+        )
+        .await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_exclude".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+        assert_eq!(result.records_loaded, 3);
+        assert_eq!(result.records_failed, 0);
+        assert_eq!(get_table_count(&pool, "test_exclude").await, 3);
+
+        // Verify: the CSV's pk_id values were NOT inserted; DB-generated defaults
+        // were used. The CSV had pk_id = 1/2/3; those should not appear.
+        if let Ok(mut conn) = pool.acquire().await
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let (count,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM test_exclude WHERE pk_id IN ('1','2','3')")
+                    .fetch_one(&mut **sqlite_conn)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                count, 0,
+                "pk_id values from CSV should NOT appear; DB should have generated defaults"
+            );
+        }
+    }
+
+    /// Parallel workers + multi-chunk load with `--exclude-columns`: the same
+    /// invariant as `test_multiple_workers_and_chunk_distribution` but with a
+    /// DB-defaulted PK column being skipped. Exercises the concurrent-chunk
+    /// path that production actually uses.
+    #[tokio::test]
+    async fn test_exclude_columns_parallel_workers() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = temp_dir.path().join("parallel.csv");
+        let mut file = File::create(&csv_path).await.unwrap();
+        file.write_all(b"pk_id,name,email\n").await.unwrap();
+        for i in 0..500 {
+            let line = format!("{},name_{},user_{}@ex.com\n", i, i, i);
+            file.write_all(line.as_bytes()).await.unwrap();
+        }
+        file.flush().await.unwrap();
+        let csv_path = csv_path.to_str().unwrap().to_string();
+
+        let pool = setup_sqlite_table(
+            "test_exclude_parallel",
+            "pk_id TEXT DEFAULT (lower(hex(randomblob(16)))) PRIMARY KEY, name TEXT, email TEXT",
+        )
+        .await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_exclude_parallel".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(4)
+            .chunk_size_bytes(800)
+            .batch_size(50)
+            .batch_concurrency(2)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+
+        assert!(result.chunks_processed > 1, "expected multiple chunks");
+        assert_eq!(result.records_loaded, 500);
+        assert_eq!(result.records_failed, 0);
+        assert_eq!(get_table_count(&pool, "test_exclude_parallel").await, 500);
+
+        let unique_workers: HashSet<_> =
+            result.chunk_results.iter().map(|r| &r.worker_id).collect();
+        assert!(
+            unique_workers.len() >= 2,
+            "expected at least 2 workers, got {}",
+            unique_workers.len()
+        );
+
+        // CSV pk_ids were 0..500; none should appear because the DB default generated them.
+        if let Ok(mut conn) = pool.acquire().await
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM test_exclude_parallel WHERE pk_id IN ('0','1','2','3','499')",
+            )
+            .fetch_one(&mut **sqlite_conn)
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 0,
+                "CSV pk_id values must not appear; DB-generated defaults should be used"
+            );
+        }
+    }
+
+    /// Parquet source + `--exclude-columns`: parquet emits records in the file's
+    /// column order, so this confirms the positional skipping logic works when the
+    /// reader is a Parquet reader (not just CSV).
+    #[tokio::test]
+    async fn test_exclude_columns_parquet() {
+        use crate::coordination::manifest::ParquetConfig;
+        use crate::formats::parquet::GenericParquetReader;
+        use arrow::array::*;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("exclude.parquet");
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("pk_id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, false),
+        ]);
+
+        let file = std::fs::File::create(&parquet_path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(50)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::new(arrow_schema.clone()), Some(props)).unwrap();
+
+        let num_rows: i32 = 100;
+        let pk_array = StringArray::from_iter((0..num_rows).map(|i| Some(format!("csv_pk_{}", i))));
+        let name_array = StringArray::from_iter((0..num_rows).map(|i| Some(format!("name_{}", i))));
+        let value_array = Float64Array::from_iter_values((0..num_rows).map(|i| (i as f64) * 1.5));
+
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(pk_array),
+                Arc::new(name_array),
+                Arc::new(value_array),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let parquet_path_str = parquet_path.to_str().unwrap().to_string();
+
+        let pool = setup_sqlite_table(
+            "test_exclude_parquet",
+            "pk_id TEXT DEFAULT (lower(hex(randomblob(16)))) PRIMARY KEY, name TEXT, value REAL",
+        )
+        .await;
+
+        let byte_reader = LocalFileByteReader::new(&parquet_path_str);
+        let parquet_reader = GenericParquetReader::new(byte_reader).await.unwrap();
+        let file_reader: Arc<dyn FileReader> = Arc::new(parquet_reader);
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(parquet_path_str)
+            .target_table("test_exclude_parquet".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(2)
+            .chunk_size_bytes(500)
+            .batch_size(20)
+            .batch_concurrency(2)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Parquet(ParquetConfig::default()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+
+        assert_eq!(result.records_loaded, 100);
+        assert_eq!(result.records_failed, 0);
+        assert_eq!(get_table_count(&pool, "test_exclude_parquet").await, 100);
+
+        // None of the parquet-sourced pk_id values should land in the DB.
+        if let Ok(mut conn) = pool.acquire().await
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM test_exclude_parquet WHERE pk_id LIKE 'csv_pk_%'",
+            )
+            .fetch_one(&mut **sqlite_conn)
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 0,
+                "Parquet pk_id values must not appear; DB default should have replaced them"
+            );
+        }
+    }
+
+    /// Field-count mismatch: the CSV is missing a column. Records should be
+    /// dropped and counted as failures with one aggregated ErrorRecord.
+    #[tokio::test]
+    async fn test_exclude_columns_field_count_mismatch_is_aggregated() {
+        let temp_dir = TempDir::new().unwrap();
+        // CSV is missing pk_id — should fail because excluded still requires full schema
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "missing_pk.csv",
+            &["name,email\n", "Alice,alice@ex.com\n", "Bob,bob@ex.com\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table(
+            "test_exclude_mismatch",
+            "pk_id TEXT DEFAULT 'x' PRIMARY KEY, name TEXT, email TEXT",
+        )
+        .await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_exclude_mismatch".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+        assert_eq!(result.records_loaded, 0);
+        assert_eq!(result.records_failed, 2);
+        assert_eq!(get_table_count(&pool, "test_exclude_mismatch").await, 0);
+
+        // Error aggregation: exactly one ErrorRecord of type field_count_mismatch with count 2
+        let field_count_errors: Vec<_> = result
+            .chunk_results
+            .iter()
+            .flat_map(|r| r.errors.iter())
+            .filter(|e| e.error_type == "field_count_mismatch")
+            .collect();
+        assert_eq!(field_count_errors.len(), 1);
+        let msg = &field_count_errors[0].error_message;
+        assert!(msg.contains("2 record(s)"), "msg: {}", msg);
+        assert!(
+            msg.contains("first mismatch at chunk record index") && msg.contains("had 2 fields"),
+            "msg: {}",
+            msg
+        );
+        assert_eq!(field_count_errors[0].line_number, 0);
+    }
+
+    /// Invalid column name: validator rejects before loading starts.
+    #[tokio::test]
+    async fn test_exclude_columns_unknown_name_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path =
+            create_csv_with_content(&temp_dir, "ok.csv", &["id,name\n", "1,Alice\n"]).await;
+
+        let pool = setup_sqlite_table("test_unknown", "id TEXT PRIMARY KEY, name TEXT").await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_unknown".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["does_not_exist".to_string()])
+            .build()
+            .unwrap();
+
+        let err = coordinator.run_load(&config).await.unwrap_err().to_string();
+        assert!(
+            err.contains("Column 'does_not_exist' not found"),
+            "error should identify the unknown column, got: {}",
+            err
+        );
+    }
+
+    /// Combination: --exclude-columns + --column-map on disjoint columns should work.
+    /// Exercises both features together: pk_id is excluded (DB applies DEFAULT), and
+    /// the SQLite column `full_name` is renamed to itself to cover the rename code path.
+    /// A non-trivial rename is not possible here without also mutating the SQLite schema,
+    /// so this asserts only that the combined pipeline loads both rows successfully.
+    /// Rename-after-exclude ordering is pinned by the unit test
+    /// `exclude_then_rename_ordering_applies_rename_to_remaining_columns` in coordinator.rs.
+    #[tokio::test]
+    async fn test_exclude_columns_plus_column_map() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "combo.csv",
+            &[
+                "pk_id,full_name,email\n",
+                "1,Alice,alice@ex.com\n",
+                "2,Bob,bob@ex.com\n",
+            ],
+        )
+        .await;
+
+        let pool = setup_sqlite_table(
+            "test_combo",
+            "pk_id TEXT DEFAULT (lower(hex(randomblob(16)))) PRIMARY KEY, full_name TEXT, email TEXT",
+        )
+        .await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let mut mappings = HashMap::new();
+        mappings.insert("full_name".to_string(), "full_name".to_string());
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_combo".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(mappings)
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+        assert_eq!(get_table_count(&pool, "test_combo").await, 2);
+    }
+
+    /// Conflict: --column-map targets an excluded column — validator must reject.
+    #[tokio::test]
+    async fn test_exclude_columns_rename_conflict_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path =
+            create_csv_with_content(&temp_dir, "conflict.csv", &["pk_id,name\n", "1,Alice\n"])
+                .await;
+
+        let pool = setup_sqlite_table(
+            "test_rename_conflict",
+            "pk_id TEXT DEFAULT 'x' PRIMARY KEY, name TEXT",
+        )
+        .await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let mut mappings = HashMap::new();
+        mappings.insert("pk_id".to_string(), "new_pk".to_string());
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_rename_conflict".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(mappings)
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let err = coordinator.run_load(&config).await.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be both excluded and renamed"),
+            "error should call out exclusion/rename conflict, got: {}",
+            err
+        );
+    }
+
+    /// --if-not-exists + --exclude-columns must be rejected at setup.
+    #[tokio::test]
+    async fn test_exclude_columns_with_if_not_exists_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path =
+            create_csv_with_content(&temp_dir, "create.csv", &["id,name\n", "1,Alice\n"]).await;
+
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("never_created".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(true)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["id".to_string()])
+            .build()
+            .unwrap();
+
+        let err = coordinator.run_load(&config).await.unwrap_err().to_string();
+        assert!(
+            err.contains("not supported with --if-not-exists"),
+            "error should reject the combination, got: {}",
+            err
+        );
+    }
+
+    /// DO UPDATE with all conflict columns excluded must be rejected.
+    #[tokio::test]
+    async fn test_exclude_columns_all_conflict_cols_excluded_do_update_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path =
+            create_csv_with_content(&temp_dir, "do_update.csv", &["pk_id,name\n", "1,Alice\n"])
+                .await;
+
+        // pk_id is the only unique column; excluding it should fail under do-update
+        let pool = setup_sqlite_table(
+            "test_all_excluded_upsert",
+            "pk_id TEXT PRIMARY KEY, name TEXT",
+        )
+        .await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_all_excluded_upsert".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoUpdate)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let err = coordinator.run_load(&config).await.unwrap_err().to_string();
+        assert!(
+            err.contains("All conflict columns are excluded"),
+            "error should call out the broken conflict target, got: {}",
+            err
+        );
+    }
+
+    /// Resume with matching --exclude-columns must succeed; mismatched must fail.
+    #[tokio::test]
+    async fn test_exclude_columns_resume_compatibility_check() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "resume.csv",
+            &["pk_id,name\n", "1,Alice\n", "2,Bob\n", "3,Charlie\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table(
+            "test_resume_excl",
+            "pk_id TEXT DEFAULT (lower(hex(randomblob(16)))) PRIMARY KEY, name TEXT",
+        )
+        .await;
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let coordinator = Coordinator::new(
+            manifest_storage.clone(),
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path.clone())
+            .target_table("test_resume_excl".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+        assert_eq!(result.records_loaded, 3);
+        let job_id = result.job_id;
+
+        // Resume with a DIFFERENT exclude list must fail
+        let byte_reader2 = LocalFileByteReader::new(&csv_path);
+        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader2,
+            DelimitedConfig::csv(),
+        ));
+        let coordinator2 = Coordinator::new(
+            manifest_storage.clone(),
+            file_reader2,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+        let bad_config = LoadConfigBuilder::default()
+            .source_uri(csv_path.clone())
+            .target_table("test_resume_excl".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["name".to_string()])
+            .resume_job_id(Some(job_id.clone()))
+            .build()
+            .unwrap();
+
+        let err = coordinator2
+            .run_load(&bad_config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--exclude-columns mismatch"),
+            "expected resume mismatch error, got: {}",
+            err
+        );
+    }
+
+    /// Resume without --exclude-columns must inherit the manifest's exclusion set.
+    /// Uses an order-reversed explicit list to also verify the sort-before-compare path.
+    #[tokio::test]
+    async fn test_exclude_columns_resume_inherits_from_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "inherit.csv",
+            &["pk_id,extra,name\n", "1,x,Alice\n", "2,y,Bob\n"],
+        )
+        .await;
+
+        let pool = setup_sqlite_table(
+            "test_resume_inherit",
+            "pk_id TEXT DEFAULT (lower(hex(randomblob(16)))) PRIMARY KEY, \
+             extra TEXT DEFAULT 'def', name TEXT",
+        )
+        .await;
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let coordinator = Coordinator::new(
+            manifest_storage.clone(),
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path.clone())
+            .target_table("test_resume_inherit".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string(), "extra".to_string()])
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+        assert_eq!(result.records_loaded, 2);
+        let job_id = result.job_id;
+
+        // Resume with exclude_columns omitted entirely should inherit from manifest.
+        let byte_reader2 = LocalFileByteReader::new(&csv_path);
+        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader2,
+            DelimitedConfig::csv(),
+        ));
+        let coordinator2 = Coordinator::new(
+            manifest_storage.clone(),
+            file_reader2,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+        let resume_omitted = LoadConfigBuilder::default()
+            .source_uri(csv_path.clone())
+            .target_table("test_resume_inherit".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .resume_job_id(Some(job_id.clone()))
+            .build()
+            .unwrap();
+
+        coordinator2
+            .run_load(&resume_omitted)
+            .await
+            .expect("resume without exclude_columns must succeed using manifest value");
+        assert_eq!(
+            get_table_count(&pool, "test_resume_inherit").await,
+            2,
+            "resume must not re-insert rows"
+        );
+
+        // Resume with the same exclude list in reversed order must also succeed
+        // (sort-before-compare makes the check order-independent).
+        let byte_reader3 = LocalFileByteReader::new(&csv_path);
+        let file_reader3: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader3,
+            DelimitedConfig::csv(),
+        ));
+        let coordinator3 = Coordinator::new(
+            manifest_storage,
+            file_reader3,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+        let resume_reordered = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_resume_inherit".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["extra".to_string(), "pk_id".to_string()])
+            .resume_job_id(Some(job_id))
+            .build()
+            .unwrap();
+
+        coordinator3
+            .run_load(&resume_reordered)
+            .await
+            .expect("reordered exclude_columns must be accepted on resume");
+        assert_eq!(
+            get_table_count(&pool, "test_resume_inherit").await,
+            2,
+            "reordered-resume must not re-insert rows"
+        );
+    }
+
+    /// Manifest integrity: resuming with a corrupted manifest where
+    /// excluded_columns and excluded_positions disagree in length must be rejected
+    /// before any worker starts.
+    #[tokio::test]
+    async fn test_exclude_columns_resume_rejects_corrupted_manifest_parity() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path =
+            create_csv_with_content(&temp_dir, "corrupt.csv", &["pk_id,name\n", "1,Alice\n"]).await;
+        let pool = setup_sqlite_table(
+            "test_parity",
+            "pk_id TEXT DEFAULT (lower(hex(randomblob(16)))) PRIMARY KEY, name TEXT",
+        )
+        .await;
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let coordinator = Coordinator::new(
+            manifest_storage.clone(),
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path.clone())
+            .target_table("test_parity".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+        let job_id = result.job_id;
+
+        // Corrupt the manifest: keep excluded_columns but drop excluded_positions.
+        let manifest_path = manifest_dir
+            .path()
+            .join("jobs")
+            .join(&job_id)
+            .join("manifest.json");
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let mut mf: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        mf["table"]["excluded_positions"] = serde_json::json!([]);
+        std::fs::write(&manifest_path, serde_json::to_string(&mf).unwrap()).unwrap();
+
+        let byte_reader2 = LocalFileByteReader::new(&csv_path);
+        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader2,
+            DelimitedConfig::csv(),
+        ));
+        let coordinator2 = Coordinator::new(
+            manifest_storage,
+            file_reader2,
+            SchemaInferrer { has_header: true },
+            pool,
+        );
+        let resume_config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_parity".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .resume_job_id(Some(job_id))
+            .build()
+            .unwrap();
+
+        let err = coordinator2
+            .run_load(&resume_config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("manifest exclusion fields disagree"),
+            "expected parity error, got: {}",
+            err
+        );
+    }
+
+    /// Manifest integrity: an out-of-range `excluded_positions` entry must be
+    /// rejected on resume even when the parity check passes.
+    #[tokio::test]
+    async fn test_exclude_columns_resume_rejects_out_of_range_position() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path =
+            create_csv_with_content(&temp_dir, "oor.csv", &["pk_id,name\n", "1,Alice\n"]).await;
+        let pool = setup_sqlite_table(
+            "test_oor",
+            "pk_id TEXT DEFAULT (lower(hex(randomblob(16)))) PRIMARY KEY, name TEXT",
+        )
+        .await;
+
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let coordinator = Coordinator::new(
+            manifest_storage.clone(),
+            file_reader,
+            SchemaInferrer { has_header: true },
+            pool.clone(),
+        );
+
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path.clone())
+            .target_table("test_oor".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .exclude_columns(vec!["pk_id".to_string()])
+            .build()
+            .unwrap();
+
+        let job_id = coordinator.run_load(&config).await.unwrap().job_id;
+
+        // Parity intact (len == 1), but position 99 is out of range.
+        let manifest_path = manifest_dir
+            .path()
+            .join("jobs")
+            .join(&job_id)
+            .join("manifest.json");
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let mut mf: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        mf["table"]["excluded_positions"] = serde_json::json!([99]);
+        std::fs::write(&manifest_path, serde_json::to_string(&mf).unwrap()).unwrap();
+
+        let byte_reader2 = LocalFileByteReader::new(&csv_path);
+        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader2,
+            DelimitedConfig::csv(),
+        ));
+        let coordinator2 = Coordinator::new(
+            manifest_storage,
+            file_reader2,
+            SchemaInferrer { has_header: true },
+            pool,
+        );
+        let resume_config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_oor".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::DoNothing)
+            .resume_job_id(Some(job_id))
+            .build()
+            .unwrap();
+
+        let err = coordinator2
+            .run_load(&resume_config)
+            .await
+            .expect_err("resume must fail when excluded_positions has an out-of-range entry")
+            .to_string();
+        // Assert on the offending position value (the one stable diagnostic) rather
+        // than exact phrasing, which clap/anyhow may re-format.
+        assert!(
+            err.contains("99"),
+            "expected error to name the offending position, got: {}",
+            err
+        );
+    }
+
+    /// Manifest integrity: duplicate / non-strictly-increasing `excluded_positions`
+    /// entries must be rejected on resume. These cannot arise from
+    /// `compute_excluded_positions`, but a hand-edited manifest can produce them
+    /// and would otherwise cause silent field-mapping misalignment.
+    #[tokio::test]
+    async fn test_exclude_columns_resume_rejects_non_strictly_increasing_positions() {
+        async fn run_corruption_case(
+            table_suffix: &str,
+            corrupted_positions: serde_json::Value,
+        ) -> String {
+            let temp_dir = TempDir::new().unwrap();
+            let csv_path = create_csv_with_content(
+                &temp_dir,
+                "nsi.csv",
+                &["pk_id,extra,name\n", "1,x,Alice\n"],
+            )
+            .await;
+            let table = format!("test_nsi_{}", table_suffix);
+            let pool = setup_sqlite_table(
+                &table,
+                "pk_id TEXT DEFAULT (lower(hex(randomblob(16)))) PRIMARY KEY, \
+                 extra TEXT DEFAULT 'def', name TEXT",
+            )
+            .await;
+
+            let manifest_dir = TempDir::new().unwrap();
+            let manifest_storage: Arc<dyn ManifestStorage> =
+                Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+            let byte_reader = LocalFileByteReader::new(&csv_path);
+            let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+                byte_reader,
+                DelimitedConfig::csv(),
+            ));
+            let coordinator = Coordinator::new(
+                manifest_storage.clone(),
+                file_reader,
+                SchemaInferrer { has_header: true },
+                pool.clone(),
+            );
+
+            // Common builder: the two call sites below differ only in whether they
+            // set exclude_columns (initial) or resume_job_id (resume).
+            let base_builder = |csv: String, table: String| {
+                LoadConfigBuilder::default()
+                    .source_uri(csv)
+                    .target_table(table)
+                    .schema("public".to_string())
+                    .dsql_config(DsqlConfig {
+                        endpoint: "test".to_string(),
+                        region: "us-west-2".to_string(),
+                        username: "test".to_string(),
+                    })
+                    .worker_count(1)
+                    .chunk_size_bytes(1000)
+                    .batch_size(10)
+                    .batch_concurrency(1)
+                    .create_table_if_missing(false)
+                    .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+                    .column_mappings(HashMap::new())
+                    .quiet(true)
+                    .on_conflict(OnConflict::DoNothing)
+                    .clone()
+            };
+
+            let config = base_builder(csv_path.clone(), table.clone())
+                .exclude_columns(vec!["pk_id".to_string(), "extra".to_string()])
+                .build()
+                .unwrap();
+
+            let job_id = coordinator
+                .run_load(&config)
+                .await
+                .expect("initial load must succeed so we have a manifest to corrupt")
+                .job_id;
+
+            // Parity preserved (len == 2) but positions violate strictly-increasing.
+            let manifest_path = manifest_dir
+                .path()
+                .join("jobs")
+                .join(&job_id)
+                .join("manifest.json");
+            let raw = std::fs::read_to_string(&manifest_path).unwrap();
+            let mut mf: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            mf["table"]["excluded_positions"] = corrupted_positions;
+            std::fs::write(&manifest_path, serde_json::to_string(&mf).unwrap()).unwrap();
+
+            let byte_reader2 = LocalFileByteReader::new(&csv_path);
+            let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+                byte_reader2,
+                DelimitedConfig::csv(),
+            ));
+            let coordinator2 = Coordinator::new(
+                manifest_storage,
+                file_reader2,
+                SchemaInferrer { has_header: true },
+                pool,
+            );
+            let resume_config = base_builder(csv_path, table)
+                .resume_job_id(Some(job_id))
+                .build()
+                .unwrap();
+
+            coordinator2
+                .run_load(&resume_config)
+                .await
+                .expect_err("resume must fail on non-strictly-increasing excluded_positions")
+                .to_string()
+        }
+
+        // Duplicate positions: [0, 0] — must be rejected (not strictly increasing).
+        let err = run_corruption_case("dup", serde_json::json!([0, 0])).await;
+        assert!(
+            err.contains("not strictly increasing"),
+            "expected not-strictly-increasing error for duplicates, got: {}",
+            err
+        );
+
+        // Non-sorted positions: [1, 0] — must be rejected (not strictly increasing).
+        let err = run_corruption_case("unsorted", serde_json::json!([1, 0])).await;
+        assert!(
+            err.contains("not strictly increasing"),
+            "expected not-strictly-increasing error for unsorted, got: {}",
+            err
+        );
     }
 }
