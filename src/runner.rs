@@ -95,6 +95,9 @@ pub struct LoadArgs {
     // Conflict resolution strategy
     pub on_conflict: OnConflict,
 
+    // Columns to exclude from INSERT statements (DB applies DEFAULT values)
+    pub exclude_columns: Vec<String>,
+
     // Delimited file options (CSV/TSV)
     /// Field delimiter (default: "," for CSV, "\t" for TSV)
     pub delimiter: Option<String>,
@@ -162,6 +165,7 @@ pub struct LoadResult {
 ///     quote: None,
 ///     escape: None,
 ///     has_header: None,
+///     exclude_columns: Vec::new(),
 /// };
 ///
 /// let result = run_load(args).await?;
@@ -266,6 +270,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         .debug(args.debug)
         .resume_job_id(args.resume_job_id)
         .on_conflict(args.on_conflict)
+        .exclude_columns(args.exclude_columns)
         .build()?;
 
     // Run the load

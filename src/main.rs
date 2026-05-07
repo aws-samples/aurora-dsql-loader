@@ -1,5 +1,6 @@
 use aurora_dsql_loader::runner::{Format, LoadArgs, OnConflict, run_load};
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
@@ -92,6 +93,13 @@ struct LoadParams {
     /// Conflict resolution strategy (do-nothing, do-update, error)
     #[arg(long, default_value = "do-nothing")]
     on_conflict: String,
+
+    /// Columns to exclude from INSERT statements so the DB applies DEFAULT values
+    /// (format: col1,col2). Source records must still contain these columns - the
+    /// loader skips them by position. Requires the table to already exist; cannot
+    /// be combined with --if-not-exists.
+    #[arg(long, conflicts_with = "if_not_exists")]
+    exclude_columns: Option<String>,
 }
 
 #[derive(Clone, ClapArgs)]
@@ -228,7 +236,13 @@ async fn run_loader(
             )
         })?
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
+    };
+
+    let exclude_columns = if let Some(ref excl_str) = load.exclude_columns {
+        cli::parse_exclude_columns(excl_str)?
+    } else {
+        Vec::new()
     };
 
     // Parse on_conflict mode
@@ -262,6 +276,9 @@ async fn run_loader(
                 println!("    {} -> {}", src, dest);
             }
         }
+        if !exclude_columns.is_empty() {
+            println!("  Excluded columns: {}", exclude_columns.join(", "));
+        }
         println!();
         println!("To execute, run without --dry-run");
         return Ok(());
@@ -287,6 +304,7 @@ async fn run_loader(
         column_mappings,
         resume_job_id: output.resume_job_id.clone(),
         on_conflict,
+        exclude_columns,
         delimiter: source.delimiter.clone(),
         quote: source.quote.clone(),
         escape: source.escape.clone(),
@@ -449,6 +467,35 @@ mod cli {
         }
     }
 
+    /// Parse "col1,col2,col3" into Vec<String>.
+    /// Errors on empty input, empty column names, or duplicates.
+    pub fn parse_exclude_columns(input: &str) -> anyhow::Result<Vec<String>> {
+        if input.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "At least one column name is required for --exclude-columns"
+            ));
+        }
+
+        let mut cols = Vec::new();
+        for raw in input.split(',') {
+            let name = raw.trim();
+            if name.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Empty column name in --exclude-columns value '{}'",
+                    input
+                ));
+            }
+            if cols.iter().any(|c| c == name) {
+                return Err(anyhow::anyhow!(
+                    "Duplicate column name '{}' in --exclude-columns",
+                    name
+                ));
+            }
+            cols.push(name.to_string());
+        }
+        Ok(cols)
+    }
+
     /// Parse column mapping string "src:dest,src2:dest2" into HashMap
     pub fn parse_column_mapping(mapping_str: &str) -> anyhow::Result<HashMap<String, String>> {
         let mut mappings = HashMap::new();
@@ -495,6 +542,114 @@ mod cli {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::collections::HashSet;
+
+    #[test]
+    fn parse_exclude_columns_basic() {
+        assert_eq!(
+            cli::parse_exclude_columns("id").unwrap(),
+            vec!["id".to_string()]
+        );
+        assert_eq!(
+            cli::parse_exclude_columns("id,created_at,updated_at").unwrap(),
+            vec![
+                "id".to_string(),
+                "created_at".to_string(),
+                "updated_at".to_string()
+            ]
+        );
+        assert_eq!(
+            cli::parse_exclude_columns("id, created_at , updated_at ").unwrap(),
+            vec![
+                "id".to_string(),
+                "created_at".to_string(),
+                "updated_at".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_exclude_columns_empty_errors() {
+        let err = cli::parse_exclude_columns("").unwrap_err().to_string();
+        assert!(err.contains("At least one column name is required"));
+        let err = cli::parse_exclude_columns("   ").unwrap_err().to_string();
+        assert!(err.contains("At least one column name is required"));
+    }
+
+    #[test]
+    fn parse_exclude_columns_empty_segment_errors() {
+        let err = cli::parse_exclude_columns("id,,name")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Empty column name"));
+    }
+
+    #[test]
+    fn parse_exclude_columns_duplicate_errors() {
+        let err = cli::parse_exclude_columns("id,name,id")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Duplicate column name 'id'"));
+    }
+
+    // Feature: loader-column-exclusion, Property 1: Parsing round-trip and duplicate detection
+    // NOTE: generator restricts to ASCII identifiers so no commas/whitespace leak into inputs
+    // and break the round-trip.
+    proptest::proptest! {
+        #[test]
+        fn prop_parse_exclude_columns_roundtrip(
+            names in proptest::collection::vec("[a-zA-Z_][a-zA-Z0-9_]{0,15}", 1..8)
+        ) {
+            let unique: Vec<String> = {
+                let mut seen = HashSet::new();
+                names.into_iter().filter(|n| seen.insert(n.clone())).collect()
+            };
+            proptest::prop_assume!(!unique.is_empty());
+            let joined = unique.join(",");
+            let parsed = cli::parse_exclude_columns(&joined).unwrap();
+            proptest::prop_assert_eq!(parsed, unique);
+        }
+
+        #[test]
+        fn prop_parse_exclude_columns_duplicate_detected(
+            base in "[a-zA-Z_][a-zA-Z0-9_]{0,15}",
+            others in proptest::collection::vec("[a-zA-Z_][a-zA-Z0-9_]{0,15}", 0..4),
+        ) {
+            // Inject base twice somewhere in the list to force a duplicate
+            let mut names = others;
+            names.push(base.clone());
+            names.push(base.clone());
+            let joined = names.join(",");
+            let err = cli::parse_exclude_columns(&joined).unwrap_err().to_string();
+            // Specifically the duplicate-detection path (not some other error)
+            proptest::prop_assert!(err.contains("Duplicate column name"));
+        }
+    }
+
+    #[test]
+    fn exclude_columns_conflicts_with_if_not_exists_at_parse_time() {
+        let result = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "test.csv",
+            "--table",
+            "t",
+            "--exclude-columns",
+            "pk_id",
+            "--if-not-exists",
+            "--dry-run",
+        ]);
+        let err = match result {
+            Ok(_) => panic!("clap should reject --exclude-columns + --if-not-exists"),
+            Err(e) => e,
+        };
+        // Assert on ErrorKind (the stable contract) rather than message wording,
+        // which clap is free to re-phrase between releases.
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn parquet_without_delimited_options_parses_successfully() {

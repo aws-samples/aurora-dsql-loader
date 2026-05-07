@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use rand::Rng;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -11,6 +12,42 @@ use crate::config::{BASE_DELAY, MAX_DELAY, MAX_RETRIES, QUERY_TIMEOUT};
 use crate::db::Pool;
 use crate::formats::{FileReader, Record};
 use crate::telemetry::TelemetryEvent;
+
+/// Apply `--exclude-columns` field filtering to a batch of records.
+///
+/// Skip-mode only: each record must have `full_len = effective_len + excluded_positions.len()`
+/// fields. Matching records drop fields at `excluded_positions`; mismatched records are
+/// excluded from the returned batch and counted.
+///
+/// Returns `(filtered_records, mismatch_count, first_mismatch)` where
+/// `first_mismatch` is `(record_index_within_chunk, observed_field_count)` for the
+/// first mismatched record, useful for locating the offending row in the source file.
+fn apply_field_exclusion(
+    records: Vec<Record>,
+    excluded_positions: &[usize],
+    full_len: usize,
+) -> (Vec<Record>, u64, Option<(usize, usize)>) {
+    let excluded_set: HashSet<usize> = excluded_positions.iter().copied().collect();
+    let mut filtered = Vec::with_capacity(records.len());
+    let mut mismatch = 0u64;
+    let mut first_mismatch: Option<(usize, usize)> = None;
+    for (idx, record) in records.into_iter().enumerate() {
+        if record.fields.len() == full_len {
+            let kept: Vec<String> = record
+                .fields
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !excluded_set.contains(i))
+                .map(|(_, f)| f)
+                .collect();
+            filtered.push(Record { fields: kept });
+        } else {
+            first_mismatch.get_or_insert((idx, record.fields.len()));
+            mismatch += 1;
+        }
+    }
+    (filtered, mismatch, first_mismatch)
+}
 
 /// Type category for SQL type conversion strategy
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -215,10 +252,48 @@ impl Worker {
             estimated_rows: chunk_info.estimated_rows,
         };
 
-        let chunk_data = file_reader
+        let mut chunk_data = file_reader
             .read_chunk(&chunk)
             .await
             .context("Failed to read chunk data")?;
+
+        // Apply --exclude-columns field filtering before batching. Skip-mode:
+        // each source record must contain all table columns; we drop fields at
+        // excluded positions so downstream batch INSERTs target only the effective
+        // schema. Records with the wrong field count are dropped and counted as
+        // failures, mirroring the existing `parse_errors` aggregation pattern.
+        let excluded_positions: &[usize] = &manifest.table.excluded_positions;
+
+        // Snapshot the record count before exclusion so bytes_per_record divides by
+        // the true number of records the chunk's bytes came from. Dividing by the
+        // post-filter count would overstate per-record size (numerator unchanged,
+        // denominator smaller) and, when multiplied by records_loaded downstream,
+        // would cause reported bytes_processed to exceed bytes actually read.
+        let pre_filter_record_count = chunk_data.records.len();
+
+        let (field_mapping_errors, first_mismatch, full_len) = if !excluded_positions.is_empty() {
+            // Invariant: setup_new_job refuses to activate exclusion without a
+            // resolved schema. Fail loudly rather than silently mis-batch every record.
+            let effective_len = manifest
+                .table
+                .schema
+                .as_ref()
+                .map(|s| s.columns.len())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Internal error: manifest has excluded_positions but no schema; \
+                         cannot compute effective field count"
+                    )
+                })?;
+            let full_len = effective_len + excluded_positions.len();
+            let original_records = std::mem::take(&mut chunk_data.records);
+            let (filtered, mismatch, first_sample) =
+                apply_field_exclusion(original_records, excluded_positions, full_len);
+            chunk_data.records = filtered;
+            (mismatch, first_sample, Some(full_len))
+        } else {
+            (0u64, None, None)
+        };
 
         // Split chunk into batches with line offset tracking
         let batches: Vec<Vec<Record>> = chunk_data
@@ -228,17 +303,22 @@ impl Worker {
             .collect();
 
         // Calculate average bytes per record for telemetry
-        let bytes_per_record = if chunk_data.records.is_empty() {
+        let bytes_per_record = if pre_filter_record_count == 0 {
             0
         } else {
-            chunk_data.bytes_read / chunk_data.records.len() as u64
+            chunk_data.bytes_read / pre_filter_record_count as u64
         };
 
         // Process batches in parallel with JoinSet for concurrency control
         let mut join_set: JoinSet<BatchResult> = JoinSet::new();
         let mut results = Vec::new();
 
-        // Track line numbers: chunk records start at line 1, +1 if file has header (to skip header line)
+        // Track line numbers: chunk records start at line 1, +1 if file has header (to skip header line).
+        // Note: `current_line` under-counts by the number of records dropped before
+        // batching (parse_errors or field_count_mismatch paths), so per-batch line
+        // numbers are unreliable as absolute source-file positions whenever drops
+        // occurred upstream. Chunk-level errors from those drop paths use
+        // line_number: 0 as a sentinel (see ErrorRecord doc comment).
         let has_header = matches!(
             manifest.file_format,
             crate::coordination::manifest::FileFormat::Csv(_)
@@ -314,6 +394,32 @@ impl Worker {
                 error_message: format!(
                     "{} record(s) failed to parse from source file. Check delimiter, quote, and escape settings.",
                     chunk_data.parse_errors
+                ),
+            });
+        }
+
+        // Include --exclude-columns field-count mismatches as failed records.
+        // `field_mapping_errors > 0` implies exclusion was active, so `full_len` is Some.
+        if let Some(full_len) = full_len
+            && field_mapping_errors > 0
+        {
+            records_failed += field_mapping_errors;
+            let first_sample = first_mismatch
+                .map(|(idx, n)| {
+                    format!(
+                        " (first mismatch at chunk record index {} had {} fields)",
+                        idx, n
+                    )
+                })
+                .unwrap_or_default();
+            errors.push(ErrorRecord {
+                line_number: 0,
+                error_type: "field_count_mismatch".to_string(),
+                error_message: format!(
+                    "{} record(s) in chunk {} had wrong field count; expected {}{} \
+                     (source file must include all table columns including excluded \
+                     ones, which will be skipped)",
+                    field_mapping_errors, chunk_id, full_len, first_sample
                 ),
             });
         }
@@ -818,4 +924,119 @@ async fn run_raw_sql_sqlite(
 ) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
     use sqlx::Executor;
     (&mut **conn).execute(sqlx::raw_sql(sql)).await
+}
+
+#[cfg(test)]
+mod field_exclusion_tests {
+    use super::*;
+
+    fn mk_record(fields: &[&str]) -> Record {
+        Record {
+            fields: fields.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn skip_mode_drops_excluded_positions() {
+        let records = vec![mk_record(&[
+            "uuid-1",
+            "Alice",
+            "alice@ex.com",
+            "2025-01-01",
+        ])];
+        let (filtered, mismatch, _first) = apply_field_exclusion(records, &[0, 3], 4);
+        assert_eq!(mismatch, 0);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].fields, vec!["Alice", "alice@ex.com"]);
+    }
+
+    #[test]
+    fn mismatched_field_count_is_counted_and_dropped() {
+        let records = vec![
+            mk_record(&["uuid-1", "Alice", "alice@ex.com", "2025-01-01"]),
+            mk_record(&["Alice", "alice@ex.com"]),
+            mk_record(&["uuid-2", "Bob", "bob@ex.com", "2025-01-02", "extra"]),
+        ];
+        let (filtered, mismatch, first) = apply_field_exclusion(records, &[0, 3], 4);
+        assert_eq!(mismatch, 2);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].fields, vec!["Alice", "alice@ex.com"]);
+        // First mismatch is the 2-field record at chunk index 1.
+        assert_eq!(first, Some((1, 2)));
+    }
+
+    #[test]
+    fn empty_excluded_positions_is_identity_over_fields() {
+        let records = vec![mk_record(&["a", "b"])];
+        let (filtered, mismatch, _first) = apply_field_exclusion(records, &[], 2);
+        assert_eq!(mismatch, 0);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].fields, vec!["a", "b"]);
+    }
+
+    // Feature: loader-column-exclusion, Property 3: field mapping correctly skips excluded positions
+    proptest::proptest! {
+        #[test]
+        fn prop_skip_mode_preserves_non_excluded_fields_in_order(
+            full_len in 2usize..10,
+            exclude_mask in proptest::collection::vec(proptest::bool::ANY, 2..10),
+            record_count in 1usize..5,
+        ) {
+            let mask: Vec<bool> = exclude_mask
+                .into_iter()
+                .take(full_len)
+                .chain(std::iter::repeat(false))
+                .take(full_len)
+                .collect();
+            let excluded_positions: Vec<usize> = mask
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &b)| b.then_some(i))
+                .collect();
+            proptest::prop_assume!(
+                !excluded_positions.is_empty() && excluded_positions.len() < full_len
+            );
+
+            let records: Vec<Record> = (0..record_count)
+                .map(|r| Record {
+                    fields: (0..full_len).map(|i| format!("r{}_c{}", r, i)).collect(),
+                })
+                .collect();
+
+            let (filtered, mismatch, _first) =
+                apply_field_exclusion(records.clone(), &excluded_positions, full_len);
+            proptest::prop_assert_eq!(mismatch, 0);
+            proptest::prop_assert_eq!(filtered.len(), record_count);
+
+            let expected_len = full_len - excluded_positions.len();
+            for (r_idx, record) in filtered.iter().enumerate() {
+                proptest::prop_assert_eq!(record.fields.len(), expected_len);
+                let expected: Vec<String> = (0..full_len)
+                    .filter(|i| !excluded_positions.contains(i))
+                    .map(|i| format!("r{}_c{}", r_idx, i))
+                    .collect();
+                proptest::prop_assert_eq!(&record.fields, &expected);
+            }
+        }
+
+        #[test]
+        fn prop_wrong_field_count_always_counts_as_mismatch(
+            full_len in 2usize..8,
+            offset in proptest::sample::select(vec![-2i32, -1, 1, 2, 3]),
+        ) {
+            let actual_len = (full_len as i32 + offset).max(0) as usize;
+            proptest::prop_assume!(actual_len != full_len);
+
+            let excluded_positions: Vec<usize> = vec![0];
+
+            let records = vec![Record {
+                fields: (0..actual_len).map(|i| format!("c{}", i)).collect(),
+            }];
+            let (filtered, mismatch, first) =
+                apply_field_exclusion(records, &excluded_positions, full_len);
+            proptest::prop_assert_eq!(mismatch, 1);
+            proptest::prop_assert!(filtered.is_empty());
+            proptest::prop_assert_eq!(first, Some((0, actual_len)));
+        }
+    }
 }
