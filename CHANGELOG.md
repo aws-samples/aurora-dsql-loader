@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.1.0] - 2026-05-07
+
+### Added
+- `--exclude-columns col1,col2` flag to skip columns from generated INSERTs so
+  the DB applies the column's `DEFAULT` expression (e.g. `gen_random_uuid()`,
+  `CURRENT_TIMESTAMP`). Source records must still contain these columns in
+  their original positions; the loader drops them by index before batching.
+  Cannot be combined with `--if-not-exists`.
+
 ## [2.0.0] - 2026-01-06
 
 Rewrite in Rust with 3-5x throughput improvement and new features.
