@@ -114,6 +114,33 @@ aurora-dsql-loader load \
 
 Resume automatically retries failed chunks and skips completed ones. For safety against duplicates on retry, use unique constraints on your table—the loader will use `ON CONFLICT DO NOTHING` to skip duplicates.
 
+## Performance Tuning
+
+The loader parallelizes work on two axes. Total in-flight INSERTs ≈ `workers × batch-concurrency`.
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--workers` | `8` | Worker threads competing for file chunks |
+| `--batch-concurrency` | `32` | Concurrent INSERT batches per worker |
+| `--batch-size` | `2000` | Records per INSERT statement |
+| `--chunk-size` | `10MB` | File is split into chunks of this size; workers claim one chunk at a time |
+
+**To load faster**, raise `--workers` and/or `--batch-concurrency`. For very large files, a smaller `--chunk-size` (e.g. `5MB`) produces more chunks and lets workers balance load better.
+
+```bash
+aurora-dsql-loader load \
+  --endpoint your-cluster.dsql.us-east-1.on.aws \
+  --source-uri big.csv \
+  --table my_table \
+  --workers 16 \
+  --batch-concurrency 64 \
+  --chunk-size 5MB
+```
+
+**Watch for:**
+- **Parameter limit**: DSQL caps a statement at 65,535 parameters, so `batch-size × column count` must stay below that. If you see `too many arguments for query`, the loader will print a suggested smaller `--batch-size`.
+- **Rate limits**: pushing concurrency very high can get requests throttled by DSQL. Back off `--workers` or `--batch-concurrency` if you see retry-heavy behavior.
+
 ## Requirements
 
 - **Rust**: 1.85 or later (for building)
