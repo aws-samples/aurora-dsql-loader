@@ -26,6 +26,7 @@ struct ConnectionArgs {
 
 #[derive(Clone, ClapArgs)]
 #[command(group = ArgGroup::new("delimited").multiple(true))]
+#[command(group = ArgGroup::new("header_mode").multiple(false))]
 struct SourceArgs {
     /// Path to source data file or S3 URI (local path, s3://bucket/key)
     #[arg(short, long)]
@@ -48,8 +49,13 @@ struct SourceArgs {
     #[arg(long, group = "delimited")]
     escape: Option<String>,
 
-    /// File has no header row
-    #[arg(long, group = "delimited")]
+    /// CSV/TSV file has a header row that should be skipped
+    #[arg(long, groups = ["delimited", "header_mode"])]
+    header: bool,
+
+    /// CSV/TSV file has no header row (default behavior; kept for backward
+    /// compatibility with 2.x scripts — will be removed in a future release)
+    #[arg(long, groups = ["delimited", "header_mode"])]
     no_header: bool,
 }
 
@@ -308,7 +314,13 @@ async fn run_loader(
         delimiter: source.delimiter.clone(),
         quote: source.quote.clone(),
         escape: source.escape.clone(),
-        has_header: if source.no_header { Some(false) } else { None },
+        has_header: if source.header {
+            Some(true)
+        } else if source.no_header {
+            Some(false)
+        } else {
+            None
+        },
     };
 
     // Run the load
@@ -387,11 +399,12 @@ fn validate_delimited_options(
     let has_delimited_options = source.delimiter.is_some()
         || source.quote.is_some()
         || source.escape.is_some()
+        || source.header
         || source.no_header;
 
     if has_delimited_options && !format_enum.is_delimited() {
         return Err(anyhow::anyhow!(
-            "Delimited file options (--delimiter, --quote, --escape, --no-header) \
+            "Delimited file options (--delimiter, --quote, --escape, --header, --no-header) \
              can only be used with CSV or TSV formats, not {}",
             format
         ));
