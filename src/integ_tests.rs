@@ -2109,6 +2109,17 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
+    async fn create_headerless_tsv(dir: &TempDir, filename: &str, num_rows: usize) -> String {
+        let path = dir.path().join(filename);
+        let mut file = File::create(&path).await.unwrap();
+        for i in 0..num_rows {
+            let line = format!("{}\tname_{}\t{}.5\t{}\n", i, i, i, i * 10);
+            file.write_all(line.as_bytes()).await.unwrap();
+        }
+        file.flush().await.unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
     #[tokio::test]
     async fn test_headerless_csv_loads_all_rows_by_default() {
         // Reproduces issue #28: a CSV with no header row must not silently
@@ -2165,6 +2176,55 @@ mod tests {
         .await;
 
         assert_eq!(result.records_loaded, 1000);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_headerless_tsv_loads_all_rows_by_default() {
+        // Symmetric coverage to test_headerless_csv_loads_all_rows_by_default:
+        // a TSV with no header row must not silently drop the first data row
+        // when the user passes no header-related flags.
+        let temp_dir = TempDir::new().unwrap();
+        let tsv_path = create_headerless_tsv(&temp_dir, "headerless.tsv", 1000).await;
+
+        let pool = setup_sqlite_table(
+            "headerless_tsv",
+            "id INTEGER, name TEXT, value REAL, amount INTEGER",
+        )
+        .await;
+
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: tsv_path,
+            target_table: "headerless_tsv".to_string(),
+            schema: "public".to_string(),
+            format: Format::Tsv,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
+            test_pool: Some(pool.clone()),
+        };
+        let result = run_load(args).await.unwrap();
+
+        assert_eq!(
+            result.records_loaded, 1000,
+            "All 1000 data rows must load when TSV has no header (issue #28 symmetric case)"
+        );
         assert_eq!(result.records_failed, 0);
     }
 

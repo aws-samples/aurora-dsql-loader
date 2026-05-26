@@ -81,9 +81,7 @@ impl DelimitedConfig {
     pub fn tsv() -> Self {
         Self {
             delimiter: "\\t".to_string(),
-            has_header: false,
-            quote: "\"".to_string(),
-            escape: None,
+            ..Self::default()
         }
     }
 }

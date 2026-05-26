@@ -53,8 +53,8 @@ struct SourceArgs {
     #[arg(long, groups = ["delimited", "header_mode"])]
     header: bool,
 
-    /// CSV/TSV file has no header row (default behavior; kept for backward
-    /// compatibility with 2.x scripts — will be removed in a future release)
+    /// Deprecated alias for the default no-header behavior. Has no effect
+    /// beyond rejecting an accompanying `--header`. Prefer omitting the flag.
     #[arg(long, groups = ["delimited", "header_mode"])]
     no_header: bool,
 }
@@ -314,6 +314,7 @@ async fn run_loader(
         delimiter: source.delimiter.clone(),
         quote: source.quote.clone(),
         escape: source.escape.clone(),
+        // `header_mode` ArgGroup makes --header/--no-header mutually exclusive at parse time.
         has_header: if source.header {
             Some(true)
         } else if source.no_header {
@@ -662,6 +663,54 @@ mod tests {
         // Assert on ErrorKind (the stable contract) rather than message wording,
         // which clap is free to re-phrase between releases.
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn header_and_no_header_are_mutually_exclusive_at_parse_time() {
+        let result = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "test.csv",
+            "--table",
+            "t",
+            "--header",
+            "--no-header",
+            "--dry-run",
+        ]);
+        let err = match result {
+            Ok(_) => panic!("clap should reject --header + --no-header"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn header_flag_rejected_with_parquet_format() {
+        let args = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "test_file.parquet",
+            "--table",
+            "my_table",
+            "--header",
+            "--dry-run",
+        ])
+        .expect("args should parse (clap groups don't restrict by format)");
+
+        let Command::Load { source, .. } = args.command;
+        let err = validate_delimited_options("parquet", Format::Parquet, &source)
+            .expect_err("--header on parquet must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--header"),
+            "error should name the offending --header flag: {msg}"
+        );
     }
 
     #[test]
