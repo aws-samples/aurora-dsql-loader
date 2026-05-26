@@ -2141,6 +2141,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_csv_with_header_loads_all_rows_when_header_flag_set() {
+        // Verifies the new --header CLI flag (which sets has_header: Some(true))
+        // correctly skips the header row and loads every data row.
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "with_header.csv", 1000).await;
+
+        let pool = setup_sqlite_table(
+            "with_header",
+            "id INTEGER, name TEXT, value REAL, amount INTEGER",
+        )
+        .await;
+
+        let result = run_csv_load_with_opts(
+            &pool,
+            "with_header",
+            &csv_path,
+            None,
+            None,
+            None,
+            /* has_header */ Some(true),
+        )
+        .await;
+
+        assert_eq!(result.records_loaded, 1000);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
     async fn test_rfc4180_crlf_line_endings() {
         let temp_dir = TempDir::new().unwrap();
         let csv_path = create_csv_with_content(
