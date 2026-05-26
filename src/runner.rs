@@ -105,7 +105,7 @@ pub struct LoadArgs {
     pub quote: Option<String>,
     /// Escape character for escaping quotes (default: None)
     pub escape: Option<String>,
-    /// Whether file has a header row (default: true)
+    /// Whether file has a header row (default: false; matches PostgreSQL `COPY FROM`)
     pub has_header: Option<bool>,
 
     // Test-only: inject a pre-created pool (for SQLite testing)
