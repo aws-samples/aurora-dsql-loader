@@ -66,7 +66,7 @@ impl Default for DelimitedConfig {
     fn default() -> Self {
         Self {
             delimiter: ",".to_string(),
-            has_header: true,
+            has_header: false,
             quote: "\"".to_string(),
             escape: None,
         }
@@ -81,7 +81,7 @@ impl DelimitedConfig {
     pub fn tsv() -> Self {
         Self {
             delimiter: "\\t".to_string(),
-            has_header: true,
+            has_header: false,
             quote: "\"".to_string(),
             escape: None,
         }
@@ -225,7 +225,12 @@ mod tests {
         temp_file.flush().unwrap();
 
         let byte_reader = LocalFileByteReader::new(temp_file.path());
-        let reader = GenericDelimitedReader::new(byte_reader, DelimitedConfig::csv());
+        // Fixture has a header row, so override the has_header default.
+        let config = DelimitedConfig {
+            has_header: true,
+            ..DelimitedConfig::csv()
+        };
+        let reader = GenericDelimitedReader::new(byte_reader, config);
         let metadata = reader.metadata().await.unwrap();
 
         // Create chunks and use the first one (which skips the header)
