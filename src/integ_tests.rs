@@ -2100,6 +2100,49 @@ mod tests {
         run_load(args).await.unwrap()
     }
 
+    /// Helper to create a CSV file with NO header row (just data).
+    async fn create_headerless_csv(dir: &TempDir, filename: &str, num_rows: usize) -> String {
+        let path = dir.path().join(filename);
+        let mut file = File::create(&path).await.unwrap();
+        for i in 0..num_rows {
+            let line = format!("{},name_{},{}.5,{}\n", i, i, i, i * 10);
+            file.write_all(line.as_bytes()).await.unwrap();
+        }
+        file.flush().await.unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_headerless_csv_loads_all_rows_by_default() {
+        // Reproduces issue #28: a CSV with no header row must not silently
+        // drop the first data row when the user passes no header-related flags.
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_headerless_csv(&temp_dir, "headerless.csv", 1000).await;
+
+        let pool = setup_sqlite_table(
+            "headerless",
+            "id INTEGER, name TEXT, value REAL, amount INTEGER",
+        )
+        .await;
+
+        let result = run_csv_load_with_opts(
+            &pool,
+            "headerless",
+            &csv_path,
+            None,
+            None,
+            None,
+            /* has_header */ None,
+        )
+        .await;
+
+        assert_eq!(
+            result.records_loaded, 1000,
+            "All 1000 data rows must load when CSV has no header (issue #28)"
+        );
+        assert_eq!(result.records_failed, 0);
+    }
+
     #[tokio::test]
     async fn test_rfc4180_crlf_line_endings() {
         let temp_dir = TempDir::new().unwrap();
