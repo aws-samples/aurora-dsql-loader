@@ -83,6 +83,36 @@ aurora-dsql-loader load \
 ```
 Listed columns are dropped from the INSERT so DSQL applies the column's `DEFAULT` expression (e.g. `gen_random_uuid()`, `CURRENT_TIMESTAMP`). Source records must still contain these columns in their original positions.
 
+### CSV/TSV header behavior
+
+By default, the loader treats every row of a CSV or TSV file as data — it does
+**not** skip the first row. This matches PostgreSQL `COPY FROM` (default
+`HEADER false`), Redshift, Snowflake, and BigQuery defaults.
+
+If your file has a header row, pass `--header` so it gets skipped:
+
+```bash
+aurora-dsql-loader load \
+  --endpoint $DSQL_ENDPOINT \
+  --source-uri sales_with_header.csv \
+  --table sales \
+  --header
+```
+
+If your file has no header row, no flag is needed:
+
+```bash
+aurora-dsql-loader load \
+  --endpoint $DSQL_ENDPOINT \
+  --source-uri sales_data_only.csv \
+  --table sales
+```
+
+> **Migrating from 2.x:** the previous default was the opposite — the loader
+> assumed a header row and silently dropped the first data row when one was
+> missing. Add `--header` to any 2.x invocation that loaded a header-bearing
+> file. See the [CHANGELOG](CHANGELOG.md) for full migration notes.
+
 ## Key Features
 
 - **Fast**: Parallel loading with configurable workers
