@@ -2228,6 +2228,119 @@ mod tests {
         assert_eq!(result.records_failed, 0);
     }
 
+    /// Library-API validation: `has_header: Some(_)` is meaningless with Parquet
+    /// and must be rejected by `run_load` before any I/O. Mirrors the CLI's
+    /// `validate_delimited_options` so library consumers don't get silent drops.
+    #[tokio::test]
+    async fn test_run_load_rejects_has_header_with_parquet() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: "/dev/null".to_string(),
+            target_table: "t".to_string(),
+            schema: "public".to_string(),
+            format: Format::Parquet,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: Some(true),
+            test_pool: Some(pool),
+        };
+        let err = run_load(args).await.expect_err("must reject");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("has_header") && msg.contains("Parquet"),
+            "error message must name the offending option and format: {msg}"
+        );
+    }
+
+    /// Regression: worker `current_line` must start at 1 for headerless CSVs.
+    ///
+    /// Pre-fix, `has_header` was derived from the format variant rather than the
+    /// manifest's `DelimitedConfig.has_header`, so headerless CSV/TSV loads
+    /// reported error line numbers off by one.
+    #[tokio::test]
+    async fn test_headerless_csv_error_line_numbers_are_one_based() {
+        let temp_dir = TempDir::new().unwrap();
+        // Headerless CSV with a duplicate id; first row is line 1.
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "dup_headerless.csv",
+            &["1,Alice\n", "1,Alice_Duplicate\n"],
+        )
+        .await;
+
+        let pool =
+            setup_sqlite_table("test_dup_headerless", "id TEXT PRIMARY KEY, name TEXT").await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: false },
+            pool.clone(),
+        );
+
+        // Use OnConflict::Error so the duplicate triggers a batch_error
+        // (which reports `line_number = line_offset` derived from current_line).
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_dup_headerless".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::Error)
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+        assert_eq!(result.records_failed, 2, "Both rows fail as a batch");
+
+        let batch_errors: Vec<_> = result
+            .chunk_results
+            .iter()
+            .flat_map(|r| r.errors.iter())
+            .filter(|e| e.error_type == "batch_error")
+            .collect();
+        assert_eq!(batch_errors.len(), 1);
+        assert_eq!(
+            batch_errors[0].line_number, 1,
+            "Headerless CSV must report line_offset starting at 1, not 2"
+        );
+    }
+
     #[tokio::test]
     async fn test_rfc4180_crlf_line_endings() {
         let temp_dir = TempDir::new().unwrap();

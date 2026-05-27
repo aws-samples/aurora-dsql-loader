@@ -165,7 +165,11 @@ pub struct LoadResult {
 ///     delimiter: None,
 ///     quote: None,
 ///     escape: None,
-///     has_header: None,
+///     // The CSV in this example has a header row that names the destination
+///     // columns. With `create_table_if_missing: true`, leaving this as `None`
+///     // would name columns from row 1's data values (the new 3.0 default
+///     // treats every row as data). Set explicitly when loading a header-bearing file.
+///     has_header: Some(true),
 ///     exclude_columns: Vec::new(),
 /// };
 ///
@@ -175,6 +179,8 @@ pub struct LoadResult {
 /// # }
 /// ```
 pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
+    validate_load_args(&args)?;
+
     let delimited_config = maybe_delimited_config(&args);
 
     // Set up manifest directory (use temp dir if not provided)
@@ -296,6 +302,26 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         duration: result.duration,
         persisted_manifest_dir,
     })
+}
+
+/// Reject combinations that would otherwise cause silent drops downstream.
+///
+/// Mirrors the CLI's `validate_delimited_options` so library consumers calling
+/// `run_load` directly get the same feedback as CLI users.
+fn validate_load_args(args: &LoadArgs) -> Result<()> {
+    let has_delimited_options = args.delimiter.is_some()
+        || args.quote.is_some()
+        || args.escape.is_some()
+        || args.has_header.is_some();
+
+    if has_delimited_options && !args.format.is_delimited() {
+        return Err(anyhow::anyhow!(
+            "Delimited file options (delimiter, quote, escape, has_header) \
+             can only be used with CSV or TSV formats, not {:?}",
+            args.format
+        ));
+    }
+    Ok(())
 }
 
 // Build custom delimited config if provided

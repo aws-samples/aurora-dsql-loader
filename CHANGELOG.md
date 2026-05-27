@@ -23,8 +23,9 @@
   ```
 - If your file has no header, no change is needed — the new default already
   matches the actual file shape.
-- The `--no-header` flag continues to work but is now a no-op (it matches the
-  default). It will be removed in a future release.
+- The `--no-header` flag continues to work; it explicitly sets header behavior
+  to `false`, which matches the new default. Emits no diagnostic and will be
+  removed in a future release.
 
 ## [2.1.0] - 2026-05-07
 

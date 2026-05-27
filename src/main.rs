@@ -26,7 +26,6 @@ struct ConnectionArgs {
 
 #[derive(Clone, ClapArgs)]
 #[command(group = ArgGroup::new("delimited").multiple(true))]
-#[command(group = ArgGroup::new("header_mode").multiple(false))]
 struct SourceArgs {
     /// Path to source data file or S3 URI (local path, s3://bucket/key)
     #[arg(short, long)]
@@ -50,12 +49,12 @@ struct SourceArgs {
     escape: Option<String>,
 
     /// CSV/TSV file has a header row that should be skipped
-    #[arg(long, groups = ["delimited", "header_mode"])]
+    #[arg(long, group = "delimited", conflicts_with = "no_header")]
     header: bool,
 
-    /// Deprecated alias for the default no-header behavior. Has no effect
-    /// beyond rejecting an accompanying `--header`. Prefer omitting the flag.
-    #[arg(long, groups = ["delimited", "header_mode"])]
+    /// Deprecated. Explicitly sets header behavior to false, which matches the
+    /// new default. Prefer omitting the flag; will be removed in a future release.
+    #[arg(long, group = "delimited")]
     no_header: bool,
 }
 
@@ -352,7 +351,7 @@ async fn run_loader(
                 total_processed, estimated
             );
             println!(
-                "This may indicate silent parse errors. Check --delimiter, --quote, and --escape settings."
+                "This may indicate silent parse errors. Check --header, --delimiter, --quote, and --escape settings."
             );
         }
     }

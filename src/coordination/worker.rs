@@ -319,11 +319,11 @@ impl Worker {
         // numbers are unreliable as absolute source-file positions whenever drops
         // occurred upstream. Chunk-level errors from those drop paths use
         // line_number: 0 as a sentinel (see ErrorRecord doc comment).
-        let has_header = matches!(
-            manifest.file_format,
-            crate::coordination::manifest::FileFormat::Csv(_)
-                | crate::coordination::manifest::FileFormat::Tsv(_)
-        );
+        let has_header = match &manifest.file_format {
+            crate::coordination::manifest::FileFormat::Csv(c)
+            | crate::coordination::manifest::FileFormat::Tsv(c) => c.has_header,
+            crate::coordination::manifest::FileFormat::Parquet(_) => false,
+        };
         let mut current_line = if has_header { 2u64 } else { 1u64 };
 
         for batch in batches {
