@@ -75,6 +75,27 @@ mod tests {
         pool
     }
 
+    /// Helper that builds a CSV `DelimitedConfig` with `has_header: true`.
+    ///
+    /// Most tests in this file create header-bearing fixtures via
+    /// `create_test_csv` / `create_csv_with_content`, but the library default
+    /// for `DelimitedConfig::csv()` is `has_header: false` (matches Postgres
+    /// `COPY FROM` HEADER default). This helper makes the test intent explicit.
+    fn csv_with_header() -> DelimitedConfig {
+        DelimitedConfig {
+            has_header: true,
+            ..DelimitedConfig::csv()
+        }
+    }
+
+    /// Helper that builds a TSV `DelimitedConfig` with `has_header: true`.
+    fn tsv_with_header() -> DelimitedConfig {
+        DelimitedConfig {
+            has_header: true,
+            ..DelimitedConfig::tsv()
+        }
+    }
+
     /// Helper to run a basic CSV load test with defaults
     async fn run_csv_load(
         pool: &Pool,
@@ -84,10 +105,8 @@ mod tests {
         chunk_size: u64,
     ) -> LoadResult {
         let byte_reader = LocalFileByteReader::new(csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::default(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -114,7 +133,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(2)
             .create_table_if_missing(true)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .debug(true) // Enable debug for tests to verify verbose output
@@ -133,10 +152,8 @@ mod tests {
         chunk_size: u64,
     ) -> LoadResult {
         let byte_reader = LocalFileByteReader::new(tsv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::tsv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, tsv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -163,7 +180,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(2)
             .create_table_if_missing(true)
-            .file_format(FileFormat::Tsv(DelimitedConfig::tsv()))
+            .file_format(FileFormat::Tsv(tsv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .build()
@@ -485,7 +502,7 @@ mod tests {
             delimiter: None,
             quote: None,
             escape: None,
-            has_header: None,
+            has_header: Some(true),
             test_pool: Some(pool.clone()),
         };
 
@@ -605,10 +622,8 @@ mod tests {
         let pool = Pool::sqlite_in_memory().await.unwrap();
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::default(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -635,7 +650,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false) // This is the key - not creating the table
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .build()
@@ -722,7 +737,7 @@ mod tests {
             delimiter: None,
             quote: None,
             escape: None,
-            has_header: None,
+            has_header: Some(true),
             test_pool: Some(pool),
         };
 
@@ -824,10 +839,8 @@ mod tests {
         .await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::default(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -854,7 +867,7 @@ mod tests {
             .batch_size(3) // All 3 records in one batch
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .debug(true) // Enable debug mode to get verbose output
@@ -922,10 +935,8 @@ mod tests {
         .await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -949,7 +960,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(2)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .build()
@@ -996,7 +1007,7 @@ mod tests {
             delimiter: None,
             quote: None,
             escape: None,
-            has_header: None,
+            has_header: Some(true),
             test_pool: Some(pool.clone()),
         };
 
@@ -1016,10 +1027,8 @@ mod tests {
         let pool = Pool::sqlite_in_memory().await.unwrap();
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -1043,7 +1052,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(true)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .build()
@@ -1100,7 +1109,7 @@ mod tests {
             delimiter: None,
             quote: None,
             escape: None,
-            has_header: None,
+            has_header: Some(true),
             test_pool: Some(pool.clone()),
         };
 
@@ -1190,7 +1199,7 @@ mod tests {
             delimiter: None,
             quote: None,
             escape: None,
-            has_header: None,
+            has_header: Some(true),
             test_pool: Some(pool.clone()),
         };
 
@@ -1312,7 +1321,7 @@ mod tests {
             delimiter: None,
             quote: None,
             escape: None,
-            has_header: None,
+            has_header: Some(true),
             test_pool: Some(pool.clone()),
         };
 
@@ -1408,7 +1417,7 @@ mod tests {
             delimiter: None,
             quote: None,
             escape: None,
-            has_header: None,
+            has_header: Some(true),
             test_pool: Some(pool.clone()),
         };
 
@@ -1467,10 +1476,8 @@ mod tests {
 
         // Load initial data with do-nothing mode
         let byte_reader = LocalFileByteReader::new(&csv_path1);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -1497,7 +1504,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -1522,10 +1529,8 @@ mod tests {
 
         // Load with do-update mode (upsert)
         let byte_reader2 = LocalFileByteReader::new(&csv_path2);
-        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader2,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader2: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader2, csv_with_header()));
 
         let coordinator2 = Coordinator::new(
             manifest_storage,
@@ -1548,7 +1553,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoUpdate)
@@ -1604,10 +1609,8 @@ mod tests {
 
         // Load initial data
         let byte_reader = LocalFileByteReader::new(&csv_path1);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -1634,7 +1637,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::Error)
@@ -1653,10 +1656,8 @@ mod tests {
         .await;
 
         let byte_reader2 = LocalFileByteReader::new(&csv_path2);
-        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader2,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader2: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader2, csv_with_header()));
 
         let coordinator2 = Coordinator::new(
             manifest_storage,
@@ -1679,7 +1680,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::Error)
@@ -1706,10 +1707,8 @@ mod tests {
         let pool = setup_sqlite_table("test_no_constraints", "id TEXT, name TEXT").await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -1736,7 +1735,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoUpdate)
@@ -1787,10 +1786,8 @@ mod tests {
         }
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
 
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
@@ -1817,7 +1814,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .debug(true) // Enable debug mode to verify verbose output
@@ -2006,7 +2003,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some(true),
         )
         .await;
 
@@ -2048,7 +2045,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some(true),
         )
         .await;
 
@@ -2100,6 +2097,332 @@ mod tests {
         run_load(args).await.unwrap()
     }
 
+    /// Helper to create a CSV file with NO header row (just data).
+    async fn create_headerless_csv(dir: &TempDir, filename: &str, num_rows: usize) -> String {
+        let path = dir.path().join(filename);
+        let mut file = File::create(&path).await.unwrap();
+        for i in 0..num_rows {
+            let line = format!("{},name_{},{}.5,{}\n", i, i, i, i * 10);
+            file.write_all(line.as_bytes()).await.unwrap();
+        }
+        file.flush().await.unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    async fn create_headerless_tsv(dir: &TempDir, filename: &str, num_rows: usize) -> String {
+        let path = dir.path().join(filename);
+        let mut file = File::create(&path).await.unwrap();
+        for i in 0..num_rows {
+            let line = format!("{}\tname_{}\t{}.5\t{}\n", i, i, i, i * 10);
+            file.write_all(line.as_bytes()).await.unwrap();
+        }
+        file.flush().await.unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_headerless_csv_loads_all_rows_by_default() {
+        // Reproduces issue #28: a CSV with no header row must not silently
+        // drop the first data row when the user passes no header-related flags.
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_headerless_csv(&temp_dir, "headerless.csv", 1000).await;
+
+        let pool = setup_sqlite_table(
+            "headerless",
+            "id INTEGER, name TEXT, value REAL, amount INTEGER",
+        )
+        .await;
+
+        let result = run_csv_load_with_opts(
+            &pool,
+            "headerless",
+            &csv_path,
+            None,
+            None,
+            None,
+            /* has_header */ None,
+        )
+        .await;
+
+        assert_eq!(
+            result.records_loaded, 1000,
+            "All 1000 data rows must load when CSV has no header (issue #28)"
+        );
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_csv_with_header_loads_all_rows_when_header_flag_set() {
+        // Verifies the new --header CLI flag (which sets has_header: Some(true))
+        // correctly skips the header row and loads every data row.
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "with_header.csv", 1000).await;
+
+        let pool = setup_sqlite_table(
+            "with_header",
+            "id INTEGER, name TEXT, value REAL, amount INTEGER",
+        )
+        .await;
+
+        let result = run_csv_load_with_opts(
+            &pool,
+            "with_header",
+            &csv_path,
+            None,
+            None,
+            None,
+            /* has_header */ Some(true),
+        )
+        .await;
+
+        assert_eq!(result.records_loaded, 1000);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_headerless_tsv_loads_all_rows_by_default() {
+        // Symmetric coverage to test_headerless_csv_loads_all_rows_by_default:
+        // a TSV with no header row must not silently drop the first data row
+        // when the user passes no header-related flags.
+        let temp_dir = TempDir::new().unwrap();
+        let tsv_path = create_headerless_tsv(&temp_dir, "headerless.tsv", 1000).await;
+
+        let pool = setup_sqlite_table(
+            "headerless_tsv",
+            "id INTEGER, name TEXT, value REAL, amount INTEGER",
+        )
+        .await;
+
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: tsv_path,
+            target_table: "headerless_tsv".to_string(),
+            schema: "public".to_string(),
+            format: Format::Tsv,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
+            test_pool: Some(pool.clone()),
+        };
+        let result = run_load(args).await.unwrap();
+
+        assert_eq!(
+            result.records_loaded, 1000,
+            "All 1000 data rows must load when TSV has no header (issue #28 symmetric case)"
+        );
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_tsv_with_header_loads_all_rows_when_header_flag_set() {
+        // Symmetric to test_csv_with_header_loads_all_rows_when_header_flag_set:
+        // a header-bearing TSV with `has_header: Some(true)` must skip the
+        // header and load every data row.
+        let temp_dir = TempDir::new().unwrap();
+        let tsv_path = create_test_tsv(&temp_dir, "with_header.tsv", 1000).await;
+
+        let pool = setup_sqlite_table(
+            "tsv_with_header",
+            "id INTEGER, name TEXT, value REAL, amount INTEGER",
+        )
+        .await;
+
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: tsv_path,
+            target_table: "tsv_with_header".to_string(),
+            schema: "public".to_string(),
+            format: Format::Tsv,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: Some(true),
+            test_pool: Some(pool.clone()),
+        };
+        let result = run_load(args).await.unwrap();
+
+        assert_eq!(result.records_loaded, 1000);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_header_csv_without_header_flag_eats_header_as_data() {
+        // Symmetric mirror of issue #28: a header-bearing CSV loaded WITHOUT
+        // `--header` under the new 3.0.0 default (`has_header: None` → false)
+        // treats the header line as a data row. With a TEXT schema the row
+        // gets silently inserted (records_loaded = data_rows + 1), which is
+        // the failure mode the post-load `--header` advisory exists to flag.
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "header_no_flag.csv", 1000).await;
+
+        // TEXT-only schema so the header line ("id,name,value,amount") parses
+        // as a valid row instead of failing on type coercion.
+        let pool = setup_sqlite_table(
+            "header_no_flag",
+            "id TEXT, name TEXT, value TEXT, amount TEXT",
+        )
+        .await;
+
+        let result = run_csv_load_with_opts(
+            &pool,
+            "header_no_flag",
+            &csv_path,
+            None,
+            None,
+            None,
+            /* has_header */ None,
+        )
+        .await;
+
+        assert_eq!(
+            result.records_loaded, 1001,
+            "header line should be loaded as a 1001st data row when --header is not set"
+        );
+        assert_eq!(result.records_failed, 0);
+    }
+
+    /// Library-API validation: `has_header: Some(_)` is meaningless with Parquet
+    /// and must be rejected by `run_load` before any I/O. Mirrors the CLI's
+    /// `validate_delimited_options` so library consumers don't get silent drops.
+    #[tokio::test]
+    async fn test_run_load_rejects_has_header_with_parquet() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: "/dev/null".to_string(),
+            target_table: "t".to_string(),
+            schema: "public".to_string(),
+            format: Format::Parquet,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: Some(true),
+            test_pool: Some(pool),
+        };
+        let err = run_load(args).await.expect_err("must reject");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("has_header") && msg.contains("Parquet"),
+            "error message must name the offending option and format: {msg}"
+        );
+    }
+
+    /// Regression: worker `current_line` must start at 1 for headerless CSVs.
+    ///
+    /// Pre-fix, `has_header` was derived from the format variant rather than the
+    /// manifest's `DelimitedConfig.has_header`, so headerless CSV/TSV loads
+    /// reported error line numbers off by one.
+    #[tokio::test]
+    async fn test_headerless_csv_error_line_numbers_are_one_based() {
+        let temp_dir = TempDir::new().unwrap();
+        // Headerless CSV with a duplicate id; first row is line 1.
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "dup_headerless.csv",
+            &["1,Alice\n", "1,Alice_Duplicate\n"],
+        )
+        .await;
+
+        let pool =
+            setup_sqlite_table("test_dup_headerless", "id TEXT PRIMARY KEY, name TEXT").await;
+
+        let byte_reader = LocalFileByteReader::new(&csv_path);
+        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
+            byte_reader,
+            DelimitedConfig::csv(),
+        ));
+        let manifest_dir = TempDir::new().unwrap();
+        let manifest_storage: Arc<dyn ManifestStorage> =
+            Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
+        let coordinator = Coordinator::new(
+            manifest_storage,
+            file_reader,
+            SchemaInferrer { has_header: false },
+            pool.clone(),
+        );
+
+        // Use OnConflict::Error so the duplicate triggers a batch_error
+        // (which reports `line_number = line_offset` derived from current_line).
+        let config = LoadConfigBuilder::default()
+            .source_uri(csv_path)
+            .target_table("test_dup_headerless".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "test".to_string(),
+                region: "us-west-2".to_string(),
+                username: "test".to_string(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1000)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .column_mappings(HashMap::new())
+            .quiet(true)
+            .on_conflict(OnConflict::Error)
+            .build()
+            .unwrap();
+
+        let result = coordinator.run_load(&config).await.unwrap();
+        assert_eq!(result.records_failed, 2, "Both rows fail as a batch");
+
+        let batch_errors: Vec<_> = result
+            .chunk_results
+            .iter()
+            .flat_map(|r| r.errors.iter())
+            .filter(|e| e.error_type == "batch_error")
+            .collect();
+        assert_eq!(batch_errors.len(), 1);
+        assert_eq!(
+            batch_errors[0].line_number, 1,
+            "Headerless CSV must report line_offset starting at 1, not 2"
+        );
+    }
+
     #[tokio::test]
     async fn test_rfc4180_crlf_line_endings() {
         let temp_dir = TempDir::new().unwrap();
@@ -2112,7 +2435,8 @@ mod tests {
 
         let pool = setup_sqlite_table("test_crlf", "col1 TEXT, col2 TEXT").await;
         let result =
-            run_csv_load_with_opts(&pool, "test_crlf", &csv_path, None, None, None, None).await;
+            run_csv_load_with_opts(&pool, "test_crlf", &csv_path, None, None, None, Some(true))
+                .await;
 
         assert_eq!(result.records_loaded, 2);
         assert_eq!(result.records_failed, 0);
@@ -2129,9 +2453,16 @@ mod tests {
         .await;
 
         let pool = setup_sqlite_table("test_no_trailing", "col1 TEXT, col2 TEXT").await;
-        let result =
-            run_csv_load_with_opts(&pool, "test_no_trailing", &csv_path, None, None, None, None)
-                .await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_no_trailing",
+            &csv_path,
+            None,
+            None,
+            None,
+            Some(true),
+        )
+        .await;
 
         assert_eq!(result.records_loaded, 2);
         assert_eq!(result.records_failed, 0);
@@ -2148,8 +2479,16 @@ mod tests {
         .await;
 
         let pool = setup_sqlite_table("test_spaces", "col1 TEXT, col2 TEXT").await;
-        let result =
-            run_csv_load_with_opts(&pool, "test_spaces", &csv_path, None, None, None, None).await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_spaces",
+            &csv_path,
+            None,
+            None,
+            None,
+            Some(true),
+        )
+        .await;
 
         assert_eq!(result.records_loaded, 2);
         assert_eq!(result.records_failed, 0);
@@ -2166,8 +2505,16 @@ mod tests {
         .await;
 
         let pool = setup_sqlite_table("test_quoted", "col1 TEXT, col2 TEXT").await;
-        let result =
-            run_csv_load_with_opts(&pool, "test_quoted", &csv_path, None, None, None, None).await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_quoted",
+            &csv_path,
+            None,
+            None,
+            None,
+            Some(true),
+        )
+        .await;
 
         assert_eq!(result.records_loaded, 2);
         assert_eq!(result.records_failed, 0);
@@ -2184,9 +2531,16 @@ mod tests {
         .await;
 
         let pool = setup_sqlite_table("test_embedded_nl", "col1 TEXT, col2 TEXT").await;
-        let result =
-            run_csv_load_with_opts(&pool, "test_embedded_nl", &csv_path, None, None, None, None)
-                .await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_embedded_nl",
+            &csv_path,
+            None,
+            None,
+            None,
+            Some(true),
+        )
+        .await;
 
         assert_eq!(result.records_loaded, 2);
         assert_eq!(result.records_failed, 0);
@@ -2210,7 +2564,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some(true),
         )
         .await;
 
@@ -2237,7 +2591,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some(true),
         )
         .await;
 
@@ -2270,7 +2624,7 @@ mod tests {
             None,
             None,
             Some("\\".to_string()),
-            None,
+            Some(true),
         )
         .await;
 
@@ -2296,7 +2650,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some(true),
         )
         .await;
 
@@ -2346,8 +2700,16 @@ mod tests {
         .await;
 
         let pool = setup_sqlite_table("test_unicode", "col1 TEXT, col2 TEXT").await;
-        let result =
-            run_csv_load_with_opts(&pool, "test_unicode", &csv_path, None, None, None, None).await;
+        let result = run_csv_load_with_opts(
+            &pool,
+            "test_unicode",
+            &csv_path,
+            None,
+            None,
+            None,
+            Some(true),
+        )
+        .await;
 
         assert_eq!(result.records_loaded, 3);
         assert_eq!(result.records_failed, 0);
@@ -2371,7 +2733,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some(true),
         )
         .await;
 
@@ -2409,10 +2771,8 @@ mod tests {
         .await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
@@ -2437,7 +2797,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -2491,10 +2851,8 @@ mod tests {
         .await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
@@ -2519,7 +2877,7 @@ mod tests {
             .batch_size(50)
             .batch_concurrency(2)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -2691,10 +3049,8 @@ mod tests {
         .await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
@@ -2719,7 +3075,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -2760,10 +3116,8 @@ mod tests {
         let pool = setup_sqlite_table("test_unknown", "id TEXT PRIMARY KEY, name TEXT").await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
@@ -2788,7 +3142,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -2832,10 +3186,8 @@ mod tests {
         .await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
@@ -2863,7 +3215,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(mappings)
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -2892,10 +3244,8 @@ mod tests {
         .await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
@@ -2923,7 +3273,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(mappings)
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -2949,10 +3299,8 @@ mod tests {
         let pool = Pool::sqlite_in_memory().await.unwrap();
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
@@ -2977,7 +3325,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(true)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3009,10 +3357,8 @@ mod tests {
         .await;
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let manifest_dir = TempDir::new().unwrap();
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
@@ -3037,7 +3383,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoUpdate)
@@ -3075,10 +3421,8 @@ mod tests {
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let coordinator = Coordinator::new(
             manifest_storage.clone(),
             file_reader,
@@ -3100,7 +3444,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3114,10 +3458,8 @@ mod tests {
 
         // Resume with a DIFFERENT exclude list must fail
         let byte_reader2 = LocalFileByteReader::new(&csv_path);
-        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader2,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader2: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader2, csv_with_header()));
         let coordinator2 = Coordinator::new(
             manifest_storage.clone(),
             file_reader2,
@@ -3138,7 +3480,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3183,10 +3525,8 @@ mod tests {
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
 
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let coordinator = Coordinator::new(
             manifest_storage.clone(),
             file_reader,
@@ -3208,7 +3548,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3222,10 +3562,8 @@ mod tests {
 
         // Resume with exclude_columns omitted entirely should inherit from manifest.
         let byte_reader2 = LocalFileByteReader::new(&csv_path);
-        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader2,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader2: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader2, csv_with_header()));
         let coordinator2 = Coordinator::new(
             manifest_storage.clone(),
             file_reader2,
@@ -3246,7 +3584,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3267,10 +3605,8 @@ mod tests {
         // Resume with the same exclude list in reversed order must also succeed
         // (sort-before-compare makes the check order-independent).
         let byte_reader3 = LocalFileByteReader::new(&csv_path);
-        let file_reader3: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader3,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader3: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader3, csv_with_header()));
         let coordinator3 = Coordinator::new(
             manifest_storage,
             file_reader3,
@@ -3291,7 +3627,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3329,10 +3665,8 @@ mod tests {
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let coordinator = Coordinator::new(
             manifest_storage.clone(),
             file_reader,
@@ -3354,7 +3688,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3377,10 +3711,8 @@ mod tests {
         std::fs::write(&manifest_path, serde_json::to_string(&mf).unwrap()).unwrap();
 
         let byte_reader2 = LocalFileByteReader::new(&csv_path);
-        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader2,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader2: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader2, csv_with_header()));
         let coordinator2 = Coordinator::new(
             manifest_storage,
             file_reader2,
@@ -3401,7 +3733,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3438,10 +3770,8 @@ mod tests {
         let manifest_storage: Arc<dyn ManifestStorage> =
             Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
         let byte_reader = LocalFileByteReader::new(&csv_path);
-        let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
         let coordinator = Coordinator::new(
             manifest_storage.clone(),
             file_reader,
@@ -3463,7 +3793,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3485,10 +3815,8 @@ mod tests {
         std::fs::write(&manifest_path, serde_json::to_string(&mf).unwrap()).unwrap();
 
         let byte_reader2 = LocalFileByteReader::new(&csv_path);
-        let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-            byte_reader2,
-            DelimitedConfig::csv(),
-        ));
+        let file_reader2: Arc<dyn FileReader> =
+            Arc::new(GenericDelimitedReader::new(byte_reader2, csv_with_header()));
         let coordinator2 = Coordinator::new(
             manifest_storage,
             file_reader2,
@@ -3509,7 +3837,7 @@ mod tests {
             .batch_size(10)
             .batch_concurrency(1)
             .create_table_if_missing(false)
-            .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+            .file_format(FileFormat::Csv(csv_with_header()))
             .column_mappings(HashMap::new())
             .quiet(true)
             .on_conflict(OnConflict::DoNothing)
@@ -3560,10 +3888,8 @@ mod tests {
             let manifest_storage: Arc<dyn ManifestStorage> =
                 Arc::new(LocalManifestStorage::new(manifest_dir.path().to_path_buf()));
             let byte_reader = LocalFileByteReader::new(&csv_path);
-            let file_reader: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-                byte_reader,
-                DelimitedConfig::csv(),
-            ));
+            let file_reader: Arc<dyn FileReader> =
+                Arc::new(GenericDelimitedReader::new(byte_reader, csv_with_header()));
             let coordinator = Coordinator::new(
                 manifest_storage.clone(),
                 file_reader,
@@ -3588,7 +3914,7 @@ mod tests {
                     .batch_size(10)
                     .batch_concurrency(1)
                     .create_table_if_missing(false)
-                    .file_format(FileFormat::Csv(DelimitedConfig::csv()))
+                    .file_format(FileFormat::Csv(csv_with_header()))
                     .column_mappings(HashMap::new())
                     .quiet(true)
                     .on_conflict(OnConflict::DoNothing)
@@ -3618,10 +3944,8 @@ mod tests {
             std::fs::write(&manifest_path, serde_json::to_string(&mf).unwrap()).unwrap();
 
             let byte_reader2 = LocalFileByteReader::new(&csv_path);
-            let file_reader2: Arc<dyn FileReader> = Arc::new(GenericDelimitedReader::new(
-                byte_reader2,
-                DelimitedConfig::csv(),
-            ));
+            let file_reader2: Arc<dyn FileReader> =
+                Arc::new(GenericDelimitedReader::new(byte_reader2, csv_with_header()));
             let coordinator2 = Coordinator::new(
                 manifest_storage,
                 file_reader2,

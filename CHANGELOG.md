@@ -1,5 +1,32 @@
 # Changelog
 
+## [3.0.0] - 2026-05-26
+
+### Changed
+- **Breaking**: CSV/TSV loads now default to `--no-header` (treat first row as
+  data). Previously, the loader assumed a header row existed and silently
+  dropped the first data row when one did not. This caused customers loading
+  headerless files to lose exactly one row per file with no diagnostic
+  ([#28](https://github.com/aws-samples/aurora-dsql-loader/issues/28)).
+  The new default aligns with PostgreSQL `COPY FROM` (HEADER false), Amazon
+  Redshift (`IGNOREHEADER 0`), Snowflake (`SKIP_HEADER 0`), and BigQuery
+  (`--skip_leading_rows 0`).
+
+### Added
+- `--header` flag for CSV/TSV loads to opt into header-row skipping.
+- Mutual-exclusion validation: `--header` and `--no-header` cannot both be set.
+
+### Migration from 2.x
+- If your CSV/TSV has a header row, **add `--header`** to your invocation:
+  ```
+  aurora-dsql-loader load ... --source-uri data.csv --header
+  ```
+- If your file has no header, no change is needed — the new default already
+  matches the actual file shape.
+- The `--no-header` flag continues to work; it explicitly sets header behavior
+  to `false`, which matches the new default. Emits no diagnostic and will be
+  removed in a future release.
+
 ## [2.1.0] - 2026-05-07
 
 ### Added

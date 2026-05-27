@@ -48,7 +48,12 @@ struct SourceArgs {
     #[arg(long, group = "delimited")]
     escape: Option<String>,
 
-    /// File has no header row
+    /// CSV/TSV file has a header row that should be skipped
+    #[arg(long, group = "delimited", conflicts_with = "no_header")]
+    header: bool,
+
+    /// Deprecated. Explicitly sets header behavior to false, which matches the
+    /// new default. Prefer omitting the flag; will be removed in a future release.
     #[arg(long, group = "delimited")]
     no_header: bool,
 }
@@ -308,7 +313,14 @@ async fn run_loader(
         delimiter: source.delimiter.clone(),
         quote: source.quote.clone(),
         escape: source.escape.clone(),
-        has_header: if source.no_header { Some(false) } else { None },
+        // `header_mode` ArgGroup makes --header/--no-header mutually exclusive at parse time.
+        has_header: if source.header {
+            Some(true)
+        } else if source.no_header {
+            Some(false)
+        } else {
+            None
+        },
     };
 
     // Run the load
@@ -339,7 +351,7 @@ async fn run_loader(
                 total_processed, estimated
             );
             println!(
-                "This may indicate silent parse errors. Check --delimiter, --quote, and --escape settings."
+                "This may indicate silent parse errors. Check --header, --delimiter, --quote, and --escape settings."
             );
         }
     }
@@ -387,11 +399,12 @@ fn validate_delimited_options(
     let has_delimited_options = source.delimiter.is_some()
         || source.quote.is_some()
         || source.escape.is_some()
+        || source.header
         || source.no_header;
 
     if has_delimited_options && !format_enum.is_delimited() {
         return Err(anyhow::anyhow!(
-            "Delimited file options (--delimiter, --quote, --escape, --no-header) \
+            "Delimited file options (--delimiter, --quote, --escape, --header, --no-header) \
              can only be used with CSV or TSV formats, not {}",
             format
         ));
@@ -649,6 +662,54 @@ mod tests {
         // Assert on ErrorKind (the stable contract) rather than message wording,
         // which clap is free to re-phrase between releases.
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn header_and_no_header_are_mutually_exclusive_at_parse_time() {
+        let result = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "test.csv",
+            "--table",
+            "t",
+            "--header",
+            "--no-header",
+            "--dry-run",
+        ]);
+        let err = match result {
+            Ok(_) => panic!("clap should reject --header + --no-header"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn header_flag_rejected_with_parquet_format() {
+        let args = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "test_file.parquet",
+            "--table",
+            "my_table",
+            "--header",
+            "--dry-run",
+        ])
+        .expect("args should parse (clap groups don't restrict by format)");
+
+        let Command::Load { source, .. } = args.command;
+        let err = validate_delimited_options("parquet", Format::Parquet, &source)
+            .expect_err("--header on parquet must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--header"),
+            "error should name the offending --header flag: {msg}"
+        );
     }
 
     #[test]
