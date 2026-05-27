@@ -2228,6 +2228,88 @@ mod tests {
         assert_eq!(result.records_failed, 0);
     }
 
+    #[tokio::test]
+    async fn test_tsv_with_header_loads_all_rows_when_header_flag_set() {
+        // Symmetric to test_csv_with_header_loads_all_rows_when_header_flag_set:
+        // a header-bearing TSV with `has_header: Some(true)` must skip the
+        // header and load every data row.
+        let temp_dir = TempDir::new().unwrap();
+        let tsv_path = create_test_tsv(&temp_dir, "with_header.tsv", 1000).await;
+
+        let pool = setup_sqlite_table(
+            "tsv_with_header",
+            "id INTEGER, name TEXT, value REAL, amount INTEGER",
+        )
+        .await;
+
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: tsv_path,
+            target_table: "tsv_with_header".to_string(),
+            schema: "public".to_string(),
+            format: Format::Tsv,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: Some(true),
+            test_pool: Some(pool.clone()),
+        };
+        let result = run_load(args).await.unwrap();
+
+        assert_eq!(result.records_loaded, 1000);
+        assert_eq!(result.records_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_header_csv_without_header_flag_eats_header_as_data() {
+        // Symmetric mirror of issue #28: a header-bearing CSV loaded WITHOUT
+        // `--header` under the new 3.0.0 default (`has_header: None` → false)
+        // treats the header line as a data row. With a TEXT schema the row
+        // gets silently inserted (records_loaded = data_rows + 1), which is
+        // the failure mode the post-load `--header` advisory exists to flag.
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "header_no_flag.csv", 1000).await;
+
+        // TEXT-only schema so the header line ("id,name,value,amount") parses
+        // as a valid row instead of failing on type coercion.
+        let pool = setup_sqlite_table(
+            "header_no_flag",
+            "id TEXT, name TEXT, value TEXT, amount TEXT",
+        )
+        .await;
+
+        let result = run_csv_load_with_opts(
+            &pool,
+            "header_no_flag",
+            &csv_path,
+            None,
+            None,
+            None,
+            /* has_header */ None,
+        )
+        .await;
+
+        assert_eq!(
+            result.records_loaded, 1001,
+            "header line should be loaded as a 1001st data row when --header is not set"
+        );
+        assert_eq!(result.records_failed, 0);
+    }
+
     /// Library-API validation: `has_header: Some(_)` is meaningless with Parquet
     /// and must be rejected by `run_load` before any I/O. Mirrors the CLI's
     /// `validate_delimited_options` so library consumers don't get silent drops.
