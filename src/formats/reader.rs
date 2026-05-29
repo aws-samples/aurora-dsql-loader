@@ -173,6 +173,33 @@ impl ReaderFactory {
             }
         }
     }
+
+    /// Create a FileReader for a pg_dump source URI, scoped to a single COPY block.
+    /// Returns the reader plus the column names declared in the matching
+    /// `COPY ... (cols)` clause, in declaration order.
+    pub async fn create_pgdump_reader(
+        &self,
+        source_uri: &SourceUri,
+        schema: &str,
+        table: &str,
+    ) -> Result<(Arc<dyn FileReader>, Vec<String>)> {
+        use crate::formats::pgdump::PgDumpReader;
+        match source_uri {
+            SourceUri::Local(path) => {
+                let byte_reader = LocalFileByteReader::new(path);
+                let reader = PgDumpReader::new(byte_reader, schema, table).await?;
+                let columns = reader.columns().to_vec();
+                Ok((Arc::new(reader) as Arc<dyn FileReader>, columns))
+            }
+            SourceUri::S3 { bucket, key } => {
+                let byte_reader =
+                    S3ByteReader::new(Arc::clone(&self.s3_client), bucket.clone(), key.clone());
+                let reader = PgDumpReader::new(byte_reader, schema, table).await?;
+                let columns = reader.columns().to_vec();
+                Ok((Arc::new(reader) as Arc<dyn FileReader>, columns))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

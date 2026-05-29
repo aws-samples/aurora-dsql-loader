@@ -140,6 +140,13 @@ pub struct LoadConfig {
     on_conflict: OnConflict,
     #[builder(default)]
     exclude_columns: Vec<String>,
+    /// Column names declared in the source pg_dump's `COPY ... (cols)` clause,
+    /// in declaration order. `None` for non-pg_dump formats. When `Some`, the
+    /// coordinator verifies the target table's columns appear in the same order
+    /// before any chunk is dispatched (positional binding would silently
+    /// misalign otherwise).
+    #[builder(default)]
+    pgdump_copy_columns: Option<Vec<String>>,
 }
 
 /// Result of a completed data load operation
@@ -395,6 +402,37 @@ impl Coordinator {
         let (file_metadata, chunks) = self.create_file_chunks(config.chunk_size_bytes).await?;
 
         let mut schema = self.resolve_table_schema(config, &chunks).await?;
+
+        // pg_dump positional-binding guard: the COPY statement's column order must
+        // match the target table's column order, since worker.rs builds the INSERT
+        // column list by iterating the resolved schema in order and field N goes to
+        // column N. For non-pg_dump formats this is a no-op.
+        if let Some(copy_cols) = config.pgdump_copy_columns.as_ref() {
+            let resolved = schema.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Internal error: pg_dump load resolved no schema for {}.{}",
+                    config.schema,
+                    config.target_table
+                )
+            })?;
+            let target_names: Vec<&str> =
+                resolved.columns.iter().map(|c| c.name.as_str()).collect();
+            let copy_names: Vec<&str> = copy_cols.iter().map(|s| s.as_str()).collect();
+            if target_names != copy_names {
+                anyhow::bail!(
+                    "pg_dump column-order mismatch for {}.{}:\n  \
+                     dump COPY columns:    {:?}\n  \
+                     target table columns: {:?}\n\
+                     The loader binds fields positionally; the target table must have the same \
+                     columns in the same order as the COPY statement. Recreate the target table \
+                     to match.",
+                    config.schema,
+                    config.target_table,
+                    copy_cols,
+                    target_names,
+                );
+            }
+        }
 
         // Apply --exclude-columns before renames. Produces the effective schema
         // that downstream code uses for INSERT generation.

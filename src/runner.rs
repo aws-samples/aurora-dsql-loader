@@ -229,13 +229,24 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
 
     // Create reader factory and file reader
     let reader_factory = ReaderFactory::new(&aws_config);
-    let file_reader = reader_factory
-        .create_reader(
-            &parsed_uri,
-            args.format.to_internal(),
-            delimited_config.clone(),
-        )
-        .await?;
+    let (file_reader, pgdump_columns) = match args.format {
+        Format::PgDump => {
+            let (reader, cols) = reader_factory
+                .create_pgdump_reader(&parsed_uri, &args.schema, &args.target_table)
+                .await?;
+            (reader, Some(cols))
+        }
+        _ => {
+            let reader = reader_factory
+                .create_reader(
+                    &parsed_uri,
+                    args.format.to_internal(),
+                    delimited_config.clone(),
+                )
+                .await?;
+            (reader, None)
+        }
+    };
 
     // Determine file format config based on format
     let (has_header, file_format) = match args.format {
@@ -249,7 +260,8 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         }
         Format::Parquet => (false, FileFormat::Parquet(ParquetConfig::default())),
         Format::PgDump => {
-            anyhow::bail!("pg_dump format wiring not yet complete (Task 6/7 will finish this)")
+            use crate::coordination::manifest::PgDumpConfig;
+            (false, FileFormat::PgDump(PgDumpConfig::default()))
         }
     };
 
@@ -284,6 +296,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         .resume_job_id(args.resume_job_id)
         .on_conflict(args.on_conflict)
         .exclude_columns(args.exclude_columns)
+        .pgdump_copy_columns(pgdump_columns)
         .build()?;
 
     // Run the load
