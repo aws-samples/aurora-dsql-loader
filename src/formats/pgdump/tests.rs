@@ -1,8 +1,12 @@
 use super::escape::{DecodedField, decode_field};
+use super::reader::PgDumpReader;
 use super::scan::{ScanError, find_copy_block, list_copy_blocks};
-use crate::io::ByteReader;
+use crate::formats::FileReader;
+use crate::io::{ByteReader, LocalFileByteReader};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::io::Write;
+use tempfile::NamedTempFile;
 
 #[test]
 fn decode_plain_text() {
@@ -222,4 +226,65 @@ async fn list_copy_blocks_empty_when_no_copy_lines() {
     let reader = MockReader(b"-- preamble\nSET timezone='UTC';\n".to_vec());
     let blocks = list_copy_blocks(&reader).await.unwrap();
     assert!(blocks.is_empty());
+}
+
+#[tokio::test]
+async fn pgdump_reader_metadata_returns_block_size() {
+    let mut f = NamedTempFile::new().unwrap();
+    write!(
+        f,
+        "{}",
+        "-- preamble that should not count toward file_size_bytes\n"
+    )
+    .unwrap();
+    write!(f, "COPY public.t (a, b) FROM stdin;\n").unwrap();
+    let data_start_marker = "1\tx\n2\ty\n";
+    write!(f, "{}", data_start_marker).unwrap();
+    write!(f, "\\.\n").unwrap();
+    f.flush().unwrap();
+
+    let byte_reader = LocalFileByteReader::new(f.path());
+    let reader = PgDumpReader::new(byte_reader, "public", "t")
+        .await
+        .unwrap();
+    let meta = reader.metadata().await.unwrap();
+    assert_eq!(meta.file_size_bytes, data_start_marker.len() as u64);
+}
+
+#[tokio::test]
+async fn pgdump_reader_chunks_cover_block_only() {
+    let mut f = NamedTempFile::new().unwrap();
+    write!(f, "COPY public.t (a) FROM stdin;\n").unwrap();
+    for i in 0..50 {
+        writeln!(f, "{}", i).unwrap();
+    }
+    write!(f, "\\.\n").unwrap();
+    f.flush().unwrap();
+
+    let byte_reader = LocalFileByteReader::new(f.path());
+    let reader = PgDumpReader::new(byte_reader, "public", "t")
+        .await
+        .unwrap();
+    let meta = reader.metadata().await.unwrap();
+    let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
+    assert_eq!(chunks.len(), 1);
+    let c = &chunks[0];
+    let peek = LocalFileByteReader::new(f.path());
+    let buf = peek
+        .read_range(c.start_offset, c.end_offset)
+        .await
+        .unwrap();
+    assert!(!buf.windows(2).any(|w| w == b"\\."));
+}
+
+#[tokio::test]
+async fn pgdump_reader_columns_are_exposed() {
+    let mut f = NamedTempFile::new().unwrap();
+    write!(f, "COPY public.t (id, name) FROM stdin;\n1\tx\n\\.\n").unwrap();
+    f.flush().unwrap();
+    let byte_reader = LocalFileByteReader::new(f.path());
+    let reader = PgDumpReader::new(byte_reader, "public", "t")
+        .await
+        .unwrap();
+    assert_eq!(reader.columns(), &["id", "name"]);
 }
