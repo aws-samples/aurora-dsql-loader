@@ -136,6 +136,7 @@ struct OutputArgs {
 }
 
 #[derive(Clone, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     Load {
         #[command(flatten)]
@@ -153,6 +154,15 @@ enum Command {
         #[command(flatten)]
         output: OutputArgs,
     },
+    /// List every `COPY ... FROM stdin;` block in a pg_dump file.
+    ///
+    /// Use this to discover tables in a dump before running `load --table=...`
+    /// per table. Output is one line per table, suitable for shell scripting.
+    ListTables {
+        /// Path to a pg_dump file (local path or s3:// URI).
+        #[arg(short, long)]
+        source_uri: String,
+    },
 }
 
 #[tokio::main]
@@ -168,6 +178,14 @@ async fn main() -> anyhow::Result<()> {
             output,
         } => {
             run_loader(connection, source, target, load, output).await?;
+        }
+        Command::ListTables { source_uri } => {
+            let tables = aurora_dsql_loader::runner::list_pgdump_tables(&source_uri).await?;
+            for t in tables {
+                // Tab-separated for easy `awk`/`cut` consumption. Columns are
+                // comma-joined on the third column so each block is one line.
+                println!("{}\t{}\t{}", t.schema, t.table, t.columns.join(","));
+            }
         }
     }
     Ok(())
@@ -703,7 +721,7 @@ mod tests {
         ])
         .expect("args should parse (clap groups don't restrict by format)");
 
-        let Command::Load { source, .. } = args.command;
+        let Command::Load { source, .. } = args.command else { panic!("expected Load") };
         let err = validate_delimited_options("parquet", Format::Parquet, &source)
             .expect_err("--header on parquet must be rejected");
         let msg = err.to_string();
@@ -729,7 +747,7 @@ mod tests {
             "--dry-run",
         ])
         .expect("pgdump format should parse");
-        let Command::Load { source, .. } = args.command;
+        let Command::Load { source, .. } = args.command else { panic!("expected Load") };
         validate_delimited_options("pgdump", Format::PgDump, &source)
             .expect("no delimited options were passed");
     }
@@ -751,10 +769,27 @@ mod tests {
             "--dry-run",
         ])
         .expect("clap accepts --header (group is per-format)");
-        let Command::Load { source, .. } = args.command;
+        let Command::Load { source, .. } = args.command else { panic!("expected Load") };
         let err = validate_delimited_options("pgdump", Format::PgDump, &source)
             .expect_err("--header on pgdump must be rejected");
         assert!(err.to_string().contains("--header"));
+    }
+
+    #[test]
+    fn list_tables_subcommand_parses() {
+        let args = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "list-tables",
+            "--source-uri",
+            "/tmp/x.sql",
+        ])
+        .expect("list-tables should parse");
+        match args.command {
+            Command::ListTables { source_uri } => {
+                assert_eq!(source_uri, "/tmp/x.sql");
+            }
+            _ => panic!("expected ListTables"),
+        }
     }
 
     #[test]
@@ -772,7 +807,7 @@ mod tests {
         ])
         .expect("args should parse");
 
-        let Command::Load { source, .. } = args.command;
+        let Command::Load { source, .. } = args.command else { panic!("expected Load") };
         validate_delimited_options("parquet", Format::Parquet, &source)
             .expect("parquet load should not trigger the delimited-options error");
     }

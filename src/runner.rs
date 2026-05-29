@@ -365,6 +365,49 @@ fn validate_load_args(args: &LoadArgs) -> Result<()> {
     Ok(())
 }
 
+/// One entry per `COPY ... FROM stdin;` block in a pg_dump file.
+#[derive(Debug, Clone)]
+pub struct PgDumpTable {
+    pub schema: String,
+    pub table: String,
+    pub columns: Vec<String>,
+}
+
+/// Enumerate every COPY block in a pg_dump file, in source order.
+///
+/// Pre-flight discovery for multi-table workflows. Customers script with this
+/// today; future versions may add a built-in `--all-tables` mode that uses the
+/// same primitive internally.
+pub async fn list_pgdump_tables(source_uri: &str) -> Result<Vec<PgDumpTable>> {
+    use crate::formats::pgdump::scan::list_copy_blocks;
+    use crate::io::{LocalFileByteReader, S3ByteReader};
+
+    let parsed = SourceUri::parse(source_uri)?;
+    let blocks = match parsed {
+        SourceUri::Local(path) => {
+            let reader = LocalFileByteReader::new(&path);
+            list_copy_blocks(&reader).await?
+        }
+        SourceUri::S3 { bucket, key } => {
+            let aws_config = aws_config::defaults(BehaviorVersion::latest())
+                .load()
+                .await;
+            let s3 = std::sync::Arc::new(aws_sdk_s3::Client::new(&aws_config));
+            let reader = S3ByteReader::new(s3, bucket, key);
+            list_copy_blocks(&reader).await?
+        }
+    };
+
+    Ok(blocks
+        .into_iter()
+        .map(|b| PgDumpTable {
+            schema: b.schema,
+            table: b.table,
+            columns: b.columns,
+        })
+        .collect())
+}
+
 // Build custom delimited config if provided
 fn maybe_delimited_config(args: &LoadArgs) -> Option<DelimitedConfig> {
     if args.format.is_delimited() {
@@ -433,6 +476,42 @@ mod tests {
         args.create_table_if_missing = true;
         let err = validate_load_args(&args).unwrap_err().to_string();
         assert!(err.contains("create_table_if_missing"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_pgdump_tables_reports_each_block() -> Result<()> {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "-- preamble")?;
+        writeln!(f, "COPY public.users (id, name) FROM stdin;")?;
+        writeln!(f, "1\tAlice")?;
+        writeln!(f, "\\.")?;
+        writeln!(f, "COPY sales.orders (id, total) FROM stdin;")?;
+        writeln!(f, "1\t99")?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let tables = list_pgdump_tables(&f.path().to_string_lossy()).await?;
+
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].schema, "public");
+        assert_eq!(tables[0].table, "users");
+        assert_eq!(tables[0].columns, vec!["id", "name"]);
+        assert_eq!(tables[1].schema, "sales");
+        assert_eq!(tables[1].table, "orders");
+        assert_eq!(tables[1].columns, vec!["id", "total"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_pgdump_tables_empty_for_no_copy_blocks() -> Result<()> {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "-- nothing here")?;
+        f.flush()?;
+        let tables = list_pgdump_tables(&f.path().to_string_lossy()).await?;
+        assert!(tables.is_empty());
+        Ok(())
     }
 
     fn sample_pgdump_args() -> LoadArgs {

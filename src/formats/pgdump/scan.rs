@@ -165,8 +165,8 @@ fn parse_copy_header(line: &[u8]) -> HeaderMatch {
     if first_id.is_empty() {
         return HeaderMatch::NoMatch;
     }
-    let (schema, table, after_table) = if after_first.starts_with('.') {
-        let (second_id, after_second) = read_identifier(&after_first[1..]);
+    let (schema, table, after_table) = if let Some(rest) = after_first.strip_prefix('.') {
+        let (second_id, after_second) = read_identifier(rest);
         if second_id.is_empty() {
             return HeaderMatch::NoMatch;
         }

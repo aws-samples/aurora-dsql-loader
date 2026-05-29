@@ -231,16 +231,11 @@ async fn list_copy_blocks_empty_when_no_copy_lines() {
 #[tokio::test]
 async fn pgdump_reader_metadata_returns_block_size() {
     let mut f = NamedTempFile::new().unwrap();
-    write!(
-        f,
-        "{}",
-        "-- preamble that should not count toward file_size_bytes\n"
-    )
-    .unwrap();
-    write!(f, "COPY public.t (a, b) FROM stdin;\n").unwrap();
+    writeln!(f, "-- preamble that should not count toward file_size_bytes").unwrap();
+    writeln!(f, "COPY public.t (a, b) FROM stdin;").unwrap();
     let data_start_marker = "1\tx\n2\ty\n";
-    write!(f, "{}", data_start_marker).unwrap();
-    write!(f, "\\.\n").unwrap();
+    write!(f, "{data_start_marker}").unwrap();
+    writeln!(f, "\\.").unwrap();
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
@@ -254,11 +249,11 @@ async fn pgdump_reader_metadata_returns_block_size() {
 #[tokio::test]
 async fn pgdump_reader_chunks_cover_block_only() {
     let mut f = NamedTempFile::new().unwrap();
-    write!(f, "COPY public.t (a) FROM stdin;\n").unwrap();
+    writeln!(f, "COPY public.t (a) FROM stdin;").unwrap();
     for i in 0..50 {
-        writeln!(f, "{}", i).unwrap();
+        writeln!(f, "{i}").unwrap();
     }
-    write!(f, "\\.\n").unwrap();
+    writeln!(f, "\\.").unwrap();
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
@@ -280,7 +275,7 @@ async fn pgdump_reader_chunks_cover_block_only() {
 #[tokio::test]
 async fn pgdump_reader_columns_are_exposed() {
     let mut f = NamedTempFile::new().unwrap();
-    write!(f, "COPY public.t (id, name) FROM stdin;\n1\tx\n\\.\n").unwrap();
+    writeln!(f, "COPY public.t (id, name) FROM stdin;\n1\tx\n\\.").unwrap();
     f.flush().unwrap();
     let byte_reader = LocalFileByteReader::new(f.path());
     let reader = PgDumpReader::new(byte_reader, "public", "t")
@@ -292,11 +287,11 @@ async fn pgdump_reader_columns_are_exposed() {
 #[tokio::test]
 async fn read_chunk_decodes_rows_and_escapes() {
     let mut f = NamedTempFile::new().unwrap();
-    write!(f, "COPY public.t (a, b, c) FROM stdin;\n").unwrap();
-    write!(f, "1\thello\tworld\n").unwrap();
-    write!(f, "2\t\\N\tline\\nbreak\n").unwrap();
-    write!(f, "3\ta\\tb\t\\\\esc\n").unwrap();
-    write!(f, "\\.\n").unwrap();
+    writeln!(f, "COPY public.t (a, b, c) FROM stdin;").unwrap();
+    writeln!(f, "1\thello\tworld").unwrap();
+    writeln!(f, "2\t\\N\tline\\nbreak").unwrap();
+    writeln!(f, "3\ta\\tb\t\\\\esc").unwrap();
+    writeln!(f, "\\.").unwrap();
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
@@ -318,11 +313,11 @@ async fn read_chunk_decodes_rows_and_escapes() {
 #[tokio::test]
 async fn read_chunk_rejects_field_count_mismatch() {
     let mut f = NamedTempFile::new().unwrap();
-    write!(f, "COPY public.t (a, b) FROM stdin;\n").unwrap();
-    write!(f, "1\tx\n").unwrap();
-    write!(f, "2\ty\tEXTRA\n").unwrap();
-    write!(f, "3\tz\n").unwrap();
-    write!(f, "\\.\n").unwrap();
+    writeln!(f, "COPY public.t (a, b) FROM stdin;").unwrap();
+    writeln!(f, "1\tx").unwrap();
+    writeln!(f, "2\ty\tEXTRA").unwrap();
+    writeln!(f, "3\tz").unwrap();
+    writeln!(f, "\\.").unwrap();
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
@@ -341,11 +336,11 @@ async fn read_chunk_rejects_field_count_mismatch() {
 async fn read_chunk_handles_multi_chunk_split() {
     const ROWS: usize = 200;
     let mut f = NamedTempFile::new().unwrap();
-    write!(f, "COPY public.t (a, b) FROM stdin;\n").unwrap();
+    writeln!(f, "COPY public.t (a, b) FROM stdin;").unwrap();
     for i in 0..ROWS {
-        writeln!(f, "{}\tname_{:04}", i, i).unwrap();
+        writeln!(f, "{i}\tname_{i:04}").unwrap();
     }
-    write!(f, "\\.\n").unwrap();
+    writeln!(f, "\\.").unwrap();
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());

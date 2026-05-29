@@ -106,6 +106,28 @@ Notes:
 - `--column-map` and `--exclude-columns` are not supported (the column set is
   embedded in the dump's `COPY` statement).
 
+**Discover tables in a dump (multi-table workflows):**
+
+```bash
+$ aurora-dsql-loader list-tables --source-uri backup.sql
+public	users	id,email,created_at
+public	orders	id,user_id,total_cents,status
+sales	commissions	rep_id,amount,paid_at
+
+# Driving multi-table loads with shell:
+aurora-dsql-loader list-tables --source-uri backup.sql | while IFS=$'\t' read schema table cols; do
+  aurora-dsql-loader load \
+    --endpoint $DSQL_ENDPOINT \
+    --source-uri backup.sql \
+    --format pgdump \
+    --schema "$schema" \
+    --table "$table"
+done
+```
+
+Pre-create each target table in DSQL with the same column set in the same order
+(see the column-order error message if mismatched).
+
 ### CSV/TSV header behavior
 
 By default, the loader treats every row of a CSV or TSV file as data — it does
