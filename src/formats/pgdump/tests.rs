@@ -288,3 +288,113 @@ async fn pgdump_reader_columns_are_exposed() {
         .unwrap();
     assert_eq!(reader.columns(), &["id", "name"]);
 }
+
+#[tokio::test]
+async fn read_chunk_decodes_rows_and_escapes() {
+    let mut f = NamedTempFile::new().unwrap();
+    write!(f, "COPY public.t (a, b, c) FROM stdin;\n").unwrap();
+    write!(f, "1\thello\tworld\n").unwrap();
+    write!(f, "2\t\\N\tline\\nbreak\n").unwrap();
+    write!(f, "3\ta\\tb\t\\\\esc\n").unwrap();
+    write!(f, "\\.\n").unwrap();
+    f.flush().unwrap();
+
+    let byte_reader = LocalFileByteReader::new(f.path());
+    let reader = PgDumpReader::new(byte_reader, "public", "t")
+        .await
+        .unwrap();
+    let meta = reader.metadata().await.unwrap();
+    let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
+    let data = reader.read_chunk(&chunks[0]).await.unwrap();
+
+    assert_eq!(data.records.len(), 3);
+    assert_eq!(data.parse_errors, 0);
+
+    assert_eq!(data.records[0].fields, vec!["1", "hello", "world"]);
+    assert_eq!(data.records[1].fields, vec!["2", "", "line\nbreak"]);
+    assert_eq!(data.records[2].fields, vec!["3", "a\tb", "\\esc"]);
+}
+
+#[tokio::test]
+async fn read_chunk_rejects_field_count_mismatch() {
+    let mut f = NamedTempFile::new().unwrap();
+    write!(f, "COPY public.t (a, b) FROM stdin;\n").unwrap();
+    write!(f, "1\tx\n").unwrap();
+    write!(f, "2\ty\tEXTRA\n").unwrap();
+    write!(f, "3\tz\n").unwrap();
+    write!(f, "\\.\n").unwrap();
+    f.flush().unwrap();
+
+    let byte_reader = LocalFileByteReader::new(f.path());
+    let reader = PgDumpReader::new(byte_reader, "public", "t")
+        .await
+        .unwrap();
+    let meta = reader.metadata().await.unwrap();
+    let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
+    let data = reader.read_chunk(&chunks[0]).await.unwrap();
+
+    assert_eq!(data.records.len(), 2);
+    assert_eq!(data.parse_errors, 1);
+}
+
+#[tokio::test]
+async fn read_chunk_handles_multi_chunk_split() {
+    const ROWS: usize = 200;
+    let mut f = NamedTempFile::new().unwrap();
+    write!(f, "COPY public.t (a, b) FROM stdin;\n").unwrap();
+    for i in 0..ROWS {
+        writeln!(f, "{}\tname_{:04}", i, i).unwrap();
+    }
+    write!(f, "\\.\n").unwrap();
+    f.flush().unwrap();
+
+    let byte_reader = LocalFileByteReader::new(f.path());
+    let reader = PgDumpReader::new(byte_reader, "public", "t")
+        .await
+        .unwrap();
+    let meta = reader.metadata().await.unwrap();
+
+    let target = std::cmp::max(meta.file_size_bytes / 4, 64);
+    let chunks = reader.create_chunks(target).await.unwrap();
+    assert!(chunks.len() >= 3, "expected ≥3 chunks, got {}", chunks.len());
+
+    for w in chunks.windows(2) {
+        assert_eq!(w[0].end_offset, w[1].start_offset, "non-contiguous chunks");
+    }
+
+    let peek = LocalFileByteReader::new(f.path());
+
+    let mut total_records = 0usize;
+    for chunk in &chunks {
+        let data = reader.read_chunk(chunk).await.unwrap();
+        let raw = peek
+            .read_range(chunk.start_offset, chunk.end_offset)
+            .await
+            .unwrap();
+
+        assert!(
+            !raw.windows(2).any(|w| w == b"\\."),
+            "chunk {} leaked the \\. terminator",
+            chunk.chunk_id
+        );
+
+        let nl_count = raw.iter().filter(|&&b| b == b'\n').count();
+        assert_eq!(
+            nl_count,
+            data.records.len(),
+            "chunk {} record/line count mismatch: {} newlines vs {} records",
+            chunk.chunk_id,
+            nl_count,
+            data.records.len(),
+        );
+        assert_eq!(
+            data.parse_errors, 0,
+            "chunk {} had parse errors",
+            chunk.chunk_id
+        );
+
+        total_records += data.records.len();
+    }
+
+    assert_eq!(total_records, ROWS);
+}

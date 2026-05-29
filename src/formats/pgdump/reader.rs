@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
+use super::escape::{DecodedField, decode_field};
 use super::scan::{CopyBlock, find_copy_block};
-use crate::formats::reader::{Chunk, ChunkData, FileMetadata, FileReader};
+use crate::formats::reader::{Chunk, ChunkData, FileMetadata, FileReader, Record};
 use crate::io::{ByteReader, estimate_rows_in_range, find_next_record_boundary};
 
 /// Reader for plain pg_dump --data-only output, scoped to a single table's
@@ -71,8 +72,57 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
         Ok(chunks)
     }
 
-    async fn read_chunk(&self, _chunk: &Chunk) -> Result<ChunkData> {
-        // Implemented in Task 5.
-        anyhow::bail!("PgDumpReader::read_chunk not yet implemented")
+    async fn read_chunk(&self, chunk: &Chunk) -> Result<ChunkData> {
+        let buffer = self
+            .reader
+            .read_range(chunk.start_offset, chunk.end_offset)
+            .await
+            .context("Failed to read chunk data")?;
+
+        let expected_columns = self.block.columns.len();
+        let mut records = Vec::new();
+        let mut parse_errors = 0u64;
+
+        for line in split_lines(&buffer) {
+            // Defensive: skip the terminator if a stray chunk includes it.
+            if line == b"\\." {
+                continue;
+            }
+            if line.is_empty() {
+                continue;
+            }
+
+            let fields: Vec<String> = line
+                .split(|&b| b == b'\t')
+                .map(|raw| match decode_field(raw) {
+                    DecodedField::Value(s) => s,
+                    DecodedField::Null => String::new(),
+                })
+                .collect();
+
+            if fields.len() != expected_columns {
+                parse_errors += 1;
+                continue;
+            }
+            records.push(Record { fields });
+        }
+
+        Ok(ChunkData {
+            records,
+            bytes_read: chunk.end_offset - chunk.start_offset,
+            parse_errors,
+        })
     }
+}
+
+/// Split a byte buffer on `\n`. Strips the trailing `\r` (CRLF tolerant).
+/// Empty trailing line (after a final `\n`) is dropped.
+fn split_lines(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
+    buf.split(|&b| b == b'\n').filter_map(|line| {
+        let line = match line.last() {
+            Some(b'\r') => &line[..line.len() - 1],
+            _ => line,
+        };
+        if line.is_empty() { None } else { Some(line) }
+    })
 }
