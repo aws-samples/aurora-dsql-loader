@@ -340,6 +340,28 @@ fn validate_load_args(args: &LoadArgs) -> Result<()> {
             args.format
         ));
     }
+
+    if args.format == Format::PgDump {
+        if !args.column_mappings.is_empty() {
+            anyhow::bail!(
+                "column_mappings (--column-map) is not supported with pg_dump: \
+                 column names come from the COPY statement and cannot be remapped"
+            );
+        }
+        if !args.exclude_columns.is_empty() {
+            anyhow::bail!(
+                "exclude_columns (--exclude-columns) is not supported with pg_dump: \
+                 the column set is fixed by the COPY statement"
+            );
+        }
+        if args.create_table_if_missing {
+            anyhow::bail!(
+                "create_table_if_missing (--if-not-exists) is not supported with \
+                 pg_dump: schema inference from a COPY-format byte stream is not \
+                 implemented in v1; pre-create the target table"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -387,5 +409,58 @@ mod tests {
         // (delimiter, quote, escape, header) does not apply, so it must NOT
         // count as a delimited format for option-validation purposes.
         assert!(!Format::PgDump.is_delimited());
+    }
+
+    #[test]
+    fn pgdump_rejects_column_map_at_validation() {
+        let mut args = sample_pgdump_args();
+        args.column_mappings.insert("a".into(), "b".into());
+        let err = validate_load_args(&args).unwrap_err().to_string();
+        assert!(err.contains("column_mappings"), "{err}");
+    }
+
+    #[test]
+    fn pgdump_rejects_exclude_columns_at_validation() {
+        let mut args = sample_pgdump_args();
+        args.exclude_columns = vec!["x".into()];
+        let err = validate_load_args(&args).unwrap_err().to_string();
+        assert!(err.contains("exclude_columns"), "{err}");
+    }
+
+    #[test]
+    fn pgdump_rejects_if_not_exists_at_validation() {
+        let mut args = sample_pgdump_args();
+        args.create_table_if_missing = true;
+        let err = validate_load_args(&args).unwrap_err().to_string();
+        assert!(err.contains("create_table_if_missing"), "{err}");
+    }
+
+    fn sample_pgdump_args() -> LoadArgs {
+        LoadArgs {
+            endpoint: "x.dsql.us-east-1.on.aws".into(),
+            region: "us-east-1".into(),
+            username: "admin".into(),
+            source_uri: "/tmp/x.sql".into(),
+            target_table: "t".into(),
+            schema: "public".into(),
+            format: Format::PgDump,
+            worker_count: 1,
+            chunk_size_bytes: 1024,
+            batch_size: 1,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: Default::default(),
+            resume_job_id: None,
+            on_conflict: OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
+            test_pool: None,
+        }
     }
 }

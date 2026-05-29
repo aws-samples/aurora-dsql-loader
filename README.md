@@ -83,6 +83,29 @@ aurora-dsql-loader load \
 ```
 Listed columns are dropped from the INSERT so DSQL applies the column's `DEFAULT` expression (e.g. `gen_random_uuid()`, `CURRENT_TIMESTAMP`). Source records must still contain these columns in their original positions.
 
+**Load from a pg_dump file:**
+```bash
+# 1. Generate the dump on the source PG side:
+pg_dump --data-only --table=users mydb > users.sql
+
+# 2. Load. The target table must already exist with a compatible schema.
+aurora-dsql-loader load \
+  --endpoint your-cluster.dsql.us-east-1.on.aws \
+  --source-uri users.sql \
+  --format pgdump \
+  --table users
+```
+
+Notes:
+- Only plain (`-Fp`, the default) `pg_dump` output with `COPY FROM stdin` blocks
+  is supported. Custom (`-Fc`) and directory (`-Fd`) formats are not.
+- The dump may contain DDL and other tables; we locate the `COPY` block matching
+  `--schema.--table` and ignore the rest.
+- Run with `--data-only` to skip DDL the loader would otherwise discard. The
+  target table must exist; `--if-not-exists` is rejected for `pgdump`.
+- `--column-map` and `--exclude-columns` are not supported (the column set is
+  embedded in the dump's `COPY` statement).
+
 ### CSV/TSV header behavior
 
 By default, the loader treats every row of a CSV or TSV file as data — it does

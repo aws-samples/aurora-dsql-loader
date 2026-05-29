@@ -31,7 +31,8 @@ struct SourceArgs {
     #[arg(short, long)]
     source_uri: String,
 
-    /// File format (csv, tsv, parquet) - auto-detected from extension if not specified
+    /// File format (csv, tsv, parquet, pgdump). Auto-detected from extension
+    /// for csv/tsv/parquet; pgdump must be specified explicitly.
     #[arg(short, long)]
     format: Option<String>,
 
@@ -710,6 +711,50 @@ mod tests {
             msg.contains("--header"),
             "error should name the offending --header flag: {msg}"
         );
+    }
+
+    #[test]
+    fn pgdump_format_parses_through_cli() {
+        let args = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "/tmp/foo.sql",
+            "--format",
+            "pgdump",
+            "--table",
+            "users",
+            "--dry-run",
+        ])
+        .expect("pgdump format should parse");
+        let Command::Load { source, .. } = args.command;
+        validate_delimited_options("pgdump", Format::PgDump, &source)
+            .expect("no delimited options were passed");
+    }
+
+    #[test]
+    fn pgdump_format_rejects_delimited_options() {
+        let args = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "/tmp/foo.sql",
+            "--format",
+            "pgdump",
+            "--table",
+            "users",
+            "--header",
+            "--dry-run",
+        ])
+        .expect("clap accepts --header (group is per-format)");
+        let Command::Load { source, .. } = args.command;
+        let err = validate_delimited_options("pgdump", Format::PgDump, &source)
+            .expect_err("--header on pgdump must be rejected");
+        assert!(err.to_string().contains("--header"));
     }
 
     #[test]
