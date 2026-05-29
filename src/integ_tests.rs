@@ -3980,4 +3980,168 @@ mod tests {
             err
         );
     }
+
+    // ============ pg_dump integration tests ============
+
+    fn pgdump_load_args(
+        source_uri: String,
+        target_table: &str,
+        pool: Pool,
+    ) -> LoadArgs {
+        LoadArgs {
+            endpoint: "ignored.dsql.us-east-1.on.aws".into(),
+            region: "us-east-1".into(),
+            username: "admin".into(),
+            source_uri,
+            target_table: target_table.into(),
+            schema: "public".into(),
+            format: Format::PgDump,
+            worker_count: 1,
+            chunk_size_bytes: 1024 * 1024,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
+            test_pool: Some(pool),
+        }
+    }
+
+    #[tokio::test]
+    async fn pgdump_loads_via_run_load() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        // pg_dump-shaped fixture: real tab bytes between fields, COPY header
+        // followed by data lines, terminated by a literal `\.` line.
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "-- PostgreSQL database dump")?;
+        writeln!(f, "SET statement_timeout = 0;")?;
+        writeln!(f)?;
+        writeln!(f, "COPY public.things (id, name, note) FROM stdin;")?;
+        writeln!(f, "1\twidget\t\\N")?;
+        writeln!(f, "2\tgizmo\thas\\ttab")?;
+        writeln!(f, "3\tgadget\thello")?;
+        writeln!(f, "\\.")?;
+        writeln!(f)?;
+        f.flush()?;
+
+        let pool = setup_sqlite_table("things", "id INTEGER, name TEXT, note TEXT").await;
+        let args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            "things",
+            pool.clone(),
+        );
+
+        let result = run_load(args).await?;
+        assert_eq!(result.records_loaded, 3);
+        assert_eq!(result.records_failed, 0);
+
+        // `note` for row 1 was `\N` → loaded as SQL NULL by the worker (empty
+        // strings are coerced to NULL). Bind it as `Option<String>` so the
+        // sqlx decode path doesn't error on UnexpectedNullError before our
+        // assertions run.
+        #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+        struct ThingRow {
+            id: i64,
+            name: String,
+            note: Option<String>,
+        }
+
+        let mut conn = pool.acquire().await?;
+        let PoolConnection::Sqlite(ref mut sqlite_conn) = conn else {
+            panic!("expected sqlite pool connection in test");
+        };
+        let rows: Vec<ThingRow> =
+            sqlx::query_as("SELECT id, name, note FROM things ORDER BY id")
+                .fetch_all(&mut **sqlite_conn)
+                .await?;
+        assert_eq!(
+            rows[0],
+            ThingRow {
+                id: 1,
+                name: "widget".into(),
+                note: None
+            }
+        );
+        assert_eq!(
+            rows[1],
+            ThingRow {
+                id: 2,
+                name: "gizmo".into(),
+                note: Some("has\ttab".into())
+            }
+        );
+        assert_eq!(
+            rows[2],
+            ThingRow {
+                id: 3,
+                name: "gadget".into(),
+                note: Some("hello".into())
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pgdump_errors_when_table_not_in_dump() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.other (a) FROM stdin;")?;
+        writeln!(f, "1")?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let pool = setup_sqlite_table("missing", "a INTEGER").await;
+        let args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            "missing",
+            pool,
+        );
+
+        let err = run_load(args).await.unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("public.missing") || msg.contains("no `COPY"),
+            "expected error to name the missing block, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pgdump_errors_on_column_order_mismatch() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        // pg_dump emits (id, name, note); target table has a different order.
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.things (id, name, note) FROM stdin;")?;
+        writeln!(f, "1\twidget\thello")?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        // SQLite table created with different column order than COPY clause.
+        let pool = setup_sqlite_table("things", "name TEXT, id INTEGER, note TEXT").await;
+        let args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            "things",
+            pool,
+        );
+
+        let err = run_load(args).await.unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("column") && (msg.contains("order") || msg.contains("mismatch")),
+            "expected a column-order error, got: {msg}"
+        );
+        Ok(())
+    }
 }
