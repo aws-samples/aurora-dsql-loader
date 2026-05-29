@@ -75,6 +75,14 @@ pub struct ParquetConfig {
     // Future: row group batch size, compression settings, etc.
 }
 
+/// Configuration for pg_dump format reading.
+///
+/// Currently empty; carries no tunables. Kept as a struct rather than a unit
+/// variant so future settings (e.g. encoding override, strict-vs-lenient
+/// escapes) can be added without breaking the manifest schema.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PgDumpConfig {}
+
 /// File format and its associated configuration
 ///
 /// This enum encapsulates both the file format type and its specific configuration.
@@ -86,6 +94,7 @@ pub enum FileFormat {
     Csv(DelimitedConfig),
     Tsv(DelimitedConfig),
     Parquet(ParquetConfig),
+    PgDump(PgDumpConfig),
 }
 
 /// Information about a chunk to be processed
@@ -487,6 +496,15 @@ mod tests {
         let parquet_format = FileFormat::Parquet(ParquetConfig::default());
         let json = serde_json::to_string_pretty(&parquet_format).unwrap();
         println!("Parquet format:\n{}", json);
+    }
+
+    #[test]
+    fn pgdump_format_round_trips_through_serde() {
+        let original = FileFormat::PgDump(PgDumpConfig::default());
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: FileFormat = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, FileFormat::PgDump(_)));
+        assert!(json.contains("\"format\":\"pgdump\""));
     }
 
     #[test]

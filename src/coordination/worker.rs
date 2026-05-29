@@ -323,6 +323,7 @@ impl Worker {
             crate::coordination::manifest::FileFormat::Csv(c)
             | crate::coordination::manifest::FileFormat::Tsv(c) => c.has_header,
             crate::coordination::manifest::FileFormat::Parquet(_) => false,
+            crate::coordination::manifest::FileFormat::PgDump(_) => false,
         };
         let mut current_line = if has_header { 2u64 } else { 1u64 };
 
