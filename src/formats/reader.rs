@@ -92,6 +92,7 @@ pub enum Format {
     Csv,
     Tsv,
     Parquet,
+    PgDump,
 }
 
 /// Factory for creating FileReader instances based on URI and format
@@ -163,6 +164,12 @@ impl ReaderFactory {
                     S3ByteReader::new(Arc::clone(&self.s3_client), bucket.clone(), key.clone());
                 let reader = GenericParquetReader::new(byte_reader).await?;
                 Ok(Arc::new(reader) as Arc<dyn FileReader>)
+            }
+
+            (_, Format::PgDump) => {
+                anyhow::bail!(
+                    "internal: pg_dump format must be created via create_pgdump_reader()"
+                )
             }
         }
     }

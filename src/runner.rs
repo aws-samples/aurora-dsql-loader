@@ -29,6 +29,7 @@ pub enum Format {
     Csv,
     Tsv,
     Parquet,
+    PgDump,
 }
 
 impl Format {
@@ -38,8 +39,9 @@ impl Format {
             "csv" => Ok(Format::Csv),
             "tsv" => Ok(Format::Tsv),
             "parquet" => Ok(Format::Parquet),
+            "pgdump" => Ok(Format::PgDump),
             _ => Err(anyhow::anyhow!(
-                "Unsupported format: {}. Supported formats: csv, tsv, parquet",
+                "Unsupported format: {}. Supported formats: csv, tsv, parquet, pgdump",
                 s
             )),
         }
@@ -51,6 +53,7 @@ impl Format {
             Format::Csv => crate::formats::Format::Csv,
             Format::Tsv => crate::formats::Format::Tsv,
             Format::Parquet => crate::formats::Format::Parquet,
+            Format::PgDump => crate::formats::Format::PgDump,
         }
     }
 
@@ -245,6 +248,9 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
             (config.has_header, FileFormat::Tsv(config))
         }
         Format::Parquet => (false, FileFormat::Parquet(ParquetConfig::default())),
+        Format::PgDump => {
+            anyhow::bail!("pg_dump format wiring not yet complete (Task 6/7 will finish this)")
+        }
     };
 
     // Create manifest storage
@@ -349,5 +355,24 @@ fn maybe_delimited_config(args: &LoadArgs) -> Option<DelimitedConfig> {
         Some(config)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_parse_accepts_pgdump() {
+        assert_eq!(Format::parse("pgdump").unwrap(), Format::PgDump);
+        assert_eq!(Format::parse("PGDUMP").unwrap(), Format::PgDump);
+    }
+
+    #[test]
+    fn format_pgdump_is_not_delimited() {
+        // pg_dump uses delimited-ish parsing internally but its CLI surface
+        // (delimiter, quote, escape, header) does not apply, so it must NOT
+        // count as a delimited format for option-validation purposes.
+        assert!(!Format::PgDump.is_delimited());
     }
 }
