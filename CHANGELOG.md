@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- New `--format pgdump` option to load data directly from `pg_dump --data-only`
+  output. Locates the `COPY <schema>.<table> FROM stdin;` block matching the
+  target table, ignores DDL and other tables, and decodes PG COPY text-format
+  escape sequences (`\N`, `\t`, `\\`, `\xHH`, `\NNN`, etc.). The target table
+  must already exist; `--if-not-exists`, `--column-map`, and `--exclude-columns`
+  are rejected for this format.
+- New `list-tables` subcommand that enumerates every `COPY ... FROM stdin;`
+  block in a pg_dump file. Drives multi-table migrations by feeding into a
+  shell loop of `load --table=...` invocations.
+
 ## [3.0.0] - 2026-05-26
 
 ### Changed
