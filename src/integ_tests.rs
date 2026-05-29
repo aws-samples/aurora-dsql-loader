@@ -4118,6 +4118,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pgdump_real_fixture_loads() -> anyhow::Result<()> {
+        let pool = setup_sqlite_table(
+            "pg_loader_test_things",
+            "id INTEGER, name TEXT, note TEXT",
+        )
+        .await;
+
+        let args = pgdump_load_args(
+            "tests/fixtures/pgdump_simple.sql".into(),
+            "pg_loader_test_things",
+            pool,
+        );
+
+        let result = run_load(args).await?;
+        assert_eq!(result.records_loaded, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pgdump_errors_on_column_order_mismatch() -> anyhow::Result<()> {
         use std::io::Write;
 
