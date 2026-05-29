@@ -1,4 +1,8 @@
 use super::escape::{DecodedField, decode_field};
+use super::scan::{ScanError, find_copy_block, list_copy_blocks};
+use crate::io::ByteReader;
+use anyhow::Result;
+use async_trait::async_trait;
 
 #[test]
 fn decode_plain_text() {
@@ -65,4 +69,157 @@ fn decode_trailing_backslash_passes_through() {
 fn decode_multi_byte_utf8() {
     let bytes = "café".as_bytes();
     assert_eq!(decode_field(bytes), DecodedField::Value("café".into()));
+}
+
+struct MockReader(Vec<u8>);
+
+#[async_trait]
+impl ByteReader for MockReader {
+    async fn size(&self) -> Result<u64> {
+        Ok(self.0.len() as u64)
+    }
+    async fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+        let s = start as usize;
+        let e = std::cmp::min(end as usize, self.0.len());
+        Ok(self.0[s..e].to_vec())
+    }
+}
+
+const SAMPLE: &[u8] = b"\
+--\n\
+-- PostgreSQL database dump\n\
+--\n\
+\n\
+SET statement_timeout = 0;\n\
+\n\
+COPY public.users (id, name, email) FROM stdin;\n\
+1\tAlice\talice@example.com\n\
+2\tBob\tbob@example.com\n\
+\\.\n\
+\n\
+COPY public.orders (id, user_id) FROM stdin;\n\
+1\t1\n\
+\\.\n\
+\n";
+
+#[tokio::test]
+async fn finds_users_block() {
+    let reader = MockReader(SAMPLE.to_vec());
+    let block = find_copy_block(&reader, "public", "users").await.unwrap();
+    assert_eq!(block.columns, vec!["id", "name", "email"]);
+    let data = &SAMPLE[block.data_start as usize..block.data_end as usize];
+    let s = std::str::from_utf8(data).unwrap();
+    assert!(s.starts_with("1\tAlice"));
+    assert!(s.ends_with("@example.com\n"));
+    assert_eq!(
+        &SAMPLE[block.data_end as usize..block.data_end as usize + 2],
+        b"\\."
+    );
+}
+
+#[tokio::test]
+async fn finds_orders_block() {
+    let reader = MockReader(SAMPLE.to_vec());
+    let block = find_copy_block(&reader, "public", "orders").await.unwrap();
+    assert_eq!(block.columns, vec!["id", "user_id"]);
+}
+
+#[tokio::test]
+async fn missing_table_errors() {
+    let reader = MockReader(SAMPLE.to_vec());
+    let err = find_copy_block(&reader, "public", "nonexistent")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<ScanError>(),
+        Some(ScanError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn schema_must_match() {
+    let reader = MockReader(SAMPLE.to_vec());
+    let err = find_copy_block(&reader, "sales", "users").await.unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<ScanError>(),
+        Some(ScanError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn case_insensitive_copy_keyword() {
+    let data = b"copy public.t (a) from stdin;\n1\n\\.\n";
+    let reader = MockReader(data.to_vec());
+    let block = find_copy_block(&reader, "public", "t").await.unwrap();
+    assert_eq!(block.columns, vec!["a"]);
+}
+
+#[tokio::test]
+async fn no_column_list_is_supported() {
+    let data = b"COPY public.t FROM stdin;\n1\ta\n\\.\n";
+    let reader = MockReader(data.to_vec());
+    let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<ScanError>(),
+        Some(ScanError::MissingColumnList { .. })
+    ));
+}
+
+#[tokio::test]
+async fn quoted_identifiers_are_unquoted() {
+    let data = b"COPY \"public\".\"My Table\" (\"col one\", \"col-two\") FROM stdin;\n1\t2\n\\.\n";
+    let reader = MockReader(data.to_vec());
+    let block = find_copy_block(&reader, "public", "My Table")
+        .await
+        .unwrap();
+    assert_eq!(block.columns, vec!["col one", "col-two"]);
+}
+
+#[tokio::test]
+async fn duplicate_block_errors() {
+    let data = b"\
+COPY public.t (a) FROM stdin;\n\
+1\n\
+\\.\n\
+COPY public.t (a) FROM stdin;\n\
+2\n\
+\\.\n";
+    let reader = MockReader(data.to_vec());
+    let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<ScanError>(),
+        Some(ScanError::Duplicate { .. })
+    ));
+}
+
+#[tokio::test]
+async fn missing_terminator_errors() {
+    let data = b"COPY public.t (a) FROM stdin;\n1\n";
+    let reader = MockReader(data.to_vec());
+    let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<ScanError>(),
+        Some(ScanError::MissingTerminator { .. })
+    ));
+}
+
+#[tokio::test]
+async fn list_copy_blocks_returns_all_blocks_in_order() {
+    let reader = MockReader(SAMPLE.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].schema, "public");
+    assert_eq!(blocks[0].table, "users");
+    assert_eq!(blocks[0].columns, vec!["id", "name", "email"]);
+    assert_eq!(blocks[1].schema, "public");
+    assert_eq!(blocks[1].table, "orders");
+    assert_eq!(blocks[1].columns, vec!["id", "user_id"]);
+    assert!(blocks[0].data_start < blocks[1].data_start);
+}
+
+#[tokio::test]
+async fn list_copy_blocks_empty_when_no_copy_lines() {
+    let reader = MockReader(b"-- preamble\nSET timezone='UTC';\n".to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert!(blocks.is_empty());
 }

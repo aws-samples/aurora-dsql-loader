@@ -5,6 +5,7 @@
 
 mod escape;
 mod reader;
+pub mod scan;
 
 #[cfg(test)]
 mod tests;
