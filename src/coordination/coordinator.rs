@@ -116,25 +116,31 @@ const MAX_SCHEMA_INFERENCE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 /// pg_dump positional-binding guard: the COPY statement's column order must
 /// match the target table's column order, since worker.rs builds the INSERT
 /// column list by iterating the resolved schema in order and field N goes to
-/// column N. Runs on both fresh and resumed loads.
+/// column N. Called from both `setup_new_job` and `setup_resume_job` (the
+/// resume site re-runs against the live target schema to catch ALTER TABLE
+/// between runs).
 ///
 /// No-op for non-pg_dump formats. For pg_dump loads where `copy_columns` is
-/// `None` (only possible on a fresh load whose runner forgot to populate the
-/// field — in practice the runner always does — never reached on resume since
-/// the runner re-scans the source on every invocation), the function logs a
-/// warning and returns `Ok` rather than failing, since failing would block
-/// every load.
+/// `None` (in practice, the in-memory `LoadConfig` always has it populated by
+/// runner.rs on every fresh and resume invocation; this branch is reachable
+/// only via library callers constructing `LoadConfig` directly with a default
+/// `PgDumpConfig`), the function bails. A silent skip-with-warn was the prior
+/// behavior, but since the entire purpose of this function is to prevent
+/// silent positional misalignment, "skipping the guard" is the worst possible
+/// failure mode.
 fn check_pgdump_column_order(config: &LoadConfig, schema: Option<&Schema>) -> Result<()> {
     let FileFormat::PgDump(pg) = &config.file_format else {
         return Ok(());
     };
     let Some(copy_cols) = pg.copy_columns.as_ref() else {
-        warn!(
-            "pg_dump load for {}.{} has no recorded COPY columns; positional-binding guard skipped. \
-             Verify your target table column order matches the source dump.",
-            config.schema, config.target_table
+        anyhow::bail!(
+            "pg_dump load for {}.{} has no recorded COPY columns; positional-binding guard \
+             cannot run. The CLI / `runner::run_load` always populates this field; if you are \
+             constructing `LoadConfig` directly, set `FileFormat::PgDump(PgDumpConfig {{ \
+             copy_columns: Some(<the COPY statement's columns>) }})`.",
+            config.schema,
+            config.target_table
         );
-        return Ok(());
     };
     let resolved = schema.ok_or_else(|| {
         anyhow::anyhow!(
@@ -594,6 +600,27 @@ impl Coordinator {
                  Current size: {} bytes",
                 manifest.total_size_bytes,
                 current_metadata.file_size_bytes
+            ));
+        }
+
+        // pg_dump: catch a source edit that changed the COPY column list while
+        // leaving the file size unchanged (e.g. swapping two columns in the
+        // header without altering data). Chunks in the manifest were created
+        // against the original byte ranges; a different positional column
+        // mapping would silently corrupt every loaded row.
+        if let (FileFormat::PgDump(manifest_pg), FileFormat::PgDump(config_pg)) =
+            (&manifest.file_format, &config.file_format)
+            && manifest_pg.copy_columns != config_pg.copy_columns
+        {
+            return Err(anyhow::anyhow!(
+                "Cannot resume: pg_dump COPY column list changed between runs.\n\
+                 Manifest columns: {:?}\n\
+                 Current columns:  {:?}\n\
+                 The chunks in the manifest were positioned against the \
+                 original column list; resuming with a different list would \
+                 silently misalign data. Start a fresh load.",
+                manifest_pg.copy_columns,
+                config_pg.copy_columns,
             ));
         }
 

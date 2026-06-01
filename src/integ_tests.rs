@@ -4137,13 +4137,26 @@ mod tests {
 
         // SQLite table created with different column order than COPY clause.
         let pool = setup_sqlite_table("things", "name TEXT, id INTEGER, note TEXT").await;
-        let args = pgdump_load_args(f.path().to_string_lossy().into_owned(), "things", pool);
+        let args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            "things",
+            pool.clone(),
+        );
 
         let err = run_load(args).await.unwrap_err();
         let msg = format!("{:#}", err);
         assert!(
             msg.contains("column") && (msg.contains("order") || msg.contains("mismatch")),
             "expected a column-order error, got: {msg}"
+        );
+
+        // The guard must reject before any chunk is loaded; otherwise a
+        // regression to "warn and continue" would silently corrupt the table
+        // by binding `1` → name, `widget` → id, `hello` → note.
+        assert_eq!(
+            get_table_count(&pool, "things").await,
+            0,
+            "column-order guard must reject before any rows are inserted"
         );
         Ok(())
     }

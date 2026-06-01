@@ -13,6 +13,15 @@
   block in a pg_dump file. Drives multi-table migrations by feeding into a
   shell loop of `load --table=...` invocations.
 
+### Changed
+- `--schema` and `--table` (all formats) now reject identifiers containing
+  embedded `"`, `\`, NUL, control bytes, or Unicode bidi/format codepoints
+  (RLM, LRM, RTL/LTR overrides, ZWSP, BOM, line/paragraph separators, bidi
+  isolates). These bytes corrupt SQL identifier quoting or visually deceive
+  operators reading load logs. Existing customers using only ASCII letters,
+  digits, and underscore are unaffected; customers using PG quoted
+  identifiers with non-Latin characters are also unaffected.
+
 ## [3.0.0] - 2026-05-26
 
 ### Changed

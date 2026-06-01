@@ -15,7 +15,8 @@ use crate::io::{ByteReader, estimate_rows_in_range, find_next_record_boundary};
 /// empty string here. The downstream worker (`coordination/worker.rs`)
 /// already maps empty strings to SQL NULL during binding, so functionally
 /// `\N → NULL` survives end-to-end. The trade-off is that real empty strings
-/// and NULLs become indistinguishable; if your dataset depends on that
+/// AND whitespace-only strings (the worker `trim()`s before the empty check)
+/// become indistinguishable from NULL; if your dataset depends on either
 /// distinction, do not use `--format pgdump` until proper `Option<String>`
 /// fidelity lands.
 pub struct PgDumpReader<R: ByteReader> {
@@ -114,9 +115,7 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
                 .split(|&b| b == b'\t')
                 .map(|raw| match decode_field(raw) {
                     DecodedField::Value(s) => s,
-                    // \N collapses to "" so the worker's empty-string-as-NULL
-                    // binding takes over. See PgDumpReader's docstring for
-                    // the trade-off and the future-fidelity revisit point.
+                    // See PgDumpReader rustdoc for the \N → "" trade-off.
                     DecodedField::Null => String::new(),
                 })
                 .collect();

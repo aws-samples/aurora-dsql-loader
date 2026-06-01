@@ -15,7 +15,7 @@ pub enum ScanError {
     NotFound { schema: String, table: String },
 
     #[error(
-        "`COPY {schema}.{table}` block has no column list - re-run pg_dump without `--column-inserts` and ensure the source PG version emits column lists"
+        "`COPY {schema}.{table}` block has no column list - the loader binds fields positionally and requires explicit column names. Ensure the source pg_dump emits `COPY t (cols) FROM stdin;` rather than `COPY t FROM stdin;`"
     )]
     MissingColumnList { schema: String, table: String },
 
@@ -300,9 +300,11 @@ const MAX_HEADER_LINE_BYTES: usize = 1024 * 1024;
 /// Cap on per-line buffer growth when scanning COPY data lines for the `\.`
 /// terminator. PostgreSQL TOAST allows attribute values up to ~1 GB; a JSONB
 /// or BYTEA column on a single COPY line can legitimately be very large, so
-/// the cap is generous. The bound exists only to backstop a truncated/
-/// malformed file with no newline at all — if you genuinely have a single
-/// row larger than 1 GB, this cap will need raising.
+/// this cap is 1024× the header cap. The bound exists only to backstop a
+/// truncated/malformed file with no newline at all — if you genuinely have a
+/// single row larger than 1 GB, this cap will need raising. Do not
+/// "harmonize" the two: header lines are kilobytes, data lines can carry
+/// whole TOASTed values.
 const MAX_DATA_LINE_BYTES: usize = 1024 * 1024 * 1024;
 
 fn line_too_long(pos: u64, cap: usize) -> anyhow::Error {
@@ -352,20 +354,57 @@ async fn skip_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<u64> 
 
 /// Find the `\.` line that terminates a COPY data section. Returns the byte
 /// offset of the start of that line (i.e. the end of the data range).
+///
+/// Streams the data range chunk-by-chunk and tests only the first three bytes
+/// after each newline (`\\`, `.`, then `\n` or `\r`). Crucially does NOT
+/// buffer entire data lines: a TOASTed value can legitimately be hundreds of
+/// MB and we do not need its content, only its newline boundaries. Bounded
+/// by `MAX_DATA_LINE_BYTES` only as a malformed-file backstop on the
+/// per-line span between newlines.
 async fn find_terminator(reader: &dyn ByteReader, start: u64, size: u64) -> Result<Option<u64>> {
+    let mut line_start = start;
     let mut p = start;
+    let mut span: usize = 0;
     while p < size {
-        let line = read_line(reader, p, size, MAX_DATA_LINE_BYTES).await?;
-        if line.is_empty() {
-            return Ok(None);
+        let end = std::cmp::min(p + CHUNK_SIZE as u64, size);
+        let buf = reader.read_range(p, end).await?;
+        if buf.is_empty() {
+            break;
         }
-        let content = strip_eol(&line);
-        if content == b"\\." {
-            return Ok(Some(p));
+        for (i, &b) in buf.iter().enumerate() {
+            if b == b'\n' {
+                let nl_offset = p + i as u64;
+                let line_len = (nl_offset + 1) - line_start;
+                if is_terminator_line(reader, line_start, line_len).await? {
+                    return Ok(Some(line_start));
+                }
+                line_start = nl_offset + 1;
+                span = 0;
+            } else {
+                span = span.saturating_add(1);
+                if span > MAX_DATA_LINE_BYTES {
+                    return Err(line_too_long(line_start, MAX_DATA_LINE_BYTES));
+                }
+            }
         }
-        p += line.len() as u64;
+        p = end;
     }
     Ok(None)
+}
+
+/// Cheap check: does the line at `line_start` of length `line_len` (including
+/// the trailing `\n`) consist of `\.` optionally followed by `\r`? Reads at
+/// most 3 bytes; the caller already located the `\n`.
+async fn is_terminator_line(
+    reader: &dyn ByteReader,
+    line_start: u64,
+    line_len: u64,
+) -> Result<bool> {
+    if line_len != 3 && line_len != 4 {
+        return Ok(false);
+    }
+    let head = reader.read_range(line_start, line_start + line_len).await?;
+    Ok(strip_eol(&head) == b"\\.")
 }
 
 fn strip_eol(mut s: &[u8]) -> &[u8] {

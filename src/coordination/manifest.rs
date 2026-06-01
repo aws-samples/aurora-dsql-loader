@@ -80,13 +80,15 @@ pub struct ParquetConfig {
 /// `copy_columns` carries the column names declared in the source dump's
 /// `COPY ... (cols)` clause, in declaration order. The runner re-scans the
 /// source on every invocation (including resume) and rebuilds this field
-/// from the live scan — the persisted value is a forensic record of what
-/// was loaded, not a runtime input. The structural reason this lives on
-/// `PgDumpConfig` rather than as a sidecar field on `LoadConfig` is that
-/// nesting collapses the cross-field invariant `(file_format == PgDump
-/// ↔ copy_columns == Some)` and lets the builder enforce it. `None` for
-/// jobs persisted before this field existed.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// from the live scan, so the in-memory value is always fresh; the persisted
+/// value is what was originally loaded and is compared against the freshly
+/// scanned value during `verify_resume_compatibility` to catch a source edit
+/// that changed the COPY column list while keeping the file size unchanged.
+/// `None` is reserved for backwards compatibility with manifests written
+/// before this field existed; library callers constructing `LoadConfig`
+/// directly must populate `copy_columns` or the column-order guard will
+/// bail.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PgDumpConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_columns: Option<Vec<String>>,
@@ -514,6 +516,26 @@ mod tests {
         let parsed: FileFormat = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, FileFormat::PgDump(_)));
         assert!(json.contains("\"format\":\"pgdump\""));
+    }
+
+    #[test]
+    fn pgdump_format_round_trips_with_populated_copy_columns() {
+        // The fresh-load runtime path always persists Some(columns); a serde
+        // rename or skip-attribute regression on `copy_columns` would silently
+        // downgrade resume to the (now-bailing) None path.
+        let original = FileFormat::PgDump(PgDumpConfig {
+            copy_columns: Some(vec!["id".into(), "name".into(), "note".into()]),
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: FileFormat = serde_json::from_str(&json).unwrap();
+        let FileFormat::PgDump(pg) = parsed else {
+            panic!("expected FileFormat::PgDump, got {parsed:?}");
+        };
+        assert_eq!(
+            pg.copy_columns,
+            Some(vec!["id".into(), "name".into(), "note".into()])
+        );
+        assert!(json.contains("copy_columns"));
     }
 
     #[test]

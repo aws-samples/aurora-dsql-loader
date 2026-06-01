@@ -386,17 +386,33 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("--{field} must not be empty");
     }
-    if value
-        .chars()
-        .any(|c| c.is_control() || c == '"' || c == '\\' || c == '\0')
-    {
+    if value.chars().any(is_unsafe_identifier_char) {
         anyhow::bail!(
             "--{field} {value:?} contains an unsafe character (control byte, \
-             backslash, or double-quote) that would corrupt SQL identifier quoting. \
-             Rename the table or use a quoted identifier in your DB instead."
+             backslash, double-quote, or Unicode bidi/format codepoint) that would \
+             corrupt SQL identifier quoting or visually deceive an operator reading \
+             logs. Rename the table or use a quoted identifier in your DB instead."
         );
     }
     Ok(())
+}
+
+/// Identifier-safety predicate shared between `validate_identifier` (CLI args)
+/// and the equivalent guard on `list-tables` output. The Unicode bidi/format
+/// codepoints are visually invisible or reorder surrounding text in a
+/// terminal, which would let a deceptive `--table` value confuse an operator
+/// reading load logs even though they cannot escape SQL identifier quoting.
+fn is_unsafe_identifier_char(c: char) -> bool {
+    if c.is_control() || c == '"' || c == '\\' || c == '\0' {
+        return true;
+    }
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// One entry per `COPY ... FROM stdin;` block in a pg_dump file.
@@ -514,8 +530,21 @@ mod tests {
         validate_identifier("table", "users").unwrap();
         validate_identifier("schema", "public").unwrap();
         // Non-ASCII letters are allowed (PG quoted identifiers may contain
-        // them); we only reject control bytes / quote / backslash / NUL.
+        // them); we only reject control bytes / quote / backslash / NUL /
+        // bidi+format codepoints.
         validate_identifier("table", "naïve").unwrap();
+    }
+
+    #[test]
+    fn validate_identifier_rejects_bidi_and_format_codepoints() {
+        // RTL override (would visually reverse trailing characters in logs)
+        assert!(validate_identifier("table", "ev\u{202E}lit").is_err());
+        // Zero-width space (invisible character splitting an identifier)
+        assert!(validate_identifier("table", "us\u{200B}ers").is_err());
+        // BOM / ZWNBSP
+        assert!(validate_identifier("schema", "\u{FEFF}public").is_err());
+        // Bidi isolate
+        assert!(validate_identifier("table", "x\u{2066}y").is_err());
     }
 
     #[test]

@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
             // TTY before we bail. Tab-separated, one block per line, for
             // downstream `awk`/`cut` consumption.
             for t in &tables {
-                if let Err(name) = check_listable(t) {
+                if let Some(name) = check_listable(t) {
                     anyhow::bail!(
                         "list-tables: identifier {name:?} contains a tab, newline, \
                          control byte, or Unicode bidi/format character that would \
@@ -437,19 +437,17 @@ async fn run_loader(
 /// - Comma — would mis-parse the comma-joined third TSV field on column
 ///   names. The schema and table fields occupy their own tab-separated slots
 ///   so a comma there does not ambiguate framing; checked only on columns.
-fn check_listable(t: &aurora_dsql_loader::runner::PgDumpTable) -> Result<(), &str> {
+fn check_listable(t: &aurora_dsql_loader::runner::PgDumpTable) -> Option<&str> {
     if t.schema.contains(is_unsafe_for_listing) {
-        return Err(&t.schema);
+        return Some(&t.schema);
     }
     if t.table.contains(is_unsafe_for_listing) {
-        return Err(&t.table);
+        return Some(&t.table);
     }
-    for col in &t.columns {
-        if col.contains(is_unsafe_for_listing) || col.contains(',') {
-            return Err(col);
-        }
-    }
-    Ok(())
+    t.columns
+        .iter()
+        .find(|col| col.contains(is_unsafe_for_listing) || col.contains(','))
+        .map(String::as_str)
 }
 
 fn is_unsafe_for_listing(c: char) -> bool {
@@ -862,7 +860,7 @@ mod tests {
             table: "users".into(),
             columns: vec!["id".into(), "name".into()],
         };
-        assert!(check_listable(&t).is_ok());
+        assert!(check_listable(&t).is_none());
     }
 
     #[test]
@@ -872,7 +870,7 @@ mod tests {
             table: "bad\tname".into(),
             columns: vec!["id".into()],
         };
-        assert!(check_listable(&t).is_err());
+        assert!(check_listable(&t).is_some());
     }
 
     #[test]
@@ -882,7 +880,7 @@ mod tests {
             table: "users".into(),
             columns: vec!["id".into(), "broken\nname".into()],
         };
-        assert!(check_listable(&t).is_err());
+        assert!(check_listable(&t).is_some());
     }
 
     #[test]
@@ -892,7 +890,7 @@ mod tests {
             table: "x\x1b]0;OWNED\x07".into(),
             columns: vec!["id".into()],
         };
-        assert!(check_listable(&t).is_err());
+        assert!(check_listable(&t).is_some());
     }
 
     #[test]
@@ -903,7 +901,7 @@ mod tests {
             table: "users".into(),
             columns: vec!["a,b".into()],
         };
-        assert!(check_listable(&t).is_err());
+        assert!(check_listable(&t).is_some());
     }
 
     #[test]
@@ -916,7 +914,7 @@ mod tests {
             table: "evil\u{202E}name".into(),
             columns: vec!["id".into()],
         };
-        assert!(check_listable(&t).is_err());
+        assert!(check_listable(&t).is_some());
     }
 
     #[test]
@@ -926,7 +924,7 @@ mod tests {
             table: "users".into(),
             columns: vec!["id\u{200B}hidden".into()],
         };
-        assert!(check_listable(&t).is_err());
+        assert!(check_listable(&t).is_some());
     }
 
     #[test]
@@ -936,7 +934,7 @@ mod tests {
             table: "users".into(),
             columns: vec!["id".into()],
         };
-        assert!(check_listable(&t).is_err());
+        assert!(check_listable(&t).is_some());
     }
 
     #[test]
