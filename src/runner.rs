@@ -393,9 +393,7 @@ pub async fn list_pgdump_tables(source_uri: &str) -> Result<Vec<PgDumpTable>> {
             list_copy_blocks(&reader).await?
         }
         SourceUri::S3 { bucket, key } => {
-            let aws_config = aws_config::defaults(BehaviorVersion::latest())
-                .load()
-                .await;
+            let aws_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
             let s3 = std::sync::Arc::new(aws_sdk_s3::Client::new(&aws_config));
             let reader = S3ByteReader::new(s3, bucket, key);
             list_copy_blocks(&reader).await?

@@ -721,7 +721,9 @@ mod tests {
         ])
         .expect("args should parse (clap groups don't restrict by format)");
 
-        let Command::Load { source, .. } = args.command else { panic!("expected Load") };
+        let Command::Load { source, .. } = args.command else {
+            panic!("expected Load")
+        };
         let err = validate_delimited_options("parquet", Format::Parquet, &source)
             .expect_err("--header on parquet must be rejected");
         let msg = err.to_string();
@@ -747,7 +749,9 @@ mod tests {
             "--dry-run",
         ])
         .expect("pgdump format should parse");
-        let Command::Load { source, .. } = args.command else { panic!("expected Load") };
+        let Command::Load { source, .. } = args.command else {
+            panic!("expected Load")
+        };
         validate_delimited_options("pgdump", Format::PgDump, &source)
             .expect("no delimited options were passed");
     }
@@ -769,7 +773,9 @@ mod tests {
             "--dry-run",
         ])
         .expect("clap accepts --header (group is per-format)");
-        let Command::Load { source, .. } = args.command else { panic!("expected Load") };
+        let Command::Load { source, .. } = args.command else {
+            panic!("expected Load")
+        };
         let err = validate_delimited_options("pgdump", Format::PgDump, &source)
             .expect_err("--header on pgdump must be rejected");
         assert!(err.to_string().contains("--header"));
@@ -807,7 +813,9 @@ mod tests {
         ])
         .expect("args should parse");
 
-        let Command::Load { source, .. } = args.command else { panic!("expected Load") };
+        let Command::Load { source, .. } = args.command else {
+            panic!("expected Load")
+        };
         validate_delimited_options("parquet", Format::Parquet, &source)
             .expect("parquet load should not trigger the delimited-options error");
     }

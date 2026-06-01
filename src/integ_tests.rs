@@ -3983,11 +3983,7 @@ mod tests {
 
     // ============ pg_dump integration tests ============
 
-    fn pgdump_load_args(
-        source_uri: String,
-        target_table: &str,
-        pool: Pool,
-    ) -> LoadArgs {
+    fn pgdump_load_args(source_uri: String, target_table: &str, pool: Pool) -> LoadArgs {
         LoadArgs {
             endpoint: "ignored.dsql.us-east-1.on.aws".into(),
             region: "us-east-1".into(),
@@ -4060,10 +4056,9 @@ mod tests {
         let PoolConnection::Sqlite(ref mut sqlite_conn) = conn else {
             panic!("expected sqlite pool connection in test");
         };
-        let rows: Vec<ThingRow> =
-            sqlx::query_as("SELECT id, name, note FROM things ORDER BY id")
-                .fetch_all(&mut **sqlite_conn)
-                .await?;
+        let rows: Vec<ThingRow> = sqlx::query_as("SELECT id, name, note FROM things ORDER BY id")
+            .fetch_all(&mut **sqlite_conn)
+            .await?;
         assert_eq!(
             rows[0],
             ThingRow {
@@ -4102,11 +4097,7 @@ mod tests {
         f.flush()?;
 
         let pool = setup_sqlite_table("missing", "a INTEGER").await;
-        let args = pgdump_load_args(
-            f.path().to_string_lossy().into_owned(),
-            "missing",
-            pool,
-        );
+        let args = pgdump_load_args(f.path().to_string_lossy().into_owned(), "missing", pool);
 
         let err = run_load(args).await.unwrap_err();
         let msg = format!("{:#}", err);
@@ -4119,11 +4110,8 @@ mod tests {
 
     #[tokio::test]
     async fn pgdump_real_fixture_loads() -> anyhow::Result<()> {
-        let pool = setup_sqlite_table(
-            "pg_loader_test_things",
-            "id INTEGER, name TEXT, note TEXT",
-        )
-        .await;
+        let pool =
+            setup_sqlite_table("pg_loader_test_things", "id INTEGER, name TEXT, note TEXT").await;
 
         let args = pgdump_load_args(
             "tests/fixtures/pgdump_simple.sql".into(),
@@ -4149,11 +4137,7 @@ mod tests {
 
         // SQLite table created with different column order than COPY clause.
         let pool = setup_sqlite_table("things", "name TEXT, id INTEGER, note TEXT").await;
-        let args = pgdump_load_args(
-            f.path().to_string_lossy().into_owned(),
-            "things",
-            pool,
-        );
+        let args = pgdump_load_args(f.path().to_string_lossy().into_owned(), "things", pool);
 
         let err = run_load(args).await.unwrap_err();
         let msg = format!("{:#}", err);

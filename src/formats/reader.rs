@@ -167,9 +167,7 @@ impl ReaderFactory {
             }
 
             (_, Format::PgDump) => {
-                anyhow::bail!(
-                    "internal: pg_dump format must be created via create_pgdump_reader()"
-                )
+                anyhow::bail!("internal: pg_dump format must be created via create_pgdump_reader()")
             }
         }
     }

@@ -143,7 +143,9 @@ async fn missing_table_errors() {
 #[tokio::test]
 async fn schema_must_match() {
     let reader = MockReader(SAMPLE.to_vec());
-    let err = find_copy_block(&reader, "sales", "users").await.unwrap_err();
+    let err = find_copy_block(&reader, "sales", "users")
+        .await
+        .unwrap_err();
     assert!(matches!(
         err.downcast_ref::<ScanError>(),
         Some(ScanError::NotFound { .. })
@@ -231,7 +233,11 @@ async fn list_copy_blocks_empty_when_no_copy_lines() {
 #[tokio::test]
 async fn pgdump_reader_metadata_returns_block_size() {
     let mut f = NamedTempFile::new().unwrap();
-    writeln!(f, "-- preamble that should not count toward file_size_bytes").unwrap();
+    writeln!(
+        f,
+        "-- preamble that should not count toward file_size_bytes"
+    )
+    .unwrap();
     writeln!(f, "COPY public.t (a, b) FROM stdin;").unwrap();
     let data_bytes = b"1\tx\n2\ty\n";
     f.write_all(data_bytes).unwrap();
@@ -239,9 +245,7 @@ async fn pgdump_reader_metadata_returns_block_size() {
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
-    let reader = PgDumpReader::new(byte_reader, "public", "t")
-        .await
-        .unwrap();
+    let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
     let meta = reader.metadata().await.unwrap();
     assert_eq!(meta.file_size_bytes, data_bytes.len() as u64);
 
@@ -268,18 +272,13 @@ async fn pgdump_reader_chunks_cover_block_only() {
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
-    let reader = PgDumpReader::new(byte_reader, "public", "t")
-        .await
-        .unwrap();
+    let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
     let meta = reader.metadata().await.unwrap();
     let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
     assert_eq!(chunks.len(), 1);
     let c = &chunks[0];
     let peek = LocalFileByteReader::new(f.path());
-    let buf = peek
-        .read_range(c.start_offset, c.end_offset)
-        .await
-        .unwrap();
+    let buf = peek.read_range(c.start_offset, c.end_offset).await.unwrap();
     assert!(!buf.windows(2).any(|w| w == b"\\."));
 }
 
@@ -289,9 +288,7 @@ async fn pgdump_reader_columns_are_exposed() {
     writeln!(f, "COPY public.t (id, name) FROM stdin;\n1\tx\n\\.").unwrap();
     f.flush().unwrap();
     let byte_reader = LocalFileByteReader::new(f.path());
-    let reader = PgDumpReader::new(byte_reader, "public", "t")
-        .await
-        .unwrap();
+    let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
     assert_eq!(reader.columns(), &["id", "name"]);
 }
 
@@ -306,9 +303,7 @@ async fn read_chunk_decodes_rows_and_escapes() {
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
-    let reader = PgDumpReader::new(byte_reader, "public", "t")
-        .await
-        .unwrap();
+    let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
     let meta = reader.metadata().await.unwrap();
     let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
     let data = reader.read_chunk(&chunks[0]).await.unwrap();
@@ -332,9 +327,7 @@ async fn read_chunk_rejects_field_count_mismatch() {
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
-    let reader = PgDumpReader::new(byte_reader, "public", "t")
-        .await
-        .unwrap();
+    let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
     let meta = reader.metadata().await.unwrap();
     let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
     let data = reader.read_chunk(&chunks[0]).await.unwrap();
@@ -356,9 +349,7 @@ async fn read_chunk_counts_blank_lines_as_parse_errors() {
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
-    let reader = PgDumpReader::new(byte_reader, "public", "t")
-        .await
-        .unwrap();
+    let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
     let meta = reader.metadata().await.unwrap();
     let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
     let data = reader.read_chunk(&chunks[0]).await.unwrap();
@@ -379,14 +370,16 @@ async fn read_chunk_handles_multi_chunk_split() {
     f.flush().unwrap();
 
     let byte_reader = LocalFileByteReader::new(f.path());
-    let reader = PgDumpReader::new(byte_reader, "public", "t")
-        .await
-        .unwrap();
+    let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
     let meta = reader.metadata().await.unwrap();
 
     let target = std::cmp::max(meta.file_size_bytes / 4, 64);
     let chunks = reader.create_chunks(target).await.unwrap();
-    assert!(chunks.len() >= 3, "expected ≥3 chunks, got {}", chunks.len());
+    assert!(
+        chunks.len() >= 3,
+        "expected ≥3 chunks, got {}",
+        chunks.len()
+    );
 
     for w in chunks.windows(2) {
         assert_eq!(w[0].end_offset, w[1].start_offset, "non-contiguous chunks");
