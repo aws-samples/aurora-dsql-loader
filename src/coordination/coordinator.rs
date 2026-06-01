@@ -116,14 +116,24 @@ const MAX_SCHEMA_INFERENCE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 /// pg_dump positional-binding guard: the COPY statement's column order must
 /// match the target table's column order, since worker.rs builds the INSERT
 /// column list by iterating the resolved schema in order and field N goes to
-/// column N. No-op for non-pg_dump formats and for jobs persisted before the
-/// COPY columns were tracked in the manifest. Runs on both fresh and resumed
-/// loads.
+/// column N. Runs on both fresh and resumed loads.
+///
+/// No-op for non-pg_dump formats. For pg_dump loads where `copy_columns` is
+/// `None` (only possible on a fresh load whose runner forgot to populate the
+/// field — in practice the runner always does — never reached on resume since
+/// the runner re-scans the source on every invocation), the function logs a
+/// warning and returns `Ok` rather than failing, since failing would block
+/// every load.
 fn check_pgdump_column_order(config: &LoadConfig, schema: Option<&Schema>) -> Result<()> {
     let FileFormat::PgDump(pg) = &config.file_format else {
         return Ok(());
     };
     let Some(copy_cols) = pg.copy_columns.as_ref() else {
+        warn!(
+            "pg_dump load for {}.{} has no recorded COPY columns; positional-binding guard skipped. \
+             Verify your target table column order matches the source dump.",
+            config.schema, config.target_table
+        );
         return Ok(());
     };
     let resolved = schema.ok_or_else(|| {

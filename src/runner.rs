@@ -336,6 +336,9 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
 /// Mirrors the CLI's `validate_delimited_options` so library consumers calling
 /// `run_load` directly get the same feedback as CLI users.
 fn validate_load_args(args: &LoadArgs) -> Result<()> {
+    validate_identifier("schema", &args.schema)?;
+    validate_identifier("table", &args.target_table)?;
+
     let has_delimited_options = args.delimiter.is_some()
         || args.quote.is_some()
         || args.escape.is_some()
@@ -369,6 +372,29 @@ fn validate_load_args(args: &LoadArgs) -> Result<()> {
                  implemented in v1; pre-create the target table"
             );
         }
+    }
+    Ok(())
+}
+
+/// Reject SQL-identifier inputs (`--schema`, `--table`) that would break
+/// downstream identifier quoting. `Pool::qualified_table_name` interpolates
+/// the value into `format!("\"{}\"", …)` without escape-doubling embedded
+/// quotes, and the worker's INSERT generation does the same with column
+/// names. Rejecting embedded `"` and control bytes here closes the otherwise
+/// open path from CLI args into raw SQL.
+fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("--{field} must not be empty");
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() || c == '"' || c == '\\' || c == '\0')
+    {
+        anyhow::bail!(
+            "--{field} {value:?} contains an unsafe character (control byte, \
+             backslash, or double-quote) that would corrupt SQL identifier quoting. \
+             Rename the table or use a quoted identifier in your DB instead."
+        );
     }
     Ok(())
 }
@@ -458,6 +484,38 @@ mod tests {
     #[test]
     fn format_pgdump_is_not_delimited() {
         assert!(!Format::PgDump.is_delimited());
+    }
+
+    #[test]
+    fn validate_identifier_rejects_embedded_quote() {
+        let err = validate_identifier("table", "x\";DROP TABLE y;--").unwrap_err();
+        assert!(err.to_string().contains("unsafe character"));
+    }
+
+    #[test]
+    fn validate_identifier_rejects_backslash() {
+        let err = validate_identifier("table", "a\\b").unwrap_err();
+        assert!(err.to_string().contains("unsafe character"));
+    }
+
+    #[test]
+    fn validate_identifier_rejects_control_byte() {
+        let err = validate_identifier("schema", "a\x1bb").unwrap_err();
+        assert!(err.to_string().contains("unsafe character"));
+    }
+
+    #[test]
+    fn validate_identifier_rejects_empty() {
+        assert!(validate_identifier("table", "").is_err());
+    }
+
+    #[test]
+    fn validate_identifier_accepts_normal_names() {
+        validate_identifier("table", "users").unwrap();
+        validate_identifier("schema", "public").unwrap();
+        // Non-ASCII letters are allowed (PG quoted identifiers may contain
+        // them); we only reject control bytes / quote / backslash / NUL.
+        validate_identifier("table", "naïve").unwrap();
     }
 
     #[test]

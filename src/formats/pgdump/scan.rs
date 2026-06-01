@@ -26,6 +26,11 @@ pub enum ScanError {
         "`COPY {schema}.{table}` block is missing the `\\.` terminator - file may be truncated"
     )]
     MissingTerminator { schema: String, table: String },
+
+    #[error(
+        "`COPY {schema}.{table}` block has a malformed column list (unterminated quoted identifier, missing close paren, or empty list)"
+    )]
+    MalformedColumnList { schema: String, table: String },
 }
 
 /// The byte range and metadata for a located COPY block.
@@ -49,6 +54,11 @@ enum HeaderMatch {
     NoMatch,
     /// Header parsed but has no column list — caller raises `MissingColumnList`.
     NoColumnList { schema: String, table: String },
+    /// Header started parsing as `COPY <schema>.<table> (` but the column list
+    /// is malformed — caller raises `MalformedColumnList`. Distinct from
+    /// `NoMatch` so the operator gets a specific diagnostic instead of a
+    /// downstream "table not found" or "missing terminator".
+    MalformedColumnList { schema: String, table: String },
     /// Header parsed with a column list.
     Matched {
         schema: String,
@@ -71,7 +81,7 @@ pub async fn list_copy_blocks(reader: &dyn ByteReader) -> Result<Vec<CopyBlock>>
     let mut blocks = Vec::new();
 
     while pos < size {
-        let line = read_line(reader, pos, size).await?;
+        let line = read_line(reader, pos, size, MAX_HEADER_LINE_BYTES).await?;
         if line.is_empty() {
             break;
         }
@@ -83,6 +93,9 @@ pub async fn list_copy_blocks(reader: &dyn ByteReader) -> Result<Vec<CopyBlock>>
             }
             HeaderMatch::NoColumnList { schema, table } => {
                 return Err(ScanError::MissingColumnList { schema, table }.into());
+            }
+            HeaderMatch::MalformedColumnList { schema, table } => {
+                return Err(ScanError::MalformedColumnList { schema, table }.into());
             }
             HeaderMatch::Matched {
                 schema,
@@ -118,16 +131,16 @@ pub async fn find_copy_block(
     schema: &str,
     table: &str,
 ) -> Result<CopyBlock> {
-    let mut matching = list_copy_blocks(reader)
+    let mut matches = list_copy_blocks(reader)
         .await?
         .into_iter()
         .filter(|b| b.schema == schema && b.table == table);
 
-    let first = matching.next().ok_or_else(|| ScanError::NotFound {
+    let first = matches.next().ok_or_else(|| ScanError::NotFound {
         schema: schema.into(),
         table: table.into(),
     })?;
-    if matching.next().is_some() {
+    if matches.next().is_some() {
         return Err(ScanError::Duplicate {
             schema: schema.into(),
             table: table.into(),
@@ -179,10 +192,14 @@ fn parse_copy_header(line: &[u8]) -> HeaderMatch {
     }
 
     let Some((columns, after_paren)) = read_column_list(&after_table[1..]) else {
-        return HeaderMatch::NoMatch;
+        // Reaching here means the line started with `COPY <schema>.<table> (`
+        // — i.e. it IS a COPY header — but the column list itself is broken.
+        // Surface that distinctly so the operator gets a precise diagnostic
+        // instead of a downstream "table not found" / "missing terminator".
+        return HeaderMatch::MalformedColumnList { schema, table };
     };
     if !check_from_stdin(after_paren.trim_start()) {
-        return HeaderMatch::NoMatch;
+        return HeaderMatch::MalformedColumnList { schema, table };
     }
 
     HeaderMatch::Matched {
@@ -275,15 +292,30 @@ fn read_identifier(s: &str) -> (String, &str) {
     }
 }
 
-/// Cap the buffer growth in `read_line` so a pathological input (a giant
-/// file with no `\n` byte at all) cannot OOM the loader. 64 MiB is far above
-/// any realistic pg_dump line — even a multi-MB JSONB or BYTEA value fits.
-const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// Cap on per-line buffer growth when scanning the SQL preamble for `COPY`
+/// headers. Real pg_dump headers are kilobytes; 1 MiB is comfortable headroom
+/// while keeping a no-newline pathological input from OOMing the loader.
+const MAX_HEADER_LINE_BYTES: usize = 1024 * 1024;
+
+/// Cap on per-line buffer growth when scanning COPY data lines for the `\.`
+/// terminator. PostgreSQL TOAST allows attribute values up to ~1 GB; a JSONB
+/// or BYTEA column on a single COPY line can legitimately be very large, so
+/// the cap is generous. The bound exists only to backstop a truncated/
+/// malformed file with no newline at all — if you genuinely have a single
+/// row larger than 1 GB, this cap will need raising.
+const MAX_DATA_LINE_BYTES: usize = 1024 * 1024 * 1024;
+
+fn line_too_long(pos: u64, cap: usize) -> anyhow::Error {
+    anyhow::anyhow!(
+        "pg_dump line at offset {pos} exceeds {cap} bytes \
+         (likely a malformed or non-text file)"
+    )
+}
 
 /// Read one line starting at `pos`. Returns bytes including the trailing `\n`
 /// (if any). Reads in CHUNK_SIZE blocks. The returned Vec may be empty if
-/// `pos >= size`. Errors if a single line exceeds `MAX_LINE_BYTES`.
-async fn read_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<Vec<u8>> {
+/// `pos >= size`. Errors if a single line exceeds `cap` bytes.
+async fn read_line(reader: &dyn ByteReader, pos: u64, size: u64, cap: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut p = pos;
     while p < size {
@@ -293,20 +325,14 @@ async fn read_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<Vec<u
             break;
         }
         if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-            if out.len().saturating_add(nl + 1) > MAX_LINE_BYTES {
-                anyhow::bail!(
-                    "pg_dump line at offset {pos} exceeds {MAX_LINE_BYTES} bytes \
-                     (likely a malformed or non-text file)"
-                );
+            if out.len().saturating_add(nl + 1) > cap {
+                return Err(line_too_long(pos, cap));
             }
             out.extend_from_slice(&buf[..=nl]);
             return Ok(out);
         }
-        if out.len().saturating_add(buf.len()) > MAX_LINE_BYTES {
-            anyhow::bail!(
-                "pg_dump line at offset {pos} exceeds {MAX_LINE_BYTES} bytes \
-                 (likely a malformed or non-text file)"
-            );
+        if out.len().saturating_add(buf.len()) > cap {
+            return Err(line_too_long(pos, cap));
         }
         out.extend_from_slice(&buf);
         p = end;
@@ -315,8 +341,13 @@ async fn read_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<Vec<u
 }
 
 /// Skip past one line; return the byte offset of the start of the next line.
+/// Used only for stepping past `\.` terminators between COPY blocks, so the
+/// generous data-line cap is appropriate.
 async fn skip_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<u64> {
-    Ok(pos + read_line(reader, pos, size).await?.len() as u64)
+    Ok(pos
+        + read_line(reader, pos, size, MAX_DATA_LINE_BYTES)
+            .await?
+            .len() as u64)
 }
 
 /// Find the `\.` line that terminates a COPY data section. Returns the byte
@@ -324,7 +355,7 @@ async fn skip_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<u64> 
 async fn find_terminator(reader: &dyn ByteReader, start: u64, size: u64) -> Result<Option<u64>> {
     let mut p = start;
     while p < size {
-        let line = read_line(reader, p, size).await?;
+        let line = read_line(reader, p, size, MAX_DATA_LINE_BYTES).await?;
         if line.is_empty() {
             return Ok(None);
         }

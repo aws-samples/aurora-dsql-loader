@@ -78,10 +78,13 @@ pub struct ParquetConfig {
 /// Configuration for pg_dump format reading.
 ///
 /// `copy_columns` carries the column names declared in the source dump's
-/// `COPY ... (cols)` clause, in declaration order. The coordinator's
-/// column-order guard reads this on every load (fresh and resumed) — keeping
-/// it inside the manifest's `FileFormat` payload means the guard survives
-/// resume, where `LoadConfig` is reconstructed from the manifest. `None` for
+/// `COPY ... (cols)` clause, in declaration order. The runner re-scans the
+/// source on every invocation (including resume) and rebuilds this field
+/// from the live scan — the persisted value is a forensic record of what
+/// was loaded, not a runtime input. The structural reason this lives on
+/// `PgDumpConfig` rather than as a sidecar field on `LoadConfig` is that
+/// nesting collapses the cross-field invariant `(file_format == PgDump
+/// ↔ copy_columns == Some)` and lets the builder enforce it. `None` for
 /// jobs persisted before this field existed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PgDumpConfig {
