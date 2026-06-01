@@ -1121,6 +1121,61 @@ mod exclusion_tests {
         assert_eq!(names, vec!["name", "email"]);
     }
 
+    fn mk_pgdump_load_config(copy_columns: Option<Vec<String>>) -> LoadConfig {
+        use crate::coordination::manifest::PgDumpConfig;
+        LoadConfigBuilder::default()
+            .source_uri("dummy".to_string())
+            .target_table("things".to_string())
+            .schema("public".to_string())
+            .dsql_config(DsqlConfig {
+                endpoint: "ignored".into(),
+                region: "us-east-1".into(),
+                username: "admin".into(),
+            })
+            .worker_count(1)
+            .chunk_size_bytes(1024)
+            .batch_size(10)
+            .batch_concurrency(1)
+            .create_table_if_missing(false)
+            .file_format(FileFormat::PgDump(PgDumpConfig { copy_columns }))
+            .quiet(true)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn check_pgdump_column_order_bails_when_copy_columns_missing() {
+        // Iteration-2 behavior: a library caller constructing LoadConfig with
+        // FileFormat::PgDump(PgDumpConfig::default()) (copy_columns: None)
+        // must hit a hard error rather than the prior warn-and-skip path.
+        // Skipping the guard would let positional misalignment through silently.
+        let config = mk_pgdump_load_config(None);
+        let schema = mk_schema(&["id", "name", "note"]);
+        let err = check_pgdump_column_order(&config, Some(&schema))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no recorded COPY columns"), "{err}");
+        assert!(err.contains("public.things"), "{err}");
+    }
+
+    #[test]
+    fn check_pgdump_column_order_accepts_matching_columns() {
+        let config = mk_pgdump_load_config(Some(vec!["id".into(), "name".into(), "note".into()]));
+        let schema = mk_schema(&["id", "name", "note"]);
+        check_pgdump_column_order(&config, Some(&schema)).unwrap();
+    }
+
+    #[test]
+    fn check_pgdump_column_order_rejects_reordered_columns() {
+        let config = mk_pgdump_load_config(Some(vec!["id".into(), "name".into(), "note".into()]));
+        // Target table column order swapped vs the COPY clause.
+        let schema = mk_schema(&["name", "id", "note"]);
+        let err = check_pgdump_column_order(&config, Some(&schema))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("column-order mismatch"), "{err}");
+    }
+
     #[test]
     fn validate_conflict_columns_all_excluded_do_update_errors() {
         let err = validate_conflict_columns_not_all_excluded(

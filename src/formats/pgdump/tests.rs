@@ -585,6 +585,21 @@ async fn read_chunk_handles_chunk_boundary_at_record_edge() {
 }
 
 #[tokio::test]
+async fn find_terminator_handles_eof_without_trailing_newline() {
+    // pg_dump always emits `\.\n`, but a hand-truncated or interrupted file
+    // may end exactly at `\.` with no final `\n`. The bytewise scanner must
+    // still recognize the terminator at EOF. Pinning this so a future
+    // refactor of find_terminator doesn't accidentally regress it.
+    let data = b"COPY public.t (a) FROM stdin;\n1\n2\n\\.";
+    let reader = MockReader(data.to_vec());
+    let block = find_copy_block(&reader, "public", "t").await.unwrap();
+    assert_eq!(block.columns, vec!["a"]);
+    // data_end points to the start of the `\.` line (offset of the `\\` byte).
+    let expected_data_end = data.len() as u64 - 2; // \. is the last 2 bytes
+    assert_eq!(block.data_end, expected_data_end);
+}
+
+#[tokio::test]
 async fn read_chunk_handles_crlf_line_endings() {
     // pg_dump on Windows-flavored paths can produce CRLF; split_lines strips
     // the trailing \r per line. Assert decoded fields don't carry stray \r.

@@ -355,16 +355,20 @@ async fn skip_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<u64> 
 /// Find the `\.` line that terminates a COPY data section. Returns the byte
 /// offset of the start of that line (i.e. the end of the data range).
 ///
-/// Streams the data range chunk-by-chunk and tests only the first three bytes
-/// after each newline (`\\`, `.`, then `\n` or `\r`). Crucially does NOT
-/// buffer entire data lines: a TOASTed value can legitimately be hundreds of
-/// MB and we do not need its content, only its newline boundaries. Bounded
-/// by `MAX_DATA_LINE_BYTES` only as a malformed-file backstop on the
-/// per-line span between newlines.
+/// Streams the data range chunk-by-chunk and tracks just the first two bytes
+/// of each line plus its span — enough to recognize a `\.` terminator (with
+/// optional `\r` before the `\n`) without re-reading or buffering the line
+/// body. A TOASTed value can legitimately be hundreds of MB and we do not
+/// need its content, only its newline boundaries. Bounded by
+/// `MAX_DATA_LINE_BYTES` only as a malformed-file backstop on the per-line
+/// span between newlines.
 async fn find_terminator(reader: &dyn ByteReader, start: u64, size: u64) -> Result<Option<u64>> {
     let mut line_start = start;
     let mut p = start;
     let mut span: usize = 0;
+    let mut first_byte: u8 = 0;
+    let mut second_byte: u8 = 0;
+    let mut last_byte: u8 = 0;
     while p < size {
         let end = std::cmp::min(p + CHUNK_SIZE as u64, size);
         let buf = reader.read_range(p, end).await?;
@@ -373,14 +377,18 @@ async fn find_terminator(reader: &dyn ByteReader, start: u64, size: u64) -> Resu
         }
         for (i, &b) in buf.iter().enumerate() {
             if b == b'\n' {
-                let nl_offset = p + i as u64;
-                let line_len = (nl_offset + 1) - line_start;
-                if is_terminator_line(reader, line_start, line_len).await? {
+                if is_terminator_pattern(span, first_byte, second_byte, last_byte) {
                     return Ok(Some(line_start));
                 }
-                line_start = nl_offset + 1;
+                line_start = p + i as u64 + 1;
                 span = 0;
             } else {
+                if span == 0 {
+                    first_byte = b;
+                } else if span == 1 {
+                    second_byte = b;
+                }
+                last_byte = b;
                 span = span.saturating_add(1);
                 if span > MAX_DATA_LINE_BYTES {
                     return Err(line_too_long(line_start, MAX_DATA_LINE_BYTES));
@@ -389,27 +397,16 @@ async fn find_terminator(reader: &dyn ByteReader, start: u64, size: u64) -> Resu
         }
         p = end;
     }
+    // EOF without trailing newline: pg_dump always emits `\.\n`, but a
+    // hand-truncated or interrupted file may end exactly at `\.` with no
+    // newline. The old read_line-based scanner handled this; preserve.
+    if is_terminator_pattern(span, first_byte, second_byte, last_byte) {
+        return Ok(Some(line_start));
+    }
     Ok(None)
 }
 
-/// Cheap check: does the line at `line_start` of length `line_len` (including
-/// the trailing `\n`) consist of `\.` optionally followed by `\r`? Reads at
-/// most 3 bytes; the caller already located the `\n`.
-async fn is_terminator_line(
-    reader: &dyn ByteReader,
-    line_start: u64,
-    line_len: u64,
-) -> Result<bool> {
-    if line_len != 3 && line_len != 4 {
-        return Ok(false);
-    }
-    let head = reader.read_range(line_start, line_start + line_len).await?;
-    Ok(strip_eol(&head) == b"\\.")
-}
-
-fn strip_eol(mut s: &[u8]) -> &[u8] {
-    while let Some(&b'\n' | &b'\r') = s.last() {
-        s = &s[..s.len() - 1];
-    }
-    s
+fn is_terminator_pattern(span: usize, first: u8, second: u8, last: u8) -> bool {
+    (span == 2 && first == b'\\' && second == b'.')
+        || (span == 3 && first == b'\\' && second == b'.' && last == b'\r')
 }
