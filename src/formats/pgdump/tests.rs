@@ -233,8 +233,8 @@ async fn pgdump_reader_metadata_returns_block_size() {
     let mut f = NamedTempFile::new().unwrap();
     writeln!(f, "-- preamble that should not count toward file_size_bytes").unwrap();
     writeln!(f, "COPY public.t (a, b) FROM stdin;").unwrap();
-    let data_start_marker = "1\tx\n2\ty\n";
-    write!(f, "{data_start_marker}").unwrap();
+    let data_bytes = b"1\tx\n2\ty\n";
+    f.write_all(data_bytes).unwrap();
     writeln!(f, "\\.").unwrap();
     f.flush().unwrap();
 
@@ -243,7 +243,18 @@ async fn pgdump_reader_metadata_returns_block_size() {
         .await
         .unwrap();
     let meta = reader.metadata().await.unwrap();
-    assert_eq!(meta.file_size_bytes, data_start_marker.len() as u64);
+    assert_eq!(meta.file_size_bytes, data_bytes.len() as u64);
+
+    // Verify the block bounds map to exactly the data lines, with no
+    // preamble bleed-in at the start nor `\.` bleed-in at the end.
+    let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
+    assert_eq!(chunks.len(), 1);
+    let peek = LocalFileByteReader::new(f.path());
+    let raw = peek
+        .read_range(chunks[0].start_offset, chunks[0].end_offset)
+        .await
+        .unwrap();
+    assert_eq!(raw, data_bytes);
 }
 
 #[tokio::test]
@@ -317,6 +328,30 @@ async fn read_chunk_rejects_field_count_mismatch() {
     writeln!(f, "1\tx").unwrap();
     writeln!(f, "2\ty\tEXTRA").unwrap();
     writeln!(f, "3\tz").unwrap();
+    writeln!(f, "\\.").unwrap();
+    f.flush().unwrap();
+
+    let byte_reader = LocalFileByteReader::new(f.path());
+    let reader = PgDumpReader::new(byte_reader, "public", "t")
+        .await
+        .unwrap();
+    let meta = reader.metadata().await.unwrap();
+    let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
+    let data = reader.read_chunk(&chunks[0]).await.unwrap();
+
+    assert_eq!(data.records.len(), 2);
+    assert_eq!(data.parse_errors, 1);
+}
+
+#[tokio::test]
+async fn read_chunk_counts_blank_lines_as_parse_errors() {
+    // pg_dump never emits blank lines inside a COPY block; if we see one it's
+    // structural corruption. Surface as parse_error rather than silently skip.
+    let mut f = NamedTempFile::new().unwrap();
+    writeln!(f, "COPY public.t (a, b) FROM stdin;").unwrap();
+    writeln!(f, "1\tx").unwrap();
+    writeln!(f).unwrap();
+    writeln!(f, "2\ty").unwrap();
     writeln!(f, "\\.").unwrap();
     f.flush().unwrap();
 

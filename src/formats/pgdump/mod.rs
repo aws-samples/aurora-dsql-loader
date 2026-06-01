@@ -5,9 +5,10 @@
 
 mod escape;
 mod reader;
-pub mod scan;
+mod scan;
 
 #[cfg(test)]
 mod tests;
 
 pub use reader::PgDumpReader;
+pub use scan::list_copy_blocks;

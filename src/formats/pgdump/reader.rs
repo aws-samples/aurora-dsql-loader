@@ -84,11 +84,11 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
         let mut parse_errors = 0u64;
 
         for line in split_lines(&buffer) {
-            // Defensive: skip the terminator if a stray chunk includes it.
-            if line == b"\\." {
-                continue;
-            }
+            // pg_dump emits exactly one record per non-terminator line; an empty
+            // line in COPY data is structural corruption, not a row to skip.
+            // Surface it as a parse error rather than silently dropping it.
             if line.is_empty() {
+                parse_errors += 1;
                 continue;
             }
 
@@ -115,14 +115,19 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
     }
 }
 
-/// Split a byte buffer on `\n`. Strips the trailing `\r` (CRLF tolerant).
-/// Empty trailing line (after a final `\n`) is dropped.
+/// Split a byte buffer on `\n`. Strips trailing `\r` (CRLF tolerant). The
+/// trailing empty element produced by a final `\n` is dropped; intermediate
+/// empty lines are preserved so callers can flag them as corruption.
 fn split_lines(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
-    buf.split(|&b| b == b'\n').filter_map(|line| {
-        let line = match line.last() {
+    let mut parts: Vec<&[u8]> = buf
+        .split(|&b| b == b'\n')
+        .map(|line| match line.last() {
             Some(b'\r') => &line[..line.len() - 1],
             _ => line,
-        };
-        if line.is_empty() { None } else { Some(line) }
-    })
+        })
+        .collect();
+    if matches!(parts.last(), Some(last) if last.is_empty()) {
+        parts.pop();
+    }
+    parts.into_iter()
 }

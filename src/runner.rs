@@ -57,7 +57,11 @@ impl Format {
         }
     }
 
-    /// Check if this format is a delimited text format (CSV/TSV)
+    /// Whether the format is delimited text (CSV/TSV) — i.e. whether the CLI's
+    /// `--delimiter`/`--quote`/`--escape`/`--header` knobs apply. pg_dump uses
+    /// delimited-ish parsing internally but exposes none of those knobs to the
+    /// user (separator is fixed, header is the COPY statement), so it returns
+    /// `false`.
     pub fn is_delimited(self) -> bool {
         matches!(self, Format::Csv | Format::Tsv)
     }
@@ -379,7 +383,7 @@ pub struct PgDumpTable {
 /// today; future versions may add a built-in `--all-tables` mode that uses the
 /// same primitive internally.
 pub async fn list_pgdump_tables(source_uri: &str) -> Result<Vec<PgDumpTable>> {
-    use crate::formats::pgdump::scan::list_copy_blocks;
+    use crate::formats::pgdump::list_copy_blocks;
     use crate::io::{LocalFileByteReader, S3ByteReader};
 
     let parsed = SourceUri::parse(source_uri)?;
@@ -448,9 +452,6 @@ mod tests {
 
     #[test]
     fn format_pgdump_is_not_delimited() {
-        // pg_dump uses delimited-ish parsing internally but its CLI surface
-        // (delimiter, quote, escape, header) does not apply, so it must NOT
-        // count as a delimited format for option-validation purposes.
         assert!(!Format::PgDump.is_delimited());
     }
 
