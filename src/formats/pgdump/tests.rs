@@ -57,11 +57,10 @@ fn decode_unknown_escape_drops_backslash() {
 
 #[test]
 fn decode_backslash_n_inside_value_is_not_null() {
-    // \N is only NULL when it is the entire field.
-    assert_eq!(
-        decode_field(b"x\\N"),
-        DecodedField::Value("xN".into()) // \N → N (unknown escape rule)
-    );
+    // \N is only NULL when it is the entire field. As a per-character escape
+    // it falls into the unknown-escape arm, where the backslash is dropped
+    // and the `N` passes through, so b"x\\N" decodes to "xN".
+    assert_eq!(decode_field(b"x\\N"), DecodedField::Value("xN".into()));
 }
 
 #[test]
@@ -420,4 +419,65 @@ async fn read_chunk_handles_multi_chunk_split() {
     }
 
     assert_eq!(total_records, ROWS);
+}
+
+#[tokio::test]
+async fn quoted_identifier_preserves_utf8_multibyte() {
+    // PG quoted identifiers may contain non-ASCII (UTF-8) characters; pg_dump
+    // emits the bytes verbatim. The scanner must round-trip them, not Latin-1
+    // mangle them through `byte as char`.
+    let data = "COPY \"public\".\"naïve\" (\"café\") FROM stdin;\n1\n\\.\n".as_bytes();
+    let reader = MockReader(data.to_vec());
+    let block = find_copy_block(&reader, "public", "naïve").await.unwrap();
+    assert_eq!(block.table, "naïve");
+    assert_eq!(block.columns, vec!["café"]);
+}
+
+#[tokio::test]
+async fn quoted_column_list_handles_paren_and_comma_inside_quotes() {
+    // A column named `c)d` must not truncate the column list; a column named
+    // `a,b` must not be split. Both are legal PG quoted identifiers.
+    let data = b"COPY public.weird (\"a,b\", normal, \"c)d\") FROM stdin;\n1\t2\t3\n\\.\n";
+    let reader = MockReader(data.to_vec());
+    let block = find_copy_block(&reader, "public", "weird").await.unwrap();
+    assert_eq!(block.columns, vec!["a,b", "normal", "c)d"]);
+}
+
+#[tokio::test]
+async fn quoted_identifier_with_escaped_quote_round_trips() {
+    // A literal `"` inside a quoted identifier is escaped as `""`.
+    let data = b"COPY public.\"weird\"\"name\" (a) FROM stdin;\n1\n\\.\n";
+    let reader = MockReader(data.to_vec());
+    let block = find_copy_block(&reader, "public", "weird\"name")
+        .await
+        .unwrap();
+    assert_eq!(block.columns, vec!["a"]);
+}
+
+#[tokio::test]
+async fn read_line_rejects_pathological_unbounded_input() {
+    // A "line" with no newline byte must not buffer unboundedly. We feed a
+    // synthetic >MAX_LINE_BYTES blob via a small header so list_copy_blocks
+    // exercises the read_line path.
+    use crate::io::ByteReader;
+    struct GiantNoNewline(u64);
+    #[async_trait::async_trait]
+    impl ByteReader for GiantNoNewline {
+        async fn size(&self) -> anyhow::Result<u64> {
+            Ok(self.0)
+        }
+        async fn read_range(&self, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
+            // Return all 'x' bytes — never a newline.
+            let len = (end - start) as usize;
+            Ok(vec![b'x'; len])
+        }
+    }
+    // 65 MiB > MAX_LINE_BYTES (64 MiB) — must error, not OOM.
+    let reader = GiantNoNewline(65 * 1024 * 1024);
+    let err = list_copy_blocks(&reader).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds") && msg.contains("bytes"),
+        "expected size-cap error, got: {msg}"
+    );
 }

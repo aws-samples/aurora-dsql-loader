@@ -59,12 +59,12 @@ enum HeaderMatch {
 
 /// List **all** `COPY ... FROM stdin;` blocks in the file in source order.
 ///
-/// This is the primitive for both single-table loading (Task 7.5 picks the
-/// matching block) and listing/multi-table workflows (Task 12 enumerates).
-/// Errors on a header that has no column list, or on a block missing its
-/// `\.` terminator. Does **not** error on duplicates — that check belongs
-/// to the caller, since multi-table workflows may legitimately want to load
-/// each occurrence (though pg_dump never produces duplicates).
+/// Used by `find_copy_block` (single-table load) and `list_pgdump_tables`
+/// (multi-table discovery). Errors on a header that has no column list, or
+/// on a block missing its `\.` terminator. Does **not** error on duplicates
+/// — that check belongs to the caller, since multi-table workflows may
+/// legitimately want to load each occurrence (though pg_dump never produces
+/// duplicates in practice).
 pub async fn list_copy_blocks(reader: &dyn ByteReader) -> Result<Vec<CopyBlock>> {
     let size = reader.size().await?;
     let mut pos = 0u64;
@@ -118,42 +118,33 @@ pub async fn find_copy_block(
     schema: &str,
     table: &str,
 ) -> Result<CopyBlock> {
-    let mut matching: Vec<CopyBlock> = list_copy_blocks(reader)
+    let mut matching = list_copy_blocks(reader)
         .await?
         .into_iter()
-        .filter(|b| b.schema == schema && b.table == table)
-        .collect();
+        .filter(|b| b.schema == schema && b.table == table);
 
-    match matching.len() {
-        0 => Err(ScanError::NotFound {
+    let first = matching.next().ok_or_else(|| ScanError::NotFound {
+        schema: schema.into(),
+        table: table.into(),
+    })?;
+    if matching.next().is_some() {
+        return Err(ScanError::Duplicate {
             schema: schema.into(),
             table: table.into(),
         }
-        .into()),
-        1 => Ok(matching.pop().unwrap()),
-        _ => Err(ScanError::Duplicate {
-            schema: schema.into(),
-            table: table.into(),
-        }
-        .into()),
+        .into());
     }
+    Ok(first)
 }
 
 /// Parse a single line as `COPY <schema>.<table> (col1, col2) FROM stdin;`
 /// (case-insensitive). Identifies the target schema/table without filtering;
 /// callers that want a specific block compare names themselves.
 fn parse_copy_header(line: &[u8]) -> HeaderMatch {
-    let mut s = line;
-    while let Some(&last) = s.last() {
-        if last == b'\n' || last == b'\r' {
-            s = &s[..s.len() - 1];
-        } else {
-            break;
-        }
-    }
-    let Ok(s) = std::str::from_utf8(s) else {
+    let Ok(s) = std::str::from_utf8(line) else {
         return HeaderMatch::NoMatch;
     };
+    let s = s.trim_end_matches(['\n', '\r']);
     let trimmed = s.trim_start();
     if !starts_with_ci(trimmed, "copy ") {
         return HeaderMatch::NoMatch;
@@ -187,30 +178,43 @@ fn parse_copy_header(line: &[u8]) -> HeaderMatch {
         };
     }
 
-    let Some(close) = after_table.find(')') else {
+    let Some((columns, after_paren)) = read_column_list(&after_table[1..]) else {
         return HeaderMatch::NoMatch;
     };
-    let inner = &after_table[1..close];
-    let after_paren = after_table[close + 1..].trim_start();
-    if !check_from_stdin(after_paren) {
+    if !check_from_stdin(after_paren.trim_start()) {
         return HeaderMatch::NoMatch;
     }
 
-    let columns = inner
-        .split(',')
-        .map(|c| {
-            let c = c.trim();
-            if c.starts_with('"') && c.ends_with('"') && c.len() >= 2 {
-                c[1..c.len() - 1].replace("\"\"", "\"")
-            } else {
-                c.to_string()
-            }
-        })
-        .collect();
     HeaderMatch::Matched {
         schema,
         table,
         columns,
+    }
+}
+
+/// Parse a quote-aware comma-separated column list ending in `)`. Returns
+/// `(columns, rest_after_close_paren)` or `None` if the closing paren is
+/// missing. Quoted identifiers may legally contain `,`, `)`, or `"` (as
+/// `""`), so we cannot rely on `find(')')`/`split(',')`.
+fn read_column_list(s: &str) -> Option<(Vec<String>, &str)> {
+    let mut columns = Vec::new();
+    let mut rest = s;
+    loop {
+        rest = rest.trim_start();
+        let (col, after) = read_identifier(rest);
+        if col.is_empty() {
+            return None;
+        }
+        columns.push(col);
+        let after = after.trim_start();
+        if let Some(after) = after.strip_prefix(',') {
+            rest = after;
+            continue;
+        }
+        if let Some(after) = after.strip_prefix(')') {
+            return Some((columns, after));
+        }
+        return None;
     }
 }
 
@@ -227,42 +231,58 @@ fn starts_with_ci(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
-/// Read either a quoted identifier "..." (with "" as escaped quote) or a bare
-/// identifier matching [A-Za-z0-9_]+. Returns (identifier, rest).
+/// Read either a quoted identifier `"..."` (with `""` as escaped quote) or a
+/// bare identifier matching `[A-Za-z0-9_]+`. Returns `(identifier, rest)`.
+///
+/// PG quoted identifiers may contain any non-`"` character including
+/// non-ASCII UTF-8 (e.g. `"naïve"`), so the quoted branch slices the source
+/// `&str` directly — casting individual bytes to `char` would mangle multi-byte
+/// sequences into Latin-1 codepoints.
 fn read_identifier(s: &str) -> (String, &str) {
     let bytes = s.as_bytes();
     if bytes.first() == Some(&b'"') {
-        let mut out = String::new();
+        // Walk byte-by-byte to find the closing quote (which is always ASCII
+        // 0x22, never the second byte of a UTF-8 sequence). Doubled `""`
+        // escapes a literal quote inside the identifier.
         let mut i = 1;
+        let mut has_escaped = false;
         while i < bytes.len() {
             if bytes[i] == b'"' {
                 if bytes.get(i + 1) == Some(&b'"') {
-                    out.push('"');
+                    has_escaped = true;
                     i += 2;
                 } else {
-                    return (out, &s[i + 1..]);
+                    let inner = &s[1..i];
+                    let decoded = if has_escaped {
+                        inner.replace("\"\"", "\"")
+                    } else {
+                        inner.to_string()
+                    };
+                    return (decoded, &s[i + 1..]);
                 }
             } else {
-                out.push(bytes[i] as char);
                 i += 1;
             }
         }
-        (out, "")
+        // Unterminated quoted identifier — treat as no match.
+        (String::new(), s)
     } else {
         let end = bytes
             .iter()
-            .position(|&b| !is_ident_byte(b))
+            .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
             .unwrap_or(bytes.len());
         (s[..end].to_string(), &s[end..])
     }
 }
 
-fn is_ident_byte(b: u8) -> bool {
-    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
-}
+/// Cap the buffer growth in `read_line` so a pathological input (a giant
+/// file with no `\n` byte at all) cannot OOM the loader. 64 MiB is far above
+/// any realistic pg_dump line — even a multi-MB JSONB or BYTEA value fits.
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Read one line starting at `pos`. Returns bytes including the trailing `\n`
-/// (if any). Reads in CHUNK_SIZE blocks. The returned Vec may be empty if pos >= size.
+/// (if any). Reads in CHUNK_SIZE blocks. The returned Vec may be empty if
+/// `pos >= size`. Errors if a single line exceeds `MAX_LINE_BYTES`.
 async fn read_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut p = pos;
@@ -273,8 +293,20 @@ async fn read_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<Vec<u
             break;
         }
         if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            if out.len().saturating_add(nl + 1) > MAX_LINE_BYTES {
+                anyhow::bail!(
+                    "pg_dump line at offset {pos} exceeds {MAX_LINE_BYTES} bytes \
+                     (likely a malformed or non-text file)"
+                );
+            }
             out.extend_from_slice(&buf[..=nl]);
             return Ok(out);
+        }
+        if out.len().saturating_add(buf.len()) > MAX_LINE_BYTES {
+            anyhow::bail!(
+                "pg_dump line at offset {pos} exceeds {MAX_LINE_BYTES} bytes \
+                 (likely a malformed or non-text file)"
+            );
         }
         out.extend_from_slice(&buf);
         p = end;
@@ -296,18 +328,18 @@ async fn find_terminator(reader: &dyn ByteReader, start: u64, size: u64) -> Resu
         if line.is_empty() {
             return Ok(None);
         }
-        let mut content = line.as_slice();
-        while let Some(&last) = content.last() {
-            if last == b'\n' || last == b'\r' {
-                content = &content[..content.len() - 1];
-            } else {
-                break;
-            }
-        }
+        let content = strip_eol(&line);
         if content == b"\\." {
             return Ok(Some(p));
         }
         p += line.len() as u64;
     }
     Ok(None)
+}
+
+fn strip_eol(mut s: &[u8]) -> &[u8] {
+    while let Some(&b'\n' | &b'\r') = s.last() {
+        s = &s[..s.len() - 1];
+    }
+    s
 }

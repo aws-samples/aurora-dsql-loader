@@ -166,6 +166,10 @@ impl ReaderFactory {
                 Ok(Arc::new(reader) as Arc<dyn FileReader>)
             }
 
+            // pg_dump needs out-of-band column metadata (the COPY clause), so it
+            // is built via `create_pgdump_reader` instead. The variant lives on
+            // the same enum for ergonomic dispatch in `runner.rs`; reaching this
+            // arm means a caller bypassed that dispatch.
             (_, Format::PgDump) => {
                 anyhow::bail!("internal: pg_dump format must be created via create_pgdump_reader()")
             }

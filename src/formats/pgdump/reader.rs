@@ -8,9 +8,27 @@ use crate::io::{ByteReader, estimate_rows_in_range, find_next_record_boundary};
 
 /// Reader for plain pg_dump --data-only output, scoped to a single table's
 /// COPY FROM stdin block.
+///
+/// **NULL handling:** PG's `\N` is decoded by `escape::decode_field` as a
+/// distinct `DecodedField::Null` variant, but the loader's `Record { fields:
+/// Vec<String> }` shape carries strings only, so `\N` is collapsed to an
+/// empty string here. The downstream worker (`coordination/worker.rs`)
+/// already maps empty strings to SQL NULL during binding, so functionally
+/// `\N → NULL` survives end-to-end. The trade-off is that real empty strings
+/// and NULLs become indistinguishable; if your dataset depends on that
+/// distinction, do not use `--format pgdump` until proper `Option<String>`
+/// fidelity lands.
 pub struct PgDumpReader<R: ByteReader> {
     reader: R,
     block: CopyBlock,
+}
+
+impl<R: ByteReader> std::fmt::Debug for PgDumpReader<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgDumpReader")
+            .field("block", &self.block)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<R: ByteReader> PgDumpReader<R> {
@@ -96,6 +114,9 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
                 .split(|&b| b == b'\t')
                 .map(|raw| match decode_field(raw) {
                     DecodedField::Value(s) => s,
+                    // \N collapses to "" so the worker's empty-string-as-NULL
+                    // binding takes over. See PgDumpReader's docstring for
+                    // the trade-off and the future-fidelity revisit point.
                     DecodedField::Null => String::new(),
                 })
                 .collect();
@@ -119,15 +140,7 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
 /// trailing empty element produced by a final `\n` is dropped; intermediate
 /// empty lines are preserved so callers can flag them as corruption.
 fn split_lines(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut parts: Vec<&[u8]> = buf
-        .split(|&b| b == b'\n')
-        .map(|line| match line.last() {
-            Some(b'\r') => &line[..line.len() - 1],
-            _ => line,
-        })
-        .collect();
-    if matches!(parts.last(), Some(last) if last.is_empty()) {
-        parts.pop();
-    }
-    parts.into_iter()
+    let buf = buf.strip_suffix(b"\n").unwrap_or(buf);
+    buf.split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
 }

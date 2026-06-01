@@ -77,11 +77,17 @@ pub struct ParquetConfig {
 
 /// Configuration for pg_dump format reading.
 ///
-/// Currently empty; carries no tunables. Kept as a struct rather than a unit
-/// variant so future settings (e.g. encoding override, strict-vs-lenient
-/// escapes) can be added without breaking the manifest schema.
+/// `copy_columns` carries the column names declared in the source dump's
+/// `COPY ... (cols)` clause, in declaration order. The coordinator's
+/// column-order guard reads this on every load (fresh and resumed) — keeping
+/// it inside the manifest's `FileFormat` payload means the guard survives
+/// resume, where `LoadConfig` is reconstructed from the manifest. `None` for
+/// jobs persisted before this field existed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PgDumpConfig {}
+pub struct PgDumpConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_columns: Option<Vec<String>>,
+}
 
 /// File format and its associated configuration
 ///

@@ -32,7 +32,9 @@ struct SourceArgs {
     source_uri: String,
 
     /// File format (csv, tsv, parquet, pgdump). Auto-detected from extension
-    /// for csv/tsv/parquet; pgdump must be specified explicitly.
+    /// for csv/tsv/parquet; pgdump must be specified explicitly. pgdump
+    /// requires plain (`-Fp`) `pg_dump --data-only` output and is not
+    /// compatible with --column-map, --exclude-columns, or --if-not-exists.
     #[arg(short, long)]
     format: Option<String>,
 
@@ -182,8 +184,19 @@ async fn main() -> anyhow::Result<()> {
         Command::ListTables { source_uri } => {
             let tables = aurora_dsql_loader::runner::list_pgdump_tables(&source_uri).await?;
             for t in tables {
-                // Tab-separated for easy `awk`/`cut` consumption. Columns are
-                // comma-joined on the third column so each block is one line.
+                // Tab-separated for easy `awk`/`cut` consumption, one block per
+                // line. Reject identifiers that would corrupt the framing or
+                // smuggle terminal escapes — quoted PG identifiers can legally
+                // contain tab/newline/CR/control bytes, but emitting them
+                // unsanitized to a TTY enables ANSI title injection or shell
+                // pipeline corruption.
+                if let Err(name) = check_listable(&t) {
+                    anyhow::bail!(
+                        "list-tables: identifier {name:?} contains a tab, newline, \
+                         or control character that would corrupt the TSV output. \
+                         Quote-escape and load this table directly via `--table`."
+                    );
+                }
                 println!("{}\t{}\t{}", t.schema, t.table, t.columns.join(","));
             }
         }
@@ -407,6 +420,27 @@ async fn run_loader(
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+/// Reject identifiers that would corrupt the `list-tables` TSV output (which
+/// downstream `awk`/`cut` pipelines depend on) or smuggle terminal control
+/// bytes. On a hit, returns the offending identifier.
+fn check_listable(t: &aurora_dsql_loader::runner::PgDumpTable) -> Result<(), &str> {
+    fn is_unsafe(c: char) -> bool {
+        c == '\t' || c == '\n' || c == '\r' || (c.is_control() && c != ' ')
+    }
+    if t.schema.contains(is_unsafe) {
+        return Err(&t.schema);
+    }
+    if t.table.contains(is_unsafe) {
+        return Err(&t.table);
+    }
+    for col in &t.columns {
+        if col.contains(is_unsafe) || col.contains(',') {
+            return Err(col);
+        }
+    }
     Ok(())
 }
 
@@ -796,6 +830,57 @@ mod tests {
             }
             _ => panic!("expected ListTables"),
         }
+    }
+
+    #[test]
+    fn check_listable_accepts_safe_identifiers() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "users".into(),
+            columns: vec!["id".into(), "name".into()],
+        };
+        assert!(check_listable(&t).is_ok());
+    }
+
+    #[test]
+    fn check_listable_rejects_tab_in_identifier() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "bad\tname".into(),
+            columns: vec!["id".into()],
+        };
+        assert!(check_listable(&t).is_err());
+    }
+
+    #[test]
+    fn check_listable_rejects_newline_in_column_name() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "users".into(),
+            columns: vec!["id".into(), "broken\nname".into()],
+        };
+        assert!(check_listable(&t).is_err());
+    }
+
+    #[test]
+    fn check_listable_rejects_ansi_escape_in_table() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "x\x1b]0;OWNED\x07".into(),
+            columns: vec!["id".into()],
+        };
+        assert!(check_listable(&t).is_err());
+    }
+
+    #[test]
+    fn check_listable_rejects_comma_in_column_name() {
+        // Comma in a column name would mis-parse the comma-joined third TSV field.
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "users".into(),
+            columns: vec!["a,b".into()],
+        };
+        assert!(check_listable(&t).is_err());
     }
 
     #[test]

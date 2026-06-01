@@ -126,7 +126,7 @@ aurora-dsql-loader/
 │   ├── runner.rs         # Main load runner logic
 │   ├── coordination/     # Load coordination and workers
 │   ├── db/               # Database connection and schema
-│   ├── formats/          # File format parsers (CSV, TSV, Parquet)
+│   ├── formats/          # File format parsers (CSV, TSV, Parquet, pg_dump)
 │   └── io/               # I/O abstractions (local, S3)
 ├── Cargo.toml            # Dependencies and metadata
 └── README.md             # User documentation

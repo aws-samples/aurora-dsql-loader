@@ -113,6 +113,46 @@ fn validate_conflict_columns_not_all_excluded(
 /// type inference while maintaining reasonable memory usage.
 const MAX_SCHEMA_INFERENCE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 
+/// pg_dump positional-binding guard: the COPY statement's column order must
+/// match the target table's column order, since worker.rs builds the INSERT
+/// column list by iterating the resolved schema in order and field N goes to
+/// column N. No-op for non-pg_dump formats and for jobs persisted before the
+/// COPY columns were tracked in the manifest. Runs on both fresh and resumed
+/// loads.
+fn check_pgdump_column_order(config: &LoadConfig, schema: Option<&Schema>) -> Result<()> {
+    let FileFormat::PgDump(pg) = &config.file_format else {
+        return Ok(());
+    };
+    let Some(copy_cols) = pg.copy_columns.as_ref() else {
+        return Ok(());
+    };
+    let resolved = schema.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Internal error: pg_dump load resolved no schema for {}.{}",
+            config.schema,
+            config.target_table
+        )
+    })?;
+    let target_iter = resolved.columns.iter().map(|c| c.name.as_str());
+    let copy_iter = copy_cols.iter().map(String::as_str);
+    if target_iter.eq(copy_iter) {
+        return Ok(());
+    }
+    let target_names: Vec<&str> = resolved.columns.iter().map(|c| c.name.as_str()).collect();
+    anyhow::bail!(
+        "pg_dump column-order mismatch for {}.{}:\n  \
+         dump COPY columns:    {:?}\n  \
+         target table columns: {:?}\n\
+         The loader binds fields positionally; the target table must have the same \
+         columns in the same order as the COPY statement. Recreate the target table \
+         to match.",
+        config.schema,
+        config.target_table,
+        copy_cols,
+        target_names,
+    );
+}
+
 /// Configuration for a data load operation
 #[derive(Debug, Clone, Builder)]
 pub struct LoadConfig {
@@ -140,13 +180,6 @@ pub struct LoadConfig {
     on_conflict: OnConflict,
     #[builder(default)]
     exclude_columns: Vec<String>,
-    /// Column names declared in the source pg_dump's `COPY ... (cols)` clause,
-    /// in declaration order. `None` for non-pg_dump formats. When `Some`, the
-    /// coordinator verifies the target table's columns appear in the same order
-    /// before any chunk is dispatched (positional binding would silently
-    /// misalign otherwise).
-    #[builder(default)]
-    pgdump_copy_columns: Option<Vec<String>>,
 }
 
 /// Result of a completed data load operation
@@ -403,36 +436,7 @@ impl Coordinator {
 
         let mut schema = self.resolve_table_schema(config, &chunks).await?;
 
-        // pg_dump positional-binding guard: the COPY statement's column order must
-        // match the target table's column order, since worker.rs builds the INSERT
-        // column list by iterating the resolved schema in order and field N goes to
-        // column N. For non-pg_dump formats this is a no-op.
-        if let Some(copy_cols) = config.pgdump_copy_columns.as_ref() {
-            let resolved = schema.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Internal error: pg_dump load resolved no schema for {}.{}",
-                    config.schema,
-                    config.target_table
-                )
-            })?;
-            let target_names: Vec<&str> =
-                resolved.columns.iter().map(|c| c.name.as_str()).collect();
-            let copy_names: Vec<&str> = copy_cols.iter().map(|s| s.as_str()).collect();
-            if target_names != copy_names {
-                anyhow::bail!(
-                    "pg_dump column-order mismatch for {}.{}:\n  \
-                     dump COPY columns:    {:?}\n  \
-                     target table columns: {:?}\n\
-                     The loader binds fields positionally; the target table must have the same \
-                     columns in the same order as the COPY statement. Recreate the target table \
-                     to match.",
-                    config.schema,
-                    config.target_table,
-                    copy_cols,
-                    target_names,
-                );
-            }
-        }
+        check_pgdump_column_order(config, schema.as_ref())?;
 
         // Apply --exclude-columns before renames. Produces the effective schema
         // that downstream code uses for INSERT generation.
@@ -491,6 +495,22 @@ impl Coordinator {
                 "Resuming with excluded columns from manifest: {:?}",
                 manifest.table.excluded_columns
             );
+        }
+
+        // Re-run the pg_dump column-order guard on resume: the manifest persists
+        // the COPY columns inside FileFormat::PgDump, but the target table could
+        // have been altered between runs. A silent positional misalignment here
+        // would corrupt every chunk loaded after this point.
+        if matches!(config.file_format, FileFormat::PgDump(_)) {
+            let live_schema = query_table_schema(&self.pool, &config.schema, &config.target_table)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Cannot resume: failed to query target schema for {}.{}",
+                        config.schema, config.target_table
+                    )
+                })?;
+            check_pgdump_column_order(config, Some(&live_schema))?;
         }
 
         info!("Cleaning up incomplete claims...");

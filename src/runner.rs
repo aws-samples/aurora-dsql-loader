@@ -265,7 +265,12 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         Format::Parquet => (false, FileFormat::Parquet(ParquetConfig::default())),
         Format::PgDump => {
             use crate::coordination::manifest::PgDumpConfig;
-            (false, FileFormat::PgDump(PgDumpConfig::default()))
+            (
+                false,
+                FileFormat::PgDump(PgDumpConfig {
+                    copy_columns: pgdump_columns,
+                }),
+            )
         }
     };
 
@@ -300,7 +305,6 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         .resume_job_id(args.resume_job_id)
         .on_conflict(args.on_conflict)
         .exclude_columns(args.exclude_columns)
-        .pgdump_copy_columns(pgdump_columns)
         .build()?;
 
     // Run the load
@@ -377,6 +381,16 @@ pub struct PgDumpTable {
     pub columns: Vec<String>,
 }
 
+impl From<crate::formats::pgdump::CopyBlock> for PgDumpTable {
+    fn from(b: crate::formats::pgdump::CopyBlock) -> Self {
+        Self {
+            schema: b.schema,
+            table: b.table,
+            columns: b.columns,
+        }
+    }
+}
+
 /// Enumerate every COPY block in a pg_dump file, in source order.
 ///
 /// Pre-flight discovery for multi-table workflows. Customers script with this
@@ -400,14 +414,7 @@ pub async fn list_pgdump_tables(source_uri: &str) -> Result<Vec<PgDumpTable>> {
         }
     };
 
-    Ok(blocks
-        .into_iter()
-        .map(|b| PgDumpTable {
-            schema: b.schema,
-            table: b.table,
-            columns: b.columns,
-        })
-        .collect())
+    Ok(blocks.into_iter().map(PgDumpTable::from).collect())
 }
 
 // Build custom delimited config if provided
