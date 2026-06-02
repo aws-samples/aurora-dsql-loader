@@ -580,6 +580,67 @@ async fn find_terminator_handles_eof_without_trailing_newline() {
 }
 
 #[tokio::test]
+async fn rejects_pgc_custom_format_archive() {
+    // pg_dump -Fc archives start with the magic bytes "PGDMP". A user pointing
+    // the loader at a custom-format dump must get a clear "use -Fp" diagnostic
+    // instead of "no COPY block found", which would only surface after
+    // streaming the entire (binary) file.
+    let mut data = b"PGDMP".to_vec();
+    data.extend_from_slice(&[0x01, 0x0e, 0x00, 0x00]); // bogus version trailer
+    let reader = MockByteReader::new(data);
+    let err = list_copy_blocks(&reader).await.unwrap_err();
+    let msg = format!("{:#}", err);
+    assert!(
+        matches!(
+            err.downcast_ref::<ScanError>(),
+            Some(ScanError::NonPlainPgDump { .. })
+        ),
+        "expected NonPlainPgDump, got: {msg}"
+    );
+    assert!(msg.contains("-Fp"), "diagnostic must point to -Fp: {msg}");
+}
+
+#[tokio::test]
+async fn rejects_pgc_archive_via_find_copy_block() {
+    // Same magic-byte rejection from the single-table entry point.
+    let data = b"PGDMP\x01\x0e\x00\x00".to_vec();
+    let reader = MockByteReader::new(data);
+    let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<ScanError>(),
+        Some(ScanError::NonPlainPgDump { .. })
+    ));
+}
+
+#[tokio::test]
+async fn plain_dump_starting_with_dashes_is_not_misdetected() {
+    // A plain dump's first bytes are usually `--` (SQL comment) or `SET`. The
+    // magic-byte check must not false-positive on those.
+    let data = b"-- PostgreSQL database dump\nCOPY public.t (a) FROM stdin;\n1\n\\.\n".to_vec();
+    let reader = MockByteReader::new(data);
+    let block = find_copy_block(&reader, "public", "t").await.unwrap();
+    assert_eq!(block.columns, vec!["a"]);
+}
+
+#[tokio::test]
+async fn empty_or_tiny_files_do_not_trigger_format_detection() {
+    // Files smaller than the magic prefix must not panic or false-positive.
+    let reader = MockByteReader::new(b"".to_vec());
+    let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<ScanError>(),
+        Some(ScanError::NotFound { .. })
+    ));
+
+    let reader = MockByteReader::new(b"PG".to_vec());
+    let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<ScanError>(),
+        Some(ScanError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
 async fn read_chunk_handles_crlf_line_endings() {
     // pg_dump on Windows-flavored paths can produce CRLF; split_lines strips
     // the trailing \r per line. Assert decoded fields don't carry stray \r.

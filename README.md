@@ -125,8 +125,10 @@ aurora-dsql-loader list-tables --source-uri backup.sql | while IFS=$'\t' read sc
 done
 ```
 
-Pre-create each target table in DSQL with the same column set in the same order
-(see the column-order error message if mismatched).
+Pre-create each target table in DSQL with the same column set as the source
+COPY clause. Order does not matter — the loader reorders columns by name to
+match the dump. A column-set mismatch (extra or missing columns) is rejected
+with a clear error before any rows are loaded.
 
 ### CSV/TSV header behavior
 

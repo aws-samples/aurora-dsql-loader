@@ -4125,18 +4125,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pgdump_errors_on_column_order_mismatch() -> anyhow::Result<()> {
+    async fn pgdump_reorders_columns_when_target_order_differs() -> anyhow::Result<()> {
         use std::io::Write;
 
-        // pg_dump emits (id, name, note); target table has a different order.
+        // pg_dump emits (id, name, note); target table column order is shuffled.
+        // The loader must reorder by name so values land in the right columns.
         let mut f = tempfile::NamedTempFile::new()?;
         writeln!(f, "COPY public.things (id, name, note) FROM stdin;")?;
         writeln!(f, "1\twidget\thello")?;
+        writeln!(f, "2\tgizmo\tworld")?;
         writeln!(f, "\\.")?;
         f.flush()?;
 
-        // SQLite table created with different column order than COPY clause.
         let pool = setup_sqlite_table("things", "name TEXT, id INTEGER, note TEXT").await;
+        let args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            "things",
+            pool.clone(),
+        );
+
+        let result = run_load(args).await?;
+        assert_eq!(result.records_loaded, 2);
+        assert_eq!(result.records_failed, 0);
+
+        // Verify the values landed in the named columns, not positionally.
+        // Without reordering, `1` would have ended up in `name` and `widget`
+        // in `id` (which would then fail or silently coerce on SQLite).
+        #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+        struct ThingRow {
+            id: i64,
+            name: String,
+            note: Option<String>,
+        }
+        let mut conn = pool.acquire().await?;
+        let PoolConnection::Sqlite(ref mut sqlite_conn) = conn else {
+            panic!("expected sqlite pool connection in test");
+        };
+        let rows: Vec<ThingRow> = sqlx::query_as("SELECT id, name, note FROM things ORDER BY id")
+            .fetch_all(&mut **sqlite_conn)
+            .await?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ThingRow {
+                id: 1,
+                name: "widget".into(),
+                note: Some("hello".into())
+            }
+        );
+        assert_eq!(
+            rows[1],
+            ThingRow {
+                id: 2,
+                name: "gizmo".into(),
+                note: Some("world".into())
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pgdump_errors_on_column_set_mismatch() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        // Target table has an extra column not present in the dump's COPY clause.
+        // Reordering cannot rescue this — the sets diverge.
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.things (id, name) FROM stdin;")?;
+        writeln!(f, "1\twidget")?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let pool =
+            setup_sqlite_table("things", "id INTEGER, name TEXT, note TEXT NOT NULL").await;
         let args = pgdump_load_args(
             f.path().to_string_lossy().into_owned(),
             "things",
@@ -4146,17 +4207,14 @@ mod tests {
         let err = run_load(args).await.unwrap_err();
         let msg = format!("{:#}", err);
         assert!(
-            msg.contains("column") && (msg.contains("order") || msg.contains("mismatch")),
-            "expected a column-order error, got: {msg}"
+            msg.contains("column-set mismatch"),
+            "expected column-set mismatch error, got: {msg}"
         );
 
-        // The guard must reject before any chunk is loaded; otherwise a
-        // regression to "warn and continue" would silently corrupt the table
-        // by binding `1` → name, `widget` → id, `hello` → note.
         assert_eq!(
             get_table_count(&pool, "things").await,
             0,
-            "column-order guard must reject before any rows are inserted"
+            "column-set guard must reject before any rows are inserted"
         );
         Ok(())
     }

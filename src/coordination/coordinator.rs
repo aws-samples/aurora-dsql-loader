@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use derive_builder::Builder;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -113,42 +113,117 @@ fn validate_conflict_columns_not_all_excluded(
 /// type inference while maintaining reasonable memory usage.
 const MAX_SCHEMA_INFERENCE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 
-/// pg_dump positional-binding guard: the COPY statement's column order must
-/// match the target table's column order, since worker.rs builds the INSERT
-/// column list by iterating the resolved schema in order and field N goes to
-/// column N. Called from both `setup_new_job` and `setup_resume_job` (the
-/// resume site re-runs against the live target schema to catch ALTER TABLE
-/// between runs).
+/// pg_dump positional-binding alignment: the COPY statement's columns and the
+/// target table's columns must form the same SET. When the names match as sets
+/// but appear in different orders, we reorder the resolved target schema in
+/// place so that field N (from the COPY data, in COPY-clause order) binds to
+/// column N (from the schema worker.rs uses to build the INSERT). This lets a
+/// hand-rolled DSQL DDL succeed even if the operator listed columns in a
+/// different order than the source PG table.
+///
+/// Errors when the sets diverge (a column is in the dump but missing from the
+/// target, or vice versa). Returning `Ok(())` guarantees the schema's column
+/// order matches `copy_columns`.
 ///
 /// No-op for non-pg_dump formats.
-fn check_pgdump_column_order(config: &LoadConfig, schema: Option<&Schema>) -> Result<()> {
+fn align_pgdump_schema_to_copy_columns(
+    config: &LoadConfig,
+    schema: &mut Option<Schema>,
+) -> Result<()> {
     let FileFormat::PgDump(pg) = &config.file_format else {
         return Ok(());
     };
     let copy_cols = &pg.copy_columns;
-    let resolved = schema.ok_or_else(|| {
+    let resolved = schema.as_mut().ok_or_else(|| {
         anyhow::anyhow!(
             "Internal error: pg_dump load resolved no schema for {}.{}",
             config.schema,
             config.target_table
         )
     })?;
-    let target_iter = resolved.columns.iter().map(|c| c.name.as_str());
-    let copy_iter = copy_cols.iter().map(String::as_str);
-    if target_iter.eq(copy_iter) {
+
+    if resolved
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .eq(copy_cols.iter().map(String::as_str))
+    {
         return Ok(());
     }
-    let target_names: Vec<&str> = resolved.columns.iter().map(|c| c.name.as_str()).collect();
+
+    let copy_set: HashSet<&str> = copy_cols.iter().map(String::as_str).collect();
+    let target_set: HashSet<&str> = resolved.columns.iter().map(|c| c.name.as_str()).collect();
+
+    if copy_set != target_set {
+        let target_names: Vec<&str> = resolved.columns.iter().map(|c| c.name.as_str()).collect();
+        let missing_in_target: Vec<&str> =
+            copy_set.difference(&target_set).copied().collect();
+        let missing_in_dump: Vec<&str> =
+            target_set.difference(&copy_set).copied().collect();
+        anyhow::bail!(
+            "pg_dump column-set mismatch for {}.{}:\n  \
+             dump COPY columns:    {:?}\n  \
+             target table columns: {:?}\n  \
+             in dump but missing from target table: {:?}\n  \
+             in target table but missing from dump:  {:?}\n\
+             Recreate the target table to contain exactly the COPY columns. \
+             Order does not matter — the loader will reorder by name.",
+            config.schema,
+            config.target_table,
+            copy_cols,
+            target_names,
+            missing_in_target,
+            missing_in_dump,
+        );
+    }
+
+    // Sets match, order differs — reorder by name so field N → column N.
+    let original = std::mem::take(&mut resolved.columns);
+    let mut by_name: HashMap<String, crate::db::schema::Column> = original
+        .into_iter()
+        .map(|c| (c.name.clone(), c))
+        .collect();
+    resolved.columns = copy_cols
+        .iter()
+        .map(|name| {
+            by_name.remove(name.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Internal: target column {name:?} disappeared between set check and reorder"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    info!(
+        "pg_dump: reordered target schema columns to match COPY clause ({} columns)",
+        resolved.columns.len()
+    );
+    Ok(())
+}
+
+/// Resume-time variant: the manifest's persisted schema is what the worker
+/// actually uses, so we don't reorder anything — we only verify that the live
+/// target table's column SET still matches the dump's COPY columns. This
+/// catches an `ALTER TABLE ... DROP/ADD COLUMN` that happened between runs.
+fn validate_pgdump_column_set(config: &LoadConfig, live_schema: &Schema) -> Result<()> {
+    let FileFormat::PgDump(pg) = &config.file_format else {
+        return Ok(());
+    };
+    let copy_set: HashSet<&str> = pg.copy_columns.iter().map(String::as_str).collect();
+    let target_set: HashSet<&str> =
+        live_schema.columns.iter().map(|c| c.name.as_str()).collect();
+    if copy_set == target_set {
+        return Ok(());
+    }
+    let target_names: Vec<&str> = live_schema.columns.iter().map(|c| c.name.as_str()).collect();
     anyhow::bail!(
-        "pg_dump column-order mismatch for {}.{}:\n  \
+        "Cannot resume: pg_dump COPY column set no longer matches target {}.{}.\n  \
          dump COPY columns:    {:?}\n  \
-         target table columns: {:?}\n\
-         The loader binds fields positionally; the target table must have the same \
-         columns in the same order as the COPY statement. Recreate the target table \
-         to match.",
+         live target columns:  {:?}\n\
+         The target table was altered between runs.",
         config.schema,
         config.target_table,
-        copy_cols,
+        pg.copy_columns,
         target_names,
     );
 }
@@ -436,7 +511,7 @@ impl Coordinator {
 
         let mut schema = self.resolve_table_schema(config, &chunks).await?;
 
-        check_pgdump_column_order(config, schema.as_ref())?;
+        align_pgdump_schema_to_copy_columns(config, &mut schema)?;
 
         // Apply --exclude-columns before renames. Produces the effective schema
         // that downstream code uses for INSERT generation.
@@ -497,10 +572,11 @@ impl Coordinator {
             );
         }
 
-        // Re-run the pg_dump column-order guard on resume: the manifest persists
-        // the COPY columns inside FileFormat::PgDump, but the target table could
-        // have been altered between runs. A silent positional misalignment here
-        // would corrupt every chunk loaded after this point.
+        // On resume, the worker uses the manifest's persisted schema (already
+        // aligned at original setup_new_job time), so we do not reorder again.
+        // We do verify the live target table's column SET still matches the
+        // dump — catches ALTER TABLE ADD/DROP COLUMN between runs, which
+        // would silently misalign every chunk loaded after this point.
         if matches!(config.file_format, FileFormat::PgDump(_)) {
             let live_schema = query_table_schema(&self.pool, &config.schema, &config.target_table)
                 .await
@@ -510,7 +586,7 @@ impl Coordinator {
                         config.schema, config.target_table
                     )
                 })?;
-            check_pgdump_column_order(config, Some(&live_schema))?;
+            validate_pgdump_column_set(config, &live_schema)?;
         }
 
         info!("Cleaning up incomplete claims...");
@@ -1002,7 +1078,6 @@ impl Coordinator {
 mod exclusion_tests {
     use super::*;
     use crate::db::schema::{Column, Schema, SqlType};
-    use std::collections::HashSet;
 
     fn mk_schema(names: &[&str]) -> Schema {
         Schema {
@@ -1128,21 +1203,85 @@ mod exclusion_tests {
     }
 
     #[test]
-    fn check_pgdump_column_order_accepts_matching_columns() {
+    fn align_pgdump_schema_accepts_matching_order() {
         let config = mk_pgdump_load_config(vec!["id".into(), "name".into(), "note".into()]);
-        let schema = mk_schema(&["id", "name", "note"]);
-        check_pgdump_column_order(&config, Some(&schema)).unwrap();
+        let mut schema = Some(mk_schema(&["id", "name", "note"]));
+        align_pgdump_schema_to_copy_columns(&config, &mut schema).unwrap();
+        let names: Vec<&str> = schema
+            .as_ref()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["id", "name", "note"]);
     }
 
     #[test]
-    fn check_pgdump_column_order_rejects_reordered_columns() {
+    fn align_pgdump_schema_reorders_when_set_matches_but_order_differs() {
         let config = mk_pgdump_load_config(vec!["id".into(), "name".into(), "note".into()]);
-        // Target table column order swapped vs the COPY clause.
-        let schema = mk_schema(&["name", "id", "note"]);
-        let err = check_pgdump_column_order(&config, Some(&schema))
+        // Target table has same columns but in a different order than COPY.
+        let mut schema = Some(mk_schema(&["name", "id", "note"]));
+        align_pgdump_schema_to_copy_columns(&config, &mut schema).unwrap();
+        let names: Vec<&str> = schema
+            .as_ref()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id", "name", "note"],
+            "schema must be reordered to COPY-clause order so positional binding aligns"
+        );
+    }
+
+    #[test]
+    fn align_pgdump_schema_rejects_when_dump_has_extra_column() {
+        let config = mk_pgdump_load_config(vec!["id".into(), "name".into(), "note".into()]);
+        // Target table is missing `note`.
+        let mut schema = Some(mk_schema(&["id", "name"]));
+        let err = align_pgdump_schema_to_copy_columns(&config, &mut schema)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("column-order mismatch"), "{err}");
+        assert!(err.contains("column-set mismatch"), "{err}");
+        assert!(
+            err.contains("note"),
+            "error must name the missing column: {err}"
+        );
+    }
+
+    #[test]
+    fn align_pgdump_schema_rejects_when_target_has_extra_column() {
+        let config = mk_pgdump_load_config(vec!["id".into(), "name".into()]);
+        // Target table has an extra column not present in the dump.
+        let mut schema = Some(mk_schema(&["id", "name", "extra"]));
+        let err = align_pgdump_schema_to_copy_columns(&config, &mut schema)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("column-set mismatch"), "{err}");
+        assert!(
+            err.contains("extra"),
+            "error must name the extra column: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_pgdump_column_set_accepts_same_set_any_order() {
+        let config = mk_pgdump_load_config(vec!["id".into(), "name".into(), "note".into()]);
+        let live = mk_schema(&["note", "id", "name"]);
+        validate_pgdump_column_set(&config, &live).unwrap();
+    }
+
+    #[test]
+    fn validate_pgdump_column_set_rejects_diverging_sets() {
+        let config = mk_pgdump_load_config(vec!["id".into(), "name".into(), "note".into()]);
+        let live = mk_schema(&["id", "name"]);
+        let err = validate_pgdump_column_set(&config, &live)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no longer matches"), "{err}");
     }
 
     #[test]

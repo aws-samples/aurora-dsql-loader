@@ -12,6 +12,14 @@
 - New `list-tables` subcommand that enumerates every `COPY ... FROM stdin;`
   block in a pg_dump file. Drives multi-table migrations by feeding into a
   shell loop of `load --table=...` invocations.
+- pg_dump loads now reorder target table columns by name to match the dump's
+  COPY clause. A target table whose columns differ in order (but match as a
+  set) loads successfully; only a column-set mismatch (extra or missing
+  columns) is rejected.
+- pg_dump loads now reject `-Fc` (custom) and `-Fd` (directory) archive
+  formats up front with a diagnostic that points to `-Fp`, instead of
+  failing later with a generic "no COPY block found" after streaming the
+  binary file.
 
 ### Changed
 - `--schema` and `--table` (all formats) now reject identifiers containing

@@ -31,6 +31,45 @@ pub enum ScanError {
         "`COPY {schema}.{table}` block has a malformed column list (unterminated quoted identifier, missing close paren, or empty list)"
     )]
     MalformedColumnList { schema: String, table: String },
+
+    #[error(
+        "source file appears to be a {variant} pg_dump archive, which is not supported. \
+         Re-run pg_dump with the plain text format flag (`-Fp`, the default) and \
+         `--data-only`, e.g. `pg_dump -Fp --data-only --table=<t> <db> > dump.sql`."
+    )]
+    NonPlainPgDump { variant: &'static str },
+}
+
+/// Fast pre-flight: read a few bytes from the start of the source and reject
+/// non-plain pg_dump archives with a precise diagnostic instead of letting the
+/// caller hit a confusing "no COPY block found" error after streaming the
+/// whole file.
+///
+/// Detects:
+/// - **`-Fc` custom format** — magic `PGDMP` at offset 0.
+/// - **`-Fd` directory format** — typically pointed at a directory, but a
+///   user pointing at the contained `toc.dat` file would also see `PGDMP`
+///   magic. The diagnostic names "custom or directory" together because
+///   they share the same on-disk magic.
+///
+/// `-Ft` (tar) is harder to identify cheaply (the `ustar` magic sits at
+/// offset 257); we deliberately do not check for it here. A tar dump that
+/// reaches the COPY scanner will fail with a generic parse error, which is
+/// acceptable since `-Ft` is rare in practice.
+async fn detect_non_plain_format(reader: &dyn ByteReader) -> Result<()> {
+    const MAGIC: &[u8] = b"PGDMP";
+    let size = reader.size().await?;
+    if size < MAGIC.len() as u64 {
+        return Ok(());
+    }
+    let head = reader.read_range(0, MAGIC.len() as u64).await?;
+    if head.starts_with(MAGIC) {
+        return Err(ScanError::NonPlainPgDump {
+            variant: "custom or directory (-Fc/-Fd)",
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// The byte range and metadata for a located COPY block.
@@ -76,6 +115,7 @@ enum HeaderMatch {
 /// legitimately want to load each occurrence (though pg_dump never produces
 /// duplicates in practice).
 pub async fn list_copy_blocks(reader: &dyn ByteReader) -> Result<Vec<CopyBlock>> {
+    detect_non_plain_format(reader).await?;
     let size = reader.size().await?;
     let mut pos = 0u64;
     let mut blocks = Vec::new();
