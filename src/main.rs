@@ -451,18 +451,7 @@ fn check_listable(t: &aurora_dsql_loader::runner::PgDumpTable) -> Option<&str> {
 }
 
 fn is_unsafe_for_listing(c: char) -> bool {
-    if c.is_control() {
-        return true;
-    }
-    // Unicode bidi controls and zero-width / format codepoints that can
-    // visually reorder or hide identifier text in a terminal.
-    matches!(
-        c,
-        '\u{200B}'..='\u{200F}'  // ZWSP, ZWNJ, ZWJ, LRM, RLM
-            | '\u{2028}'..='\u{202E}'  // line/paragraph sep + bidi overrides
-            | '\u{2066}'..='\u{2069}'  // bidi isolates
-            | '\u{FEFF}'              // BOM / ZWNBSP
-    )
+    c.is_control() || aurora_dsql_loader::runner::is_bidi_or_format_char(c)
 }
 
 fn validate_delimited_options(

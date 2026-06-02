@@ -11,4 +11,4 @@ mod scan;
 mod tests;
 
 pub use reader::PgDumpReader;
-pub use scan::{CopyBlock, list_copy_blocks};
+pub use scan::list_copy_blocks;

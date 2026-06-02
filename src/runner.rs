@@ -238,7 +238,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
             let (reader, cols) = reader_factory
                 .create_pgdump_reader(&parsed_uri, &args.schema, &args.target_table)
                 .await?;
-            (reader, Some(cols))
+            (reader, cols)
         }
         _ => {
             let reader = reader_factory
@@ -248,7 +248,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
                     delimited_config.clone(),
                 )
                 .await?;
-            (reader, None)
+            (reader, Vec::new())
         }
     };
 
@@ -397,15 +397,15 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Identifier-safety predicate shared between `validate_identifier` (CLI args)
-/// and the equivalent guard on `list-tables` output. The Unicode bidi/format
-/// codepoints are visually invisible or reorder surrounding text in a
-/// terminal, which would let a deceptive `--table` value confuse an operator
-/// reading load logs even though they cannot escape SQL identifier quoting.
-fn is_unsafe_identifier_char(c: char) -> bool {
-    if c.is_control() || c == '"' || c == '\\' || c == '\0' {
-        return true;
-    }
+/// Unicode bidi-control and zero-width / format codepoints that visually
+/// reorder or hide surrounding text in a terminal — RLM, LRM, RTL/LTR
+/// overrides, ZWSP/ZWNJ/ZWJ, BOM/ZWNBSP, line/paragraph separators, bidi
+/// isolates. A deceptive identifier carrying any of these would confuse an
+/// operator reading load logs even though it cannot escape SQL quoting.
+///
+/// Shared between `validate_identifier` (CLI `--schema` / `--table` inputs)
+/// and `main::is_unsafe_for_listing` (the `list-tables` TSV output guard).
+pub fn is_bidi_or_format_char(c: char) -> bool {
     matches!(
         c,
         '\u{200B}'..='\u{200F}'
@@ -415,22 +415,16 @@ fn is_unsafe_identifier_char(c: char) -> bool {
     )
 }
 
+fn is_unsafe_identifier_char(c: char) -> bool {
+    c.is_control() || c == '"' || c == '\\' || c == '\0' || is_bidi_or_format_char(c)
+}
+
 /// One entry per `COPY ... FROM stdin;` block in a pg_dump file.
 #[derive(Debug, Clone)]
 pub struct PgDumpTable {
     pub schema: String,
     pub table: String,
     pub columns: Vec<String>,
-}
-
-impl From<crate::formats::pgdump::CopyBlock> for PgDumpTable {
-    fn from(b: crate::formats::pgdump::CopyBlock) -> Self {
-        Self {
-            schema: b.schema,
-            table: b.table,
-            columns: b.columns,
-        }
-    }
 }
 
 /// Enumerate every COPY block in a pg_dump file, in source order.
@@ -456,7 +450,14 @@ pub async fn list_pgdump_tables(source_uri: &str) -> Result<Vec<PgDumpTable>> {
         }
     };
 
-    Ok(blocks.into_iter().map(PgDumpTable::from).collect())
+    Ok(blocks
+        .into_iter()
+        .map(|b| PgDumpTable {
+            schema: b.schema,
+            table: b.table,
+            columns: b.columns,
+        })
+        .collect())
 }
 
 // Build custom delimited config if provided

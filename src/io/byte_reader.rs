@@ -83,61 +83,60 @@ pub async fn estimate_rows_in_range(
     Ok(Some(estimated_rows))
 }
 
+/// In-memory `ByteReader` implementation for tests across the crate. Wraps a
+/// `Vec<u8>` and serves `read_range` against the slice. Reachable from other
+/// modules' `#[cfg(test)]` code as `crate::io::byte_reader::MockByteReader`.
+#[cfg(test)]
+pub(crate) struct MockByteReader {
+    pub data: Vec<u8>,
+}
+
+#[cfg(test)]
+impl MockByteReader {
+    pub fn new(data: impl Into<Vec<u8>>) -> Self {
+        Self { data: data.into() }
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ByteReader for MockByteReader {
+    async fn size(&self) -> Result<u64> {
+        Ok(self.data.len() as u64)
+    }
+
+    async fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+        let start = start as usize;
+        let end = std::cmp::min(end as usize, self.data.len());
+        Ok(self.data[start..end].to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Mock ByteReader for testing
-    struct MockByteReader {
-        data: Vec<u8>,
-    }
-
-    #[async_trait]
-    impl ByteReader for MockByteReader {
-        async fn size(&self) -> Result<u64> {
-            Ok(self.data.len() as u64)
-        }
-
-        async fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
-            let start = start as usize;
-            let end = std::cmp::min(end as usize, self.data.len());
-            Ok(self.data[start..end].to_vec())
-        }
-    }
-
     #[tokio::test]
     async fn test_find_next_record_boundary() {
-        let data = b"line1\nline2\nline3\n";
-        let reader = MockByteReader {
-            data: data.to_vec(),
-        };
+        let reader = MockByteReader::new(b"line1\nline2\nline3\n".to_vec());
 
-        // Find boundary after offset 0 (should find after "line1\n")
         let boundary = find_next_record_boundary(&reader, 0).await.unwrap();
         assert_eq!(boundary, 6);
 
-        // Find boundary after offset 3 (mid-line, should find after "line1\n")
         let boundary = find_next_record_boundary(&reader, 3).await.unwrap();
         assert_eq!(boundary, 6);
 
-        // Find boundary after offset 6 (start of line2, should find after "line2\n")
         let boundary = find_next_record_boundary(&reader, 6).await.unwrap();
         assert_eq!(boundary, 12);
     }
 
     #[tokio::test]
     async fn test_estimate_rows() {
-        let data = b"line1\nline2\nline3\nline4\nline5\n";
-        let reader = MockByteReader {
-            data: data.to_vec(),
-        };
-
+        let reader = MockByteReader::new(b"line1\nline2\nline3\nline4\nline5\n".to_vec());
         let size = reader.size().await.unwrap();
         let estimate = estimate_rows_in_range(&reader, 0, size).await.unwrap();
 
-        // Should estimate around 5 rows
-        assert!(estimate.is_some());
-        let count = estimate.unwrap();
+        let count = estimate.expect("non-empty range estimates rows");
         assert!((4..=6).contains(&count)); // Allow some variance in estimation
     }
 }

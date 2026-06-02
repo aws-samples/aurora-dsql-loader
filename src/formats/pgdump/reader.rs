@@ -1,19 +1,20 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
-use super::escape::{DecodedField, decode_field};
+use super::escape::decode_field;
 use super::scan::{CopyBlock, find_copy_block};
-use crate::formats::reader::{Chunk, ChunkData, FileMetadata, FileReader, Record};
-use crate::io::{ByteReader, estimate_rows_in_range, find_next_record_boundary};
+use crate::formats::reader::{
+    Chunk, ChunkData, FileMetadata, FileReader, Record, build_chunks_over_range,
+};
+use crate::io::{ByteReader, estimate_rows_in_range};
 
 /// Reader for plain pg_dump --data-only output, scoped to a single table's
 /// COPY FROM stdin block.
 ///
-/// **NULL handling:** PG's `\N` is decoded by `escape::decode_field` as a
-/// distinct `DecodedField::Null` variant, but the loader's `Record { fields:
-/// Vec<String> }` shape carries strings only, so `\N` is collapsed to an
-/// empty string here. The downstream worker (`coordination/worker.rs`)
-/// already maps empty strings to SQL NULL during binding, so functionally
+/// **NULL handling:** PG's `\N` is decoded by `escape::decode_field` to an
+/// empty string, since the loader's `Record { fields: Vec<String> }` shape
+/// carries strings only. The downstream worker (`coordination/worker.rs`)
+/// then maps empty strings to SQL NULL during binding, so functionally
 /// `\N → NULL` survives end-to-end. The trade-off is that real empty strings
 /// AND whitespace-only strings (the worker `trim()`s before the empty check)
 /// become indistinguishable from NULL; if your dataset depends on either
@@ -22,14 +23,6 @@ use crate::io::{ByteReader, estimate_rows_in_range, find_next_record_boundary};
 pub struct PgDumpReader<R: ByteReader> {
     reader: R,
     block: CopyBlock,
-}
-
-impl<R: ByteReader> std::fmt::Debug for PgDumpReader<R> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PgDumpReader")
-            .field("block", &self.block)
-            .finish_non_exhaustive()
-    }
 }
 
 impl<R: ByteReader> PgDumpReader<R> {
@@ -60,35 +53,13 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
     }
 
     async fn create_chunks(&self, target_size: u64) -> Result<Vec<Chunk>> {
-        let block_size = self.block.data_end - self.block.data_start;
-        if block_size == 0 {
-            return Ok(vec![]);
-        }
-
-        let mut chunks = Vec::new();
-        let mut current = self.block.data_start;
-        let mut chunk_id = 0u32;
-        let end = self.block.data_end;
-
-        while current < end {
-            let target_end = std::cmp::min(current + target_size, end);
-            let actual_end = if target_end >= end {
-                end
-            } else {
-                let boundary = find_next_record_boundary(&self.reader, target_end).await?;
-                std::cmp::min(boundary, end)
-            };
-            let estimated_rows = estimate_rows_in_range(&self.reader, current, actual_end).await?;
-            chunks.push(Chunk {
-                chunk_id,
-                start_offset: current,
-                end_offset: actual_end,
-                estimated_rows,
-            });
-            current = actual_end;
-            chunk_id += 1;
-        }
-        Ok(chunks)
+        build_chunks_over_range(
+            &self.reader,
+            self.block.data_start,
+            self.block.data_end,
+            target_size,
+        )
+        .await
     }
 
     async fn read_chunk(&self, chunk: &Chunk) -> Result<ChunkData> {
@@ -111,14 +82,9 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
                 continue;
             }
 
-            let fields: Vec<String> = line
-                .split(|&b| b == b'\t')
-                .map(|raw| match decode_field(raw) {
-                    DecodedField::Value(s) => s,
-                    // See PgDumpReader rustdoc for the \N → "" trade-off.
-                    DecodedField::Null => String::new(),
-                })
-                .collect();
+            // decode_field returns "" for `\N`; see PgDumpReader rustdoc for
+            // the trade-off (the worker also maps "" → SQL NULL on binding).
+            let fields: Vec<String> = line.split(|&b| b == b'\t').map(decode_field).collect();
 
             if fields.len() != expected_columns {
                 parse_errors += 1;

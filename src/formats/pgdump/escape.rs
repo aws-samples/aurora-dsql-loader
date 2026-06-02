@@ -3,27 +3,16 @@
 //! Reference: https://www.postgresql.org/docs/current/sql-copy.html
 //! "Text Format" section: a backslash introduces an escape sequence.
 
-/// Outcome of decoding one COPY-text-format field.
-///
-/// `Null` is preserved here as a distinct variant; the call site in
-/// `reader.rs` decides how to flatten it into the wider loader pipeline
-/// (which carries `Vec<String>`, not `Vec<Option<String>>`). Keeping the
-/// distinction at the decode layer means a future refactor that wants real
-/// NULL fidelity has one site to change.
-#[derive(Debug, PartialEq, Eq)]
-pub enum DecodedField {
-    /// A normal value (possibly empty).
-    Value(String),
-    /// PG's `\N` literal — the field was SQL NULL in the source database.
-    Null,
-}
-
-/// Decode one COPY-text-format field. Input is the raw bytes between
-/// tabs (or between start-of-line and tab, etc.). The whole-field literal
-/// `\N` is returned as `DecodedField::Null`; everything else is `Value`.
-pub fn decode_field(input: &[u8]) -> DecodedField {
+/// Decode one COPY-text-format field. Input is the raw bytes between tabs
+/// (or between start-of-line and tab). The whole-field literal `\N` is
+/// returned as an empty string — the loader's `Record { fields: Vec<String> }`
+/// shape doesn't carry NULLs, and the worker's binding path already maps
+/// empty strings to SQL NULL, so `\N → NULL` survives end-to-end. The
+/// trade-off (real empty strings and whitespace-only strings collapse to
+/// NULL too) is documented on `PgDumpReader`.
+pub fn decode_field(input: &[u8]) -> String {
     if input == b"\\N" {
-        return DecodedField::Null;
+        return String::new();
     }
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
@@ -103,5 +92,5 @@ pub fn decode_field(input: &[u8]) -> DecodedField {
     // far better surfaced as replacement chars than as a hard parse error here.
     // Non-UTF-8 fields show up as U+FFFD; if that proves problematic in
     // practice, switch to `std::str::from_utf8` and surface as a parse error.
-    DecodedField::Value(String::from_utf8_lossy(&out).into_owned())
+    String::from_utf8_lossy(&out).into_owned()
 }

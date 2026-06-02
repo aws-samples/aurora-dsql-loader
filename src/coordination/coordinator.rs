@@ -120,28 +120,12 @@ const MAX_SCHEMA_INFERENCE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 /// resume site re-runs against the live target schema to catch ALTER TABLE
 /// between runs).
 ///
-/// No-op for non-pg_dump formats. For pg_dump loads where `copy_columns` is
-/// `None` (in practice, the in-memory `LoadConfig` always has it populated by
-/// runner.rs on every fresh and resume invocation; this branch is reachable
-/// only via library callers constructing `LoadConfig` directly with a default
-/// `PgDumpConfig`), the function bails. A silent skip-with-warn was the prior
-/// behavior, but since the entire purpose of this function is to prevent
-/// silent positional misalignment, "skipping the guard" is the worst possible
-/// failure mode.
+/// No-op for non-pg_dump formats.
 fn check_pgdump_column_order(config: &LoadConfig, schema: Option<&Schema>) -> Result<()> {
     let FileFormat::PgDump(pg) = &config.file_format else {
         return Ok(());
     };
-    let Some(copy_cols) = pg.copy_columns.as_ref() else {
-        anyhow::bail!(
-            "pg_dump load for {}.{} has no recorded COPY columns; positional-binding guard \
-             cannot run. The CLI / `runner::run_load` always populates this field; if you are \
-             constructing `LoadConfig` directly, set `FileFormat::PgDump(PgDumpConfig {{ \
-             copy_columns: Some(<the COPY statement's columns>) }})`.",
-            config.schema,
-            config.target_table
-        );
-    };
+    let copy_cols = &pg.copy_columns;
     let resolved = schema.ok_or_else(|| {
         anyhow::anyhow!(
             "Internal error: pg_dump load resolved no schema for {}.{}",
@@ -1121,7 +1105,7 @@ mod exclusion_tests {
         assert_eq!(names, vec!["name", "email"]);
     }
 
-    fn mk_pgdump_load_config(copy_columns: Option<Vec<String>>) -> LoadConfig {
+    fn mk_pgdump_load_config(copy_columns: Vec<String>) -> LoadConfig {
         use crate::coordination::manifest::PgDumpConfig;
         LoadConfigBuilder::default()
             .source_uri("dummy".to_string())
@@ -1144,30 +1128,15 @@ mod exclusion_tests {
     }
 
     #[test]
-    fn check_pgdump_column_order_bails_when_copy_columns_missing() {
-        // Iteration-2 behavior: a library caller constructing LoadConfig with
-        // FileFormat::PgDump(PgDumpConfig::default()) (copy_columns: None)
-        // must hit a hard error rather than the prior warn-and-skip path.
-        // Skipping the guard would let positional misalignment through silently.
-        let config = mk_pgdump_load_config(None);
-        let schema = mk_schema(&["id", "name", "note"]);
-        let err = check_pgdump_column_order(&config, Some(&schema))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no recorded COPY columns"), "{err}");
-        assert!(err.contains("public.things"), "{err}");
-    }
-
-    #[test]
     fn check_pgdump_column_order_accepts_matching_columns() {
-        let config = mk_pgdump_load_config(Some(vec!["id".into(), "name".into(), "note".into()]));
+        let config = mk_pgdump_load_config(vec!["id".into(), "name".into(), "note".into()]);
         let schema = mk_schema(&["id", "name", "note"]);
         check_pgdump_column_order(&config, Some(&schema)).unwrap();
     }
 
     #[test]
     fn check_pgdump_column_order_rejects_reordered_columns() {
-        let config = mk_pgdump_load_config(Some(vec!["id".into(), "name".into(), "note".into()]));
+        let config = mk_pgdump_load_config(vec!["id".into(), "name".into(), "note".into()]);
         // Target table column order swapped vs the COPY clause.
         let schema = mk_schema(&["name", "id", "note"]);
         let err = check_pgdump_column_order(&config, Some(&schema))

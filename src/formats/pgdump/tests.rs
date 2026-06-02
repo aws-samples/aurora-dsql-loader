@@ -1,58 +1,59 @@
-use super::escape::{DecodedField, decode_field};
+use super::escape::decode_field;
 use super::reader::PgDumpReader;
 use super::scan::{ScanError, find_copy_block, list_copy_blocks};
 use crate::formats::FileReader;
+use crate::io::byte_reader::MockByteReader;
 use crate::io::{ByteReader, LocalFileByteReader};
-use anyhow::Result;
-use async_trait::async_trait;
 use std::io::Write;
 use tempfile::NamedTempFile;
 
 #[test]
 fn decode_plain_text() {
-    assert_eq!(decode_field(b"hello"), DecodedField::Value("hello".into()));
+    assert_eq!(decode_field(b"hello"), "hello");
 }
 
 #[test]
 fn decode_empty() {
-    assert_eq!(decode_field(b""), DecodedField::Value(String::new()));
+    assert_eq!(decode_field(b""), "");
 }
 
 #[test]
-fn decode_null_sentinel() {
-    assert_eq!(decode_field(b"\\N"), DecodedField::Null);
+fn decode_null_sentinel_is_empty_string() {
+    // \N is the COPY-format NULL sentinel; the reader decodes it to "" and
+    // the worker then maps "" → SQL NULL during binding.
+    assert_eq!(decode_field(b"\\N"), "");
 }
 
 #[test]
 fn decode_escape_t_n_r_etc() {
-    assert_eq!(decode_field(b"a\\tb"), DecodedField::Value("a\tb".into()));
-    assert_eq!(decode_field(b"a\\nb"), DecodedField::Value("a\nb".into()));
-    assert_eq!(decode_field(b"a\\rb"), DecodedField::Value("a\rb".into()));
-    assert_eq!(decode_field(b"a\\\\b"), DecodedField::Value("a\\b".into()));
+    assert_eq!(decode_field(b"a\\tb"), "a\tb");
+    assert_eq!(decode_field(b"a\\nb"), "a\nb");
+    assert_eq!(decode_field(b"a\\rb"), "a\rb");
+    assert_eq!(decode_field(b"a\\\\b"), "a\\b");
 }
 
 #[test]
 fn decode_hex_escape() {
     // \x41 → 'A'
-    assert_eq!(decode_field(b"\\x41"), DecodedField::Value("A".into()));
+    assert_eq!(decode_field(b"\\x41"), "A");
     // \x4 (single hex digit) → byte 0x04
-    assert_eq!(decode_field(b"\\x4"), DecodedField::Value("\u{4}".into()));
+    assert_eq!(decode_field(b"\\x4"), "\u{4}");
     // \x with no digits → literal \x
-    assert_eq!(decode_field(b"\\xZ"), DecodedField::Value("\\xZ".into()));
+    assert_eq!(decode_field(b"\\xZ"), "\\xZ");
 }
 
 #[test]
 fn decode_octal_escape() {
     // \101 → 'A'
-    assert_eq!(decode_field(b"\\101"), DecodedField::Value("A".into()));
+    assert_eq!(decode_field(b"\\101"), "A");
     // \1 → byte 0x01
-    assert_eq!(decode_field(b"\\1"), DecodedField::Value("\u{1}".into()));
+    assert_eq!(decode_field(b"\\1"), "\u{1}");
 }
 
 #[test]
 fn decode_unknown_escape_drops_backslash() {
     // PG behavior: \q → q
-    assert_eq!(decode_field(b"\\q"), DecodedField::Value("q".into()));
+    assert_eq!(decode_field(b"\\q"), "q");
 }
 
 #[test]
@@ -60,32 +61,18 @@ fn decode_backslash_n_inside_value_is_not_null() {
     // \N is only NULL when it is the entire field. As a per-character escape
     // it falls into the unknown-escape arm, where the backslash is dropped
     // and the `N` passes through, so b"x\\N" decodes to "xN".
-    assert_eq!(decode_field(b"x\\N"), DecodedField::Value("xN".into()));
+    assert_eq!(decode_field(b"x\\N"), "xN");
 }
 
 #[test]
 fn decode_trailing_backslash_passes_through() {
-    assert_eq!(decode_field(b"abc\\"), DecodedField::Value("abc\\".into()));
+    assert_eq!(decode_field(b"abc\\"), "abc\\");
 }
 
 #[test]
 fn decode_multi_byte_utf8() {
     let bytes = "café".as_bytes();
-    assert_eq!(decode_field(bytes), DecodedField::Value("café".into()));
-}
-
-struct MockReader(Vec<u8>);
-
-#[async_trait]
-impl ByteReader for MockReader {
-    async fn size(&self) -> Result<u64> {
-        Ok(self.0.len() as u64)
-    }
-    async fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
-        let s = start as usize;
-        let e = std::cmp::min(end as usize, self.0.len());
-        Ok(self.0[s..e].to_vec())
-    }
+    assert_eq!(decode_field(bytes), "café");
 }
 
 const SAMPLE: &[u8] = b"\
@@ -107,7 +94,7 @@ COPY public.orders (id, user_id) FROM stdin;\n\
 
 #[tokio::test]
 async fn finds_users_block() {
-    let reader = MockReader(SAMPLE.to_vec());
+    let reader = MockByteReader::new(SAMPLE.to_vec());
     let block = find_copy_block(&reader, "public", "users").await.unwrap();
     assert_eq!(block.columns, vec!["id", "name", "email"]);
     let data = &SAMPLE[block.data_start as usize..block.data_end as usize];
@@ -122,14 +109,14 @@ async fn finds_users_block() {
 
 #[tokio::test]
 async fn finds_orders_block() {
-    let reader = MockReader(SAMPLE.to_vec());
+    let reader = MockByteReader::new(SAMPLE.to_vec());
     let block = find_copy_block(&reader, "public", "orders").await.unwrap();
     assert_eq!(block.columns, vec!["id", "user_id"]);
 }
 
 #[tokio::test]
 async fn missing_table_errors() {
-    let reader = MockReader(SAMPLE.to_vec());
+    let reader = MockByteReader::new(SAMPLE.to_vec());
     let err = find_copy_block(&reader, "public", "nonexistent")
         .await
         .unwrap_err();
@@ -141,7 +128,7 @@ async fn missing_table_errors() {
 
 #[tokio::test]
 async fn schema_must_match() {
-    let reader = MockReader(SAMPLE.to_vec());
+    let reader = MockByteReader::new(SAMPLE.to_vec());
     let err = find_copy_block(&reader, "sales", "users")
         .await
         .unwrap_err();
@@ -154,7 +141,7 @@ async fn schema_must_match() {
 #[tokio::test]
 async fn case_insensitive_copy_keyword() {
     let data = b"copy public.t (a) from stdin;\n1\n\\.\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let block = find_copy_block(&reader, "public", "t").await.unwrap();
     assert_eq!(block.columns, vec!["a"]);
 }
@@ -162,7 +149,7 @@ async fn case_insensitive_copy_keyword() {
 #[tokio::test]
 async fn no_column_list_is_supported() {
     let data = b"COPY public.t FROM stdin;\n1\ta\n\\.\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
     assert!(matches!(
         err.downcast_ref::<ScanError>(),
@@ -173,7 +160,7 @@ async fn no_column_list_is_supported() {
 #[tokio::test]
 async fn quoted_identifiers_are_unquoted() {
     let data = b"COPY \"public\".\"My Table\" (\"col one\", \"col-two\") FROM stdin;\n1\t2\n\\.\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let block = find_copy_block(&reader, "public", "My Table")
         .await
         .unwrap();
@@ -189,7 +176,7 @@ COPY public.t (a) FROM stdin;\n\
 COPY public.t (a) FROM stdin;\n\
 2\n\
 \\.\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
     assert!(matches!(
         err.downcast_ref::<ScanError>(),
@@ -200,7 +187,7 @@ COPY public.t (a) FROM stdin;\n\
 #[tokio::test]
 async fn missing_terminator_errors() {
     let data = b"COPY public.t (a) FROM stdin;\n1\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
     assert!(matches!(
         err.downcast_ref::<ScanError>(),
@@ -210,7 +197,7 @@ async fn missing_terminator_errors() {
 
 #[tokio::test]
 async fn list_copy_blocks_returns_all_blocks_in_order() {
-    let reader = MockReader(SAMPLE.to_vec());
+    let reader = MockByteReader::new(SAMPLE.to_vec());
     let blocks = list_copy_blocks(&reader).await.unwrap();
     assert_eq!(blocks.len(), 2);
     assert_eq!(blocks[0].schema, "public");
@@ -224,7 +211,7 @@ async fn list_copy_blocks_returns_all_blocks_in_order() {
 
 #[tokio::test]
 async fn list_copy_blocks_empty_when_no_copy_lines() {
-    let reader = MockReader(b"-- preamble\nSET timezone='UTC';\n".to_vec());
+    let reader = MockByteReader::new(b"-- preamble\nSET timezone='UTC';\n".to_vec());
     let blocks = list_copy_blocks(&reader).await.unwrap();
     assert!(blocks.is_empty());
 }
@@ -427,7 +414,7 @@ async fn quoted_identifier_preserves_utf8_multibyte() {
     // emits the bytes verbatim. The scanner must round-trip them, not Latin-1
     // mangle them through `byte as char`.
     let data = "COPY \"public\".\"naïve\" (\"café\") FROM stdin;\n1\n\\.\n".as_bytes();
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let block = find_copy_block(&reader, "public", "naïve").await.unwrap();
     assert_eq!(block.table, "naïve");
     assert_eq!(block.columns, vec!["café"]);
@@ -438,7 +425,7 @@ async fn quoted_column_list_handles_paren_and_comma_inside_quotes() {
     // A column named `c)d` must not truncate the column list; a column named
     // `a,b` must not be split. Both are legal PG quoted identifiers.
     let data = b"COPY public.weird (\"a,b\", normal, \"c)d\") FROM stdin;\n1\t2\t3\n\\.\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let block = find_copy_block(&reader, "public", "weird").await.unwrap();
     assert_eq!(block.columns, vec!["a,b", "normal", "c)d"]);
 }
@@ -449,7 +436,7 @@ async fn malformed_column_list_unterminated_quote_errors() {
     // Must surface as MalformedColumnList, not silently downgrade to
     // NoMatch (which would later look like NotFound or MissingTerminator).
     let data = b"COPY public.t (\"a, b) FROM stdin;\n1\n\\.\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let err = list_copy_blocks(&reader).await.unwrap_err();
     assert!(matches!(
         err.downcast_ref::<ScanError>(),
@@ -460,7 +447,7 @@ async fn malformed_column_list_unterminated_quote_errors() {
 #[tokio::test]
 async fn malformed_column_list_empty_parens_errors() {
     let data = b"COPY public.t () FROM stdin;\n\\.\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let err = list_copy_blocks(&reader).await.unwrap_err();
     assert!(matches!(
         err.downcast_ref::<ScanError>(),
@@ -472,7 +459,7 @@ async fn malformed_column_list_empty_parens_errors() {
 async fn quoted_identifier_with_escaped_quote_round_trips() {
     // A literal `"` inside a quoted identifier is escaped as `""`.
     let data = b"COPY public.\"weird\"\"name\" (a) FROM stdin;\n1\n\\.\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let block = find_copy_block(&reader, "public", "weird\"name")
         .await
         .unwrap();
@@ -506,18 +493,17 @@ async fn read_line_rejects_pathological_unbounded_header() {
 }
 
 #[tokio::test]
-async fn find_terminator_rejects_data_line_exceeding_cap() {
-    // A COPY block whose data section never has a `\n` between data_start and
-    // size simulates a truncated dump body. find_terminator must error rather
-    // than allocate up to MAX_DATA_LINE_BYTES (1 GiB) before giving up. We
-    // wrap a header so the scanner enters the data-scan code path; the data
-    // body is 2 MiB of `x` with no newlines.
+async fn find_terminator_errors_on_truncated_body_without_newlines() {
+    // A COPY block whose data section never contains `\n` between data_start
+    // and EOF simulates a truncated dump body. find_terminator must surface
+    // a MissingTerminator error rather than spin or grow memory unbounded.
+    // 2 MiB body keeps the test fast; the production 1 GiB cap is the same
+    // code path with a larger fixture.
     use crate::io::ByteReader;
     struct HeaderThenJunk;
     #[async_trait::async_trait]
     impl ByteReader for HeaderThenJunk {
         async fn size(&self) -> anyhow::Result<u64> {
-            // header line ("COPY public.t (a) FROM stdin;\n" = 30 bytes) + 2 MiB junk
             Ok(30 + 2 * 1024 * 1024)
         }
         async fn read_range(&self, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
@@ -534,12 +520,6 @@ async fn find_terminator_rejects_data_line_exceeding_cap() {
             Ok(out)
         }
     }
-    // Lower the cap by exhausting the data scan via a small file-size proxy:
-    // since we cannot temporarily shrink the production cap, this test instead
-    // verifies the bytewise scan path TERMINATES at end-of-file with
-    // Ok(None) when no terminator is present (rather than spinning or OOMing).
-    // Production cap is exercised in CI by the slow-path test below if the
-    // build defines it; here we assert bounded behavior on a finite stream.
     let reader = HeaderThenJunk;
     let blocks = list_copy_blocks(&reader).await;
     assert!(
@@ -591,7 +571,7 @@ async fn find_terminator_handles_eof_without_trailing_newline() {
     // still recognize the terminator at EOF. Pinning this so a future
     // refactor of find_terminator doesn't accidentally regress it.
     let data = b"COPY public.t (a) FROM stdin;\n1\n2\n\\.";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let block = find_copy_block(&reader, "public", "t").await.unwrap();
     assert_eq!(block.columns, vec!["a"]);
     // data_end points to the start of the `\.` line (offset of the `\\` byte).
@@ -604,7 +584,7 @@ async fn read_chunk_handles_crlf_line_endings() {
     // pg_dump on Windows-flavored paths can produce CRLF; split_lines strips
     // the trailing \r per line. Assert decoded fields don't carry stray \r.
     let data = b"COPY public.t (a, b) FROM stdin;\r\n1\twidget\r\n2\tgizmo\r\n\\.\r\n";
-    let reader = MockReader(data.to_vec());
+    let reader = MockByteReader::new(data.to_vec());
     let pg_reader = PgDumpReader::new(reader, "public", "t").await.unwrap();
     let meta = pg_reader.metadata().await.unwrap();
     let chunks = pg_reader.create_chunks(meta.file_size_bytes).await.unwrap();

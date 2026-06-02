@@ -84,14 +84,9 @@ pub struct ParquetConfig {
 /// value is what was originally loaded and is compared against the freshly
 /// scanned value during `verify_resume_compatibility` to catch a source edit
 /// that changed the COPY column list while keeping the file size unchanged.
-/// `None` is reserved for backwards compatibility with manifests written
-/// before this field existed; library callers constructing `LoadConfig`
-/// directly must populate `copy_columns` or the column-order guard will
-/// bail.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PgDumpConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub copy_columns: Option<Vec<String>>,
+    pub copy_columns: Vec<String>,
 }
 
 /// File format and its associated configuration
@@ -511,20 +506,8 @@ mod tests {
 
     #[test]
     fn pgdump_format_round_trips_through_serde() {
-        let original = FileFormat::PgDump(PgDumpConfig::default());
-        let json = serde_json::to_string(&original).unwrap();
-        let parsed: FileFormat = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, FileFormat::PgDump(_)));
-        assert!(json.contains("\"format\":\"pgdump\""));
-    }
-
-    #[test]
-    fn pgdump_format_round_trips_with_populated_copy_columns() {
-        // The fresh-load runtime path always persists Some(columns); a serde
-        // rename or skip-attribute regression on `copy_columns` would silently
-        // downgrade resume to the (now-bailing) None path.
         let original = FileFormat::PgDump(PgDumpConfig {
-            copy_columns: Some(vec!["id".into(), "name".into(), "note".into()]),
+            copy_columns: vec!["id".into(), "name".into(), "note".into()],
         });
         let json = serde_json::to_string(&original).unwrap();
         let parsed: FileFormat = serde_json::from_str(&json).unwrap();
@@ -533,8 +516,9 @@ mod tests {
         };
         assert_eq!(
             pg.copy_columns,
-            Some(vec!["id".into(), "name".into(), "note".into()])
+            vec!["id".to_string(), "name".into(), "note".into()]
         );
+        assert!(json.contains("\"format\":\"pgdump\""));
         assert!(json.contains("copy_columns"));
     }
 
