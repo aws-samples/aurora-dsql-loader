@@ -4196,8 +4196,7 @@ mod tests {
         writeln!(f, "\\.")?;
         f.flush()?;
 
-        let pool =
-            setup_sqlite_table("things", "id INTEGER, name TEXT, note TEXT NOT NULL").await;
+        let pool = setup_sqlite_table("things", "id INTEGER, name TEXT, note TEXT NOT NULL").await;
         let args = pgdump_load_args(
             f.path().to_string_lossy().into_owned(),
             "things",

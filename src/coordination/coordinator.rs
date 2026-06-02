@@ -156,10 +156,8 @@ fn align_pgdump_schema_to_copy_columns(
 
     if copy_set != target_set {
         let target_names: Vec<&str> = resolved.columns.iter().map(|c| c.name.as_str()).collect();
-        let missing_in_target: Vec<&str> =
-            copy_set.difference(&target_set).copied().collect();
-        let missing_in_dump: Vec<&str> =
-            target_set.difference(&copy_set).copied().collect();
+        let missing_in_target: Vec<&str> = copy_set.difference(&target_set).copied().collect();
+        let missing_in_dump: Vec<&str> = target_set.difference(&copy_set).copied().collect();
         anyhow::bail!(
             "pg_dump column-set mismatch for {}.{}:\n  \
              dump COPY columns:    {:?}\n  \
@@ -179,10 +177,8 @@ fn align_pgdump_schema_to_copy_columns(
 
     // Sets match, order differs — reorder by name so field N → column N.
     let original = std::mem::take(&mut resolved.columns);
-    let mut by_name: HashMap<String, crate::db::schema::Column> = original
-        .into_iter()
-        .map(|c| (c.name.clone(), c))
-        .collect();
+    let mut by_name: HashMap<String, crate::db::schema::Column> =
+        original.into_iter().map(|c| (c.name.clone(), c)).collect();
     resolved.columns = copy_cols
         .iter()
         .map(|name| {
@@ -210,12 +206,19 @@ fn validate_pgdump_column_set(config: &LoadConfig, live_schema: &Schema) -> Resu
         return Ok(());
     };
     let copy_set: HashSet<&str> = pg.copy_columns.iter().map(String::as_str).collect();
-    let target_set: HashSet<&str> =
-        live_schema.columns.iter().map(|c| c.name.as_str()).collect();
+    let target_set: HashSet<&str> = live_schema
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     if copy_set == target_set {
         return Ok(());
     }
-    let target_names: Vec<&str> = live_schema.columns.iter().map(|c| c.name.as_str()).collect();
+    let target_names: Vec<&str> = live_schema
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     anyhow::bail!(
         "Cannot resume: pg_dump COPY column set no longer matches target {}.{}.\n  \
          dump COPY columns:    {:?}\n  \
