@@ -18,6 +18,26 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
 
+    # Postgres source instance for the pg_dump E2E test. Same major version
+    # ubuntu-latest ships pg_dump for, so the dump-and-load round-trip uses
+    # matched binary + server.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGDUMP_E2E_SOURCE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -26,6 +46,11 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
+
+    - name: Install postgresql-client (provides pg_dump)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql-client
 
     - name: Cache cargo registry
       uses: actions/cache@v4

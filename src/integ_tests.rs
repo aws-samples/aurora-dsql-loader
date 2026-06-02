@@ -4184,6 +4184,136 @@ mod tests {
         Ok(())
     }
 
+    /// End-to-end: drive the real `pg_dump` binary against a real Postgres
+    /// instance, then run the dump through the loader's pgdump pipeline and
+    /// assert row equality. This is the only test that exercises whatever
+    /// today's `pg_dump` binary actually emits — the other tests use
+    /// hand-shaped fixtures.
+    ///
+    /// Skipped (returns Ok with a printed message) when `PGDUMP_E2E_SOURCE_URL`
+    /// is not set, so `cargo test` works locally without a Postgres available.
+    /// CI sets it via the `postgres` service container.
+    #[tokio::test]
+    async fn pgdump_real_binary_to_loader_round_trip() -> anyhow::Result<()> {
+        use std::process::Command;
+
+        let Some(source_pg_url) = std::env::var("PGDUMP_E2E_SOURCE_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+        else {
+            eprintln!(
+                "skipping pgdump_real_binary_to_loader_round_trip: \
+                 PGDUMP_E2E_SOURCE_URL not set"
+            );
+            return Ok(());
+        };
+
+        // 1. Set up SOURCE table on the real PG instance with type variety
+        // that exercises the COPY text-format escapes the decoder handles.
+        let src_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&source_pg_url)
+            .await?;
+
+        let table = format!("pg_loader_e2e_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (
+                id BIGINT PRIMARY KEY,
+                name TEXT NOT NULL,
+                note TEXT,
+                blob BYTEA,
+                payload JSONB,
+                ts TIMESTAMPTZ
+            )"
+        ))
+        .execute(&src_pool)
+        .await?;
+
+        // Rows that hit each escape class: tab in TEXT, newline in TEXT, NULL,
+        // BYTEA, JSONB, TZ-aware ts, plus a multi-byte UTF-8 column value.
+        sqlx::query(&format!(
+            "INSERT INTO {table} (id, name, note, blob, payload, ts) VALUES
+                (1, 'plain',         E'tab\\there',  E'\\\\xDEADBEEF', '{{\"a\":1}}'::jsonb, '2024-01-15 12:34:56+00'),
+                (2, 'unicode-naïve', E'two\\nlines', E'\\\\x00FF',     '[1,2,3]'::jsonb,    '2024-06-30 23:59:59+00'),
+                (3, 'null-note',      NULL,          NULL,             NULL,                NULL)"
+        ))
+        .execute(&src_pool)
+        .await?;
+
+        // 2. Dump it with the real pg_dump binary.
+        let dump_dir = tempfile::tempdir()?;
+        let dump_path = dump_dir.path().join("dump.sql");
+        let status = Command::new("pg_dump")
+            .args([
+                "--data-only",
+                "-Fp",
+                "--table",
+                &table,
+                "--no-owner",
+                "--no-privileges",
+                &source_pg_url,
+            ])
+            .stdout(std::fs::File::create(&dump_path)?)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to spawn pg_dump (is it on PATH?): {e}"))?;
+        assert!(status.success(), "pg_dump exited with {status}");
+
+        // 3. Load through the loader pipeline into SQLite. SQLite stands in
+        // for DSQL here; the contract under test is "the bytes the real
+        // pg_dump binary writes parse correctly through PgDumpReader and
+        // the worker insert path", which is database-agnostic.
+        // Target column order is shuffled relative to the dump's COPY clause
+        // — exercises the name-based reorder against real pg_dump output.
+        let pool = setup_sqlite_table(
+            &table,
+            "ts TEXT, payload TEXT, blob BLOB, note TEXT, name TEXT, id INTEGER",
+        )
+        .await;
+        let args = pgdump_load_args(
+            dump_path.to_string_lossy().into_owned(),
+            &table,
+            pool.clone(),
+        );
+
+        let result = run_load(args).await?;
+        assert_eq!(
+            result.records_loaded, 3,
+            "all 3 dumped rows must load; failed = {}",
+            result.records_failed
+        );
+        assert_eq!(result.records_failed, 0);
+
+        // 4. Spot-check the tricky row: tab inside TEXT survives the decode.
+        #[derive(Debug, sqlx::FromRow)]
+        struct DumpRow {
+            id: i64,
+            name: String,
+            note: Option<String>,
+        }
+        let mut conn = pool.acquire().await?;
+        let PoolConnection::Sqlite(ref mut sqlite_conn) = conn else {
+            panic!("expected sqlite pool connection in test");
+        };
+        let rows: Vec<DumpRow> =
+            sqlx::query_as(&format!("SELECT id, name, note FROM {table} ORDER BY id"))
+                .fetch_all(&mut **sqlite_conn)
+                .await?;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].name, "plain");
+        assert_eq!(rows[0].note.as_deref(), Some("tab\there"));
+        assert_eq!(rows[1].name, "unicode-naïve");
+        assert_eq!(rows[1].note.as_deref(), Some("two\nlines"));
+        assert_eq!(rows[2].name, "null-note");
+        assert_eq!(rows[2].note, None);
+
+        // 5. Best-effort source cleanup.
+        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(&src_pool)
+            .await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn pgdump_errors_on_column_set_mismatch() -> anyhow::Result<()> {
         use std::io::Write;
