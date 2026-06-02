@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use super::delimited::reader::GenericDelimitedReader;
 use super::parquet::GenericParquetReader;
-use crate::io::{LocalFileByteReader, S3ByteReader, SourceUri};
+use crate::io::{
+    ByteReader, LocalFileByteReader, S3ByteReader, SourceUri, estimate_rows_in_range,
+    find_next_record_boundary,
+};
 
 /// Metadata about a file to be loaded
 #[derive(Debug, Clone)]
@@ -37,6 +40,50 @@ pub struct ChunkData {
     pub bytes_read: u64,
     /// Number of records that failed to parse
     pub parse_errors: u64,
+}
+
+/// Build newline-aligned `Chunk`s over the byte range `[start, end)` from
+/// `reader`, each at most `target_size` bytes. Each chunk's `end_offset` is
+/// snapped forward to the next `\n` so a row never straddles two chunks.
+/// Estimated rows are sampled per chunk via `estimate_rows_in_range`.
+///
+/// Used by every newline-delimited reader (CSV/TSV, pg_dump). Parquet has
+/// its own row-group-aware chunking and does not call this.
+pub async fn build_chunks_over_range(
+    reader: &dyn ByteReader,
+    start: u64,
+    end: u64,
+    target_size: u64,
+) -> Result<Vec<Chunk>> {
+    if start >= end {
+        return Ok(vec![]);
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = start;
+    let mut chunk_id = 0u32;
+
+    while current < end {
+        let target_end = std::cmp::min(current + target_size, end);
+        let actual_end = if target_end >= end {
+            end
+        } else {
+            // find_next_record_boundary returns end-of-file when no \n exists
+            // in [target_end, file_size); clamp to our range so a pgdump caller
+            // doesn't push past data_end.
+            std::cmp::min(find_next_record_boundary(reader, target_end).await?, end)
+        };
+        let estimated_rows = estimate_rows_in_range(reader, current, actual_end).await?;
+        chunks.push(Chunk {
+            chunk_id,
+            start_offset: current,
+            end_offset: actual_end,
+            estimated_rows,
+        });
+        current = actual_end;
+        chunk_id += 1;
+    }
+    Ok(chunks)
 }
 
 /// Trait for reading different file formats with chunking support
@@ -92,6 +139,7 @@ pub enum Format {
     Csv,
     Tsv,
     Parquet,
+    PgDump,
 }
 
 /// Factory for creating FileReader instances based on URI and format
@@ -163,6 +211,41 @@ impl ReaderFactory {
                     S3ByteReader::new(Arc::clone(&self.s3_client), bucket.clone(), key.clone());
                 let reader = GenericParquetReader::new(byte_reader).await?;
                 Ok(Arc::new(reader) as Arc<dyn FileReader>)
+            }
+
+            // pg_dump needs out-of-band column metadata (the COPY clause), so it
+            // is built via `create_pgdump_reader` instead. The variant lives on
+            // the same enum for ergonomic dispatch in `runner.rs`; reaching this
+            // arm means a caller bypassed that dispatch.
+            (_, Format::PgDump) => {
+                anyhow::bail!("internal: pg_dump format must be created via create_pgdump_reader()")
+            }
+        }
+    }
+
+    /// Create a FileReader for a pg_dump source URI, scoped to a single COPY block.
+    /// Returns the reader plus the column names declared in the matching
+    /// `COPY ... (cols)` clause, in declaration order.
+    pub async fn create_pgdump_reader(
+        &self,
+        source_uri: &SourceUri,
+        schema: &str,
+        table: &str,
+    ) -> Result<(Arc<dyn FileReader>, Vec<String>)> {
+        use crate::formats::pgdump::PgDumpReader;
+        match source_uri {
+            SourceUri::Local(path) => {
+                let byte_reader = LocalFileByteReader::new(path);
+                let reader = PgDumpReader::new(byte_reader, schema, table).await?;
+                let columns = reader.columns().to_vec();
+                Ok((Arc::new(reader) as Arc<dyn FileReader>, columns))
+            }
+            SourceUri::S3 { bucket, key } => {
+                let byte_reader =
+                    S3ByteReader::new(Arc::clone(&self.s3_client), bucket.clone(), key.clone());
+                let reader = PgDumpReader::new(byte_reader, schema, table).await?;
+                let columns = reader.columns().to_vec();
+                Ok((Arc::new(reader) as Arc<dyn FileReader>, columns))
             }
         }
     }

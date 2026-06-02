@@ -75,6 +75,20 @@ pub struct ParquetConfig {
     // Future: row group batch size, compression settings, etc.
 }
 
+/// Configuration for pg_dump format reading.
+///
+/// `copy_columns` carries the column names declared in the source dump's
+/// `COPY ... (cols)` clause, in declaration order. The runner re-scans the
+/// source on every invocation (including resume) and rebuilds this field
+/// from the live scan, so the in-memory value is always fresh; the persisted
+/// value is what was originally loaded and is compared against the freshly
+/// scanned value during `verify_resume_compatibility` to catch a source edit
+/// that changed the COPY column list while keeping the file size unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PgDumpConfig {
+    pub copy_columns: Vec<String>,
+}
+
 /// File format and its associated configuration
 ///
 /// This enum encapsulates both the file format type and its specific configuration.
@@ -86,6 +100,7 @@ pub enum FileFormat {
     Csv(DelimitedConfig),
     Tsv(DelimitedConfig),
     Parquet(ParquetConfig),
+    PgDump(PgDumpConfig),
 }
 
 /// Information about a chunk to be processed
@@ -487,6 +502,24 @@ mod tests {
         let parquet_format = FileFormat::Parquet(ParquetConfig::default());
         let json = serde_json::to_string_pretty(&parquet_format).unwrap();
         println!("Parquet format:\n{}", json);
+    }
+
+    #[test]
+    fn pgdump_format_round_trips_through_serde() {
+        let original = FileFormat::PgDump(PgDumpConfig {
+            copy_columns: vec!["id".into(), "name".into(), "note".into()],
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: FileFormat = serde_json::from_str(&json).unwrap();
+        let FileFormat::PgDump(pg) = parsed else {
+            panic!("expected FileFormat::PgDump, got {parsed:?}");
+        };
+        assert_eq!(
+            pg.copy_columns,
+            vec!["id".to_string(), "name".into(), "note".into()]
+        );
+        assert!(json.contains("\"format\":\"pgdump\""));
+        assert!(json.contains("copy_columns"));
     }
 
     #[test]

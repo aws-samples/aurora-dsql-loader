@@ -83,6 +83,53 @@ aurora-dsql-loader load \
 ```
 Listed columns are dropped from the INSERT so DSQL applies the column's `DEFAULT` expression (e.g. `gen_random_uuid()`, `CURRENT_TIMESTAMP`). Source records must still contain these columns in their original positions.
 
+**Load from a pg_dump file:**
+```bash
+# 1. Generate the dump on the source PG side:
+pg_dump --data-only --table=users mydb > users.sql
+
+# 2. Load. The target table must already exist with a compatible schema.
+aurora-dsql-loader load \
+  --endpoint your-cluster.dsql.us-east-1.on.aws \
+  --source-uri users.sql \
+  --format pgdump \
+  --table users
+```
+
+Notes:
+- Only plain (`-Fp`, the default) `pg_dump` output with `COPY FROM stdin` blocks
+  is supported. Custom (`-Fc`) and directory (`-Fd`) formats are not.
+- The dump may contain DDL and other tables; we locate the `COPY` block matching
+  `--schema.--table` and ignore the rest.
+- Run with `--data-only` to skip DDL the loader would otherwise discard. The
+  target table must exist; `--if-not-exists` is rejected for `pgdump`.
+- `--column-map` and `--exclude-columns` are not supported (the column set is
+  embedded in the dump's `COPY` statement).
+
+**Discover tables in a dump (multi-table workflows):**
+
+```bash
+$ aurora-dsql-loader list-tables --source-uri backup.sql
+public	users	id,email,created_at
+public	orders	id,user_id,total_cents,status
+sales	commissions	rep_id,amount,paid_at
+
+# Driving multi-table loads with shell:
+aurora-dsql-loader list-tables --source-uri backup.sql | while IFS=$'\t' read schema table cols; do
+  aurora-dsql-loader load \
+    --endpoint $DSQL_ENDPOINT \
+    --source-uri backup.sql \
+    --format pgdump \
+    --schema "$schema" \
+    --table "$table"
+done
+```
+
+Pre-create each target table in DSQL with the same column set as the source
+COPY clause. Order does not matter — the loader reorders columns by name to
+match the dump. A column-set mismatch (extra or missing columns) is rejected
+with a clear error before any rows are loaded.
+
 ### CSV/TSV header behavior
 
 By default, the loader treats every row of a CSV or TSV file as data — it does

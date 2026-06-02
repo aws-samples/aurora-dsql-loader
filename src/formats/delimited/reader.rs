@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
-use crate::formats::reader::{Chunk, ChunkData, DelimitedConfig, FileMetadata, FileReader, Record};
+use crate::formats::reader::{
+    Chunk, ChunkData, DelimitedConfig, FileMetadata, FileReader, Record, build_chunks_over_range,
+};
 use crate::io::{ByteReader, estimate_rows_in_range, find_next_record_boundary};
 
 /// Generic delimited file reader that works with any ByteReader implementation
@@ -36,48 +38,13 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
     }
 
     async fn create_chunks(&self, target_size: u64) -> Result<Vec<Chunk>> {
-        let metadata = self.metadata().await?;
-        let file_size = metadata.file_size_bytes;
-
-        if file_size == 0 {
-            return Ok(vec![]);
-        }
-
-        let mut chunks = Vec::new();
-        let mut current_offset = 0u64;
-        let mut chunk_id = 0u32;
-
-        // Skip header if present
-        if self.config.has_header {
-            current_offset = find_next_record_boundary(&self.reader, 0).await?;
-        }
-
-        while current_offset < file_size {
-            let target_end = std::cmp::min(current_offset + target_size, file_size);
-
-            // Find the actual end at a record boundary
-            let actual_end = if target_end >= file_size {
-                file_size
-            } else {
-                find_next_record_boundary(&self.reader, target_end).await?
-            };
-
-            // Estimate rows for this chunk
-            let estimated_rows =
-                estimate_rows_in_range(&self.reader, current_offset, actual_end).await?;
-
-            chunks.push(Chunk {
-                chunk_id,
-                start_offset: current_offset,
-                end_offset: actual_end,
-                estimated_rows,
-            });
-
-            current_offset = actual_end;
-            chunk_id += 1;
-        }
-
-        Ok(chunks)
+        let file_size = self.metadata().await?.file_size_bytes;
+        let start = if self.config.has_header {
+            find_next_record_boundary(&self.reader, 0).await?
+        } else {
+            0
+        };
+        build_chunks_over_range(&self.reader, start, file_size, target_size).await
     }
 
     async fn read_chunk(&self, chunk: &Chunk) -> Result<ChunkData> {

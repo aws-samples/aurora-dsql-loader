@@ -31,7 +31,10 @@ struct SourceArgs {
     #[arg(short, long)]
     source_uri: String,
 
-    /// File format (csv, tsv, parquet) - auto-detected from extension if not specified
+    /// File format (csv, tsv, parquet, pgdump). Auto-detected from extension
+    /// for csv/tsv/parquet; pgdump must be specified explicitly. pgdump
+    /// requires plain (`-Fp`) `pg_dump --data-only` output and is not
+    /// compatible with --column-map, --exclude-columns, or --if-not-exists.
     #[arg(short, long)]
     format: Option<String>,
 
@@ -135,6 +138,7 @@ struct OutputArgs {
 }
 
 #[derive(Clone, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     Load {
         #[command(flatten)]
@@ -152,6 +156,15 @@ enum Command {
         #[command(flatten)]
         output: OutputArgs,
     },
+    /// List every `COPY ... FROM stdin;` block in a pg_dump file.
+    ///
+    /// Use this to discover tables in a dump before running `load --table=...`
+    /// per table. Output is one line per table, suitable for shell scripting.
+    ListTables {
+        /// Path to a pg_dump file (local path or s3:// URI).
+        #[arg(short, long)]
+        source_uri: String,
+    },
 }
 
 #[tokio::main]
@@ -167,6 +180,26 @@ async fn main() -> anyhow::Result<()> {
             output,
         } => {
             run_loader(connection, source, target, load, output).await?;
+        }
+        Command::ListTables { source_uri } => {
+            let tables = aurora_dsql_loader::runner::list_pgdump_tables(&source_uri).await?;
+            // Validate ALL identifiers before printing ANY line: a malicious
+            // dump that places a title-injection payload in the Nth block
+            // must not be able to leak the first N-1 lines onto the operator's
+            // TTY before we bail. Tab-separated, one block per line, for
+            // downstream `awk`/`cut` consumption.
+            for t in &tables {
+                if let Some(name) = check_listable(t) {
+                    anyhow::bail!(
+                        "list-tables: identifier {name:?} contains a tab, newline, \
+                         control byte, or Unicode bidi/format character that would \
+                         corrupt the TSV output or visually deceive the operator."
+                    );
+                }
+            }
+            for t in &tables {
+                println!("{}\t{}\t{}", t.schema, t.table, t.columns.join(","));
+            }
         }
     }
     Ok(())
@@ -389,6 +422,36 @@ async fn run_loader(
     }
 
     Ok(())
+}
+
+/// Reject identifiers that would corrupt the `list-tables` TSV output (which
+/// downstream `awk`/`cut` pipelines depend on) or visually deceive an operator
+/// reading the output on a TTY. On a hit, returns the offending identifier.
+///
+/// Reject classes:
+/// - C0/C1 control bytes (covers `\t`, `\n`, `\r`, NUL, DEL, ESC) — corrupt
+///   TSV framing or smuggle ANSI terminal escapes.
+/// - Unicode bidi/format codepoints (RLM, LRM, RTL/LTR overrides, ZWSP, BOM,
+///   line/paragraph separators) — visually reorder or hide characters in a
+///   terminal without using any C0/C1 byte.
+/// - Comma — would mis-parse the comma-joined third TSV field on column
+///   names. The schema and table fields occupy their own tab-separated slots
+///   so a comma there does not ambiguate framing; checked only on columns.
+fn check_listable(t: &aurora_dsql_loader::runner::PgDumpTable) -> Option<&str> {
+    if t.schema.contains(is_unsafe_for_listing) {
+        return Some(&t.schema);
+    }
+    if t.table.contains(is_unsafe_for_listing) {
+        return Some(&t.table);
+    }
+    t.columns
+        .iter()
+        .find(|col| col.contains(is_unsafe_for_listing) || col.contains(','))
+        .map(String::as_str)
+}
+
+fn is_unsafe_for_listing(c: char) -> bool {
+    c.is_control() || aurora_dsql_loader::runner::is_bidi_or_format_char(c)
 }
 
 fn validate_delimited_options(
@@ -702,7 +765,9 @@ mod tests {
         ])
         .expect("args should parse (clap groups don't restrict by format)");
 
-        let Command::Load { source, .. } = args.command;
+        let Command::Load { source, .. } = args.command else {
+            panic!("expected Load")
+        };
         let err = validate_delimited_options("parquet", Format::Parquet, &source)
             .expect_err("--header on parquet must be rejected");
         let msg = err.to_string();
@@ -710,6 +775,155 @@ mod tests {
             msg.contains("--header"),
             "error should name the offending --header flag: {msg}"
         );
+    }
+
+    #[test]
+    fn pgdump_format_parses_through_cli() {
+        let args = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "/tmp/foo.sql",
+            "--format",
+            "pgdump",
+            "--table",
+            "users",
+            "--dry-run",
+        ])
+        .expect("pgdump format should parse");
+        let Command::Load { source, .. } = args.command else {
+            panic!("expected Load")
+        };
+        validate_delimited_options("pgdump", Format::PgDump, &source)
+            .expect("no delimited options were passed");
+    }
+
+    #[test]
+    fn pgdump_format_rejects_delimited_options() {
+        let args = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "/tmp/foo.sql",
+            "--format",
+            "pgdump",
+            "--table",
+            "users",
+            "--header",
+            "--dry-run",
+        ])
+        .expect("clap accepts --header (group is per-format)");
+        let Command::Load { source, .. } = args.command else {
+            panic!("expected Load")
+        };
+        let err = validate_delimited_options("pgdump", Format::PgDump, &source)
+            .expect_err("--header on pgdump must be rejected");
+        assert!(err.to_string().contains("--header"));
+    }
+
+    #[test]
+    fn list_tables_subcommand_parses() {
+        let args = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "list-tables",
+            "--source-uri",
+            "/tmp/x.sql",
+        ])
+        .expect("list-tables should parse");
+        match args.command {
+            Command::ListTables { source_uri } => {
+                assert_eq!(source_uri, "/tmp/x.sql");
+            }
+            _ => panic!("expected ListTables"),
+        }
+    }
+
+    #[test]
+    fn check_listable_accepts_safe_identifiers() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "users".into(),
+            columns: vec!["id".into(), "name".into()],
+        };
+        assert!(check_listable(&t).is_none());
+    }
+
+    #[test]
+    fn check_listable_rejects_tab_in_identifier() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "bad\tname".into(),
+            columns: vec!["id".into()],
+        };
+        assert!(check_listable(&t).is_some());
+    }
+
+    #[test]
+    fn check_listable_rejects_newline_in_column_name() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "users".into(),
+            columns: vec!["id".into(), "broken\nname".into()],
+        };
+        assert!(check_listable(&t).is_some());
+    }
+
+    #[test]
+    fn check_listable_rejects_ansi_escape_in_table() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "x\x1b]0;OWNED\x07".into(),
+            columns: vec!["id".into()],
+        };
+        assert!(check_listable(&t).is_some());
+    }
+
+    #[test]
+    fn check_listable_rejects_comma_in_column_name() {
+        // Comma in a column name would mis-parse the comma-joined third TSV field.
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "users".into(),
+            columns: vec!["a,b".into()],
+        };
+        assert!(check_listable(&t).is_some());
+    }
+
+    #[test]
+    fn check_listable_rejects_unicode_rtl_override() {
+        // U+202E "RIGHT-TO-LEFT OVERRIDE" reorders subsequent characters in
+        // a terminal — classic homograph spoof. Must be rejected even though
+        // it's not a C0/C1 control byte.
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "evil\u{202E}name".into(),
+            columns: vec!["id".into()],
+        };
+        assert!(check_listable(&t).is_some());
+    }
+
+    #[test]
+    fn check_listable_rejects_zero_width_space() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "public".into(),
+            table: "users".into(),
+            columns: vec!["id\u{200B}hidden".into()],
+        };
+        assert!(check_listable(&t).is_some());
+    }
+
+    #[test]
+    fn check_listable_rejects_bom() {
+        let t = aurora_dsql_loader::runner::PgDumpTable {
+            schema: "\u{FEFF}public".into(),
+            table: "users".into(),
+            columns: vec!["id".into()],
+        };
+        assert!(check_listable(&t).is_some());
     }
 
     #[test]
@@ -727,7 +941,9 @@ mod tests {
         ])
         .expect("args should parse");
 
-        let Command::Load { source, .. } = args.command;
+        let Command::Load { source, .. } = args.command else {
+            panic!("expected Load")
+        };
         validate_delimited_options("parquet", Format::Parquet, &source)
             .expect("parquet load should not trigger the delimited-options error");
     }

@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- New `--format pgdump` option to load data directly from `pg_dump --data-only`
+  output. Locates the `COPY <schema>.<table> FROM stdin;` block matching the
+  target table, ignores DDL and other tables, and decodes PG COPY text-format
+  escape sequences (`\N`, `\t`, `\\`, `\xHH`, `\NNN`, etc.). The target table
+  must already exist; `--if-not-exists`, `--column-map`, and `--exclude-columns`
+  are rejected for this format.
+- New `list-tables` subcommand that enumerates every `COPY ... FROM stdin;`
+  block in a pg_dump file. Drives multi-table migrations by feeding into a
+  shell loop of `load --table=...` invocations.
+- pg_dump loads now reorder target table columns by name to match the dump's
+  COPY clause. A target table whose columns differ in order (but match as a
+  set) loads successfully; only a column-set mismatch (extra or missing
+  columns) is rejected.
+- pg_dump loads now reject `-Fc` (custom) and `-Fd` (directory) archive
+  formats up front with a diagnostic that points to `-Fp`, instead of
+  failing later with a generic "no COPY block found" after streaming the
+  binary file.
+
+### Changed
+- `--schema` and `--table` (all formats) now reject identifiers containing
+  embedded `"`, `\`, NUL, control bytes, or Unicode bidi/format codepoints
+  (RLM, LRM, RTL/LTR overrides, ZWSP, BOM, line/paragraph separators, bidi
+  isolates). These bytes corrupt SQL identifier quoting or visually deceive
+  operators reading load logs. Existing customers using only ASCII letters,
+  digits, and underscore are unaffected; customers using PG quoted
+  identifiers with non-Latin characters are also unaffected.
+
 ## [3.0.0] - 2026-05-26
 
 ### Changed
