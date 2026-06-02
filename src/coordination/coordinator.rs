@@ -666,6 +666,26 @@ impl Coordinator {
             ));
         }
 
+        // Manifest chunks are aligned by the original format's chunker
+        // (CSV/TSV split on newlines, parquet on row groups, pg_dump on row
+        // boundaries inside a specific COPY block). Resuming under a
+        // different format would reuse those byte ranges with a parser that
+        // does not understand them and silently mis-parse every chunk.
+        if std::mem::discriminant(&manifest.file_format)
+            != std::mem::discriminant(&config.file_format)
+        {
+            return Err(anyhow::anyhow!(
+                "Cannot resume: file format mismatch\n\
+                 Manifest format: {:?}\n\
+                 Requested format: {:?}\n\
+                 The manifest's chunks were aligned by the original format's \
+                 chunker; resuming with a different format would parse the \
+                 wrong byte ranges. Start a fresh load.",
+                manifest.file_format,
+                config.file_format,
+            ));
+        }
+
         // pg_dump: catch a source edit that changed the COPY column list while
         // leaving the file size unchanged (e.g. swapping two columns in the
         // header without altering data). Chunks in the manifest were created

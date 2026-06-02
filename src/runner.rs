@@ -416,7 +416,7 @@ pub fn is_bidi_or_format_char(c: char) -> bool {
 }
 
 fn is_unsafe_identifier_char(c: char) -> bool {
-    c.is_control() || c == '"' || c == '\\' || c == '\0' || is_bidi_or_format_char(c)
+    c.is_control() || c == '"' || c == '\\' || is_bidi_or_format_char(c)
 }
 
 /// One entry per `COPY ... FROM stdin;` block in a pg_dump file.

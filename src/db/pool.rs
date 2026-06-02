@@ -107,6 +107,16 @@ pub async fn pool(args: PoolArgs) -> anyhow::Result<Pool> {
 }
 
 impl Pool {
+    /// Wrap an externally-managed `PgPool` for tests that need to drive the
+    /// loader against a real Postgres (e.g. CI's postgres service container).
+    /// Production code uses [`pool`] which goes through DSQL IAM auth.
+    #[cfg(test)]
+    pub fn from_pg_pool(pg_pool: sqlx::PgPool) -> Self {
+        Pool {
+            inner: PoolInner::Postgres(pg_pool),
+        }
+    }
+
     /// Create an in-memory SQLite pool for testing
     #[cfg(test)]
     pub async fn sqlite_in_memory() -> Result<Self, sqlx::Error> {

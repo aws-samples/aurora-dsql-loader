@@ -4184,17 +4184,18 @@ mod tests {
         Ok(())
     }
 
-    /// End-to-end: drive the real `pg_dump` binary against a real Postgres
-    /// instance, then run the dump through the loader's pgdump pipeline and
-    /// assert row equality. This is the only test that exercises whatever
-    /// today's `pg_dump` binary actually emits — the other tests use
-    /// hand-shaped fixtures.
+    /// End-to-end fidelity test: PG → real `pg_dump` → loader → PG, verified
+    /// with `EXCEPT` in both directions so any decode bug (BYTEA hex escapes,
+    /// JSONB whitespace canonicalization, TIMESTAMPTZ precision, NULL vs '',
+    /// UTF-8 multi-byte) shows up as a non-empty diff. Loading into the same
+    /// Postgres instance under a different table name lets PG do the type-
+    /// aware comparison — SQLite would silently coerce mismatches.
     ///
     /// Skipped (returns Ok with a printed message) when `PGDUMP_E2E_SOURCE_URL`
     /// is not set, so `cargo test` works locally without a Postgres available.
     /// CI sets it via the `postgres` service container.
     #[tokio::test]
-    async fn pgdump_real_binary_to_loader_round_trip() -> anyhow::Result<()> {
+    async fn pgdump_real_binary_round_trip_pg_to_pg() -> anyhow::Result<()> {
         use std::process::Command;
 
         let Some(source_pg_url) = std::env::var("PGDUMP_E2E_SOURCE_URL")
@@ -4202,22 +4203,26 @@ mod tests {
             .filter(|v| !v.is_empty())
         else {
             eprintln!(
-                "skipping pgdump_real_binary_to_loader_round_trip: \
+                "skipping pgdump_real_binary_round_trip_pg_to_pg: \
                  PGDUMP_E2E_SOURCE_URL not set"
             );
             return Ok(());
         };
 
-        // 1. Set up SOURCE table on the real PG instance with type variety
-        // that exercises the COPY text-format escapes the decoder handles.
-        let src_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
+        let pg_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
             .connect(&source_pg_url)
             .await?;
 
-        let table = format!("pg_loader_e2e_{}", uuid::Uuid::new_v4().simple());
+        // Unique src/dst names so concurrent CI runs don't collide.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let src = format!("pg_loader_src_{suffix}");
+        let dst = format!("pg_loader_dst_{suffix}");
+
+        // 1. SOURCE table with full type variety. Each row exercises a
+        // distinct decode class.
         sqlx::query(&format!(
-            "CREATE TABLE {table} (
+            "CREATE TABLE {src} (
                 id BIGINT PRIMARY KEY,
                 name TEXT NOT NULL,
                 note TEXT,
@@ -4226,21 +4231,36 @@ mod tests {
                 ts TIMESTAMPTZ
             )"
         ))
-        .execute(&src_pool)
+        .execute(&pg_pool)
         .await?;
 
-        // Rows that hit each escape class: tab in TEXT, newline in TEXT, NULL,
-        // BYTEA, JSONB, TZ-aware ts, plus a multi-byte UTF-8 column value.
+        // Pre-create DST with the same column SET but in DIFFERENT order than
+        // pg_dump emits — exercises name-based reorder against real pg_dump
+        // output. pg_dump emits columns in attnum (creation) order.
         sqlx::query(&format!(
-            "INSERT INTO {table} (id, name, note, blob, payload, ts) VALUES
-                (1, 'plain',         E'tab\\there',  E'\\\\xDEADBEEF', '{{\"a\":1}}'::jsonb, '2024-01-15 12:34:56+00'),
-                (2, 'unicode-naïve', E'two\\nlines', E'\\\\x00FF',     '[1,2,3]'::jsonb,    '2024-06-30 23:59:59+00'),
-                (3, 'null-note',      NULL,          NULL,             NULL,                NULL)"
+            "CREATE TABLE {dst} (
+                ts TIMESTAMPTZ,
+                payload JSONB,
+                blob BYTEA,
+                note TEXT,
+                name TEXT NOT NULL,
+                id BIGINT PRIMARY KEY
+            )"
         ))
-        .execute(&src_pool)
+        .execute(&pg_pool)
         .await?;
 
-        // 2. Dump it with the real pg_dump binary.
+        sqlx::query(&format!(
+            "INSERT INTO {src} (id, name, note, blob, payload, ts) VALUES
+                (1, 'plain',         E'tab\\there',  E'\\\\xDEADBEEF', '{{\"a\":1}}'::jsonb,  '2024-01-15 12:34:56+00'),
+                (2, 'unicode-naïve', E'two\\nlines', E'\\\\x00FF',     '[1,2,3,null]'::jsonb, '2024-06-30 23:59:59.123456+00'),
+                (3, 'null-fields',    NULL,          NULL,             NULL,                  NULL),
+                (4, 'empty-strings',  '',            E'\\\\x',         '{{}}'::jsonb,         '1970-01-01 00:00:00+00')"
+        ))
+        .execute(&pg_pool)
+        .await?;
+
+        // 2. Dump src with the real pg_dump binary.
         let dump_dir = tempfile::tempdir()?;
         let dump_path = dump_dir.path().join("dump.sql");
         let status = Command::new("pg_dump")
@@ -4248,7 +4268,7 @@ mod tests {
                 "--data-only",
                 "-Fp",
                 "--table",
-                &table,
+                &src,
                 "--no-owner",
                 "--no-privileges",
                 &source_pg_url,
@@ -4258,58 +4278,102 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("failed to spawn pg_dump (is it on PATH?): {e}"))?;
         assert!(status.success(), "pg_dump exited with {status}");
 
-        // 3. Load through the loader pipeline into SQLite. SQLite stands in
-        // for DSQL here; the contract under test is "the bytes the real
-        // pg_dump binary writes parse correctly through PgDumpReader and
-        // the worker insert path", which is database-agnostic.
-        // Target column order is shuffled relative to the dump's COPY clause
-        // — exercises the name-based reorder against real pg_dump output.
-        let pool = setup_sqlite_table(
-            &table,
-            "ts TEXT, payload TEXT, blob BLOB, note TEXT, name TEXT, id INTEGER",
-        )
-        .await;
-        let args = pgdump_load_args(
-            dump_path.to_string_lossy().into_owned(),
-            &table,
-            pool.clone(),
-        );
+        // 3. Re-target the dump's COPY block from `src` to `dst`. pg_dump
+        // emits the source table name in the COPY header; rewrite that line
+        // so the loader matches the dst block. Single-table workflow.
+        let dump_text = std::fs::read_to_string(&dump_path)?;
+        let rewritten =
+            dump_text.replace(&format!("COPY public.{src}"), &format!("COPY public.{dst}"));
+        let rewritten_path = dump_dir.path().join("rewritten.sql");
+        std::fs::write(&rewritten_path, rewritten)?;
+
+        // 4. Load through the loader pipeline into the same PG instance.
+        let pool = Pool::from_pg_pool(pg_pool.clone());
+        let args = LoadArgs {
+            endpoint: "ignored.dsql.us-east-1.on.aws".into(),
+            region: "us-east-1".into(),
+            username: "ignored".into(),
+            source_uri: rewritten_path.to_string_lossy().into_owned(),
+            target_table: dst.clone(),
+            schema: "public".into(),
+            format: Format::PgDump,
+            worker_count: 1,
+            chunk_size_bytes: 1024 * 1024,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
+            test_pool: Some(pool),
+        };
 
         let result = run_load(args).await?;
         assert_eq!(
-            result.records_loaded, 3,
-            "all 3 dumped rows must load; failed = {}",
+            result.records_loaded, 4,
+            "all 4 dumped rows must load; failed = {}",
             result.records_failed
         );
         assert_eq!(result.records_failed, 0);
 
-        // 4. Spot-check the tricky row: tab inside TEXT survives the decode.
-        #[derive(Debug, sqlx::FromRow)]
-        struct DumpRow {
-            id: i64,
-            name: String,
-            note: Option<String>,
-        }
-        let mut conn = pool.acquire().await?;
-        let PoolConnection::Sqlite(ref mut sqlite_conn) = conn else {
-            panic!("expected sqlite pool connection in test");
-        };
-        let rows: Vec<DumpRow> =
-            sqlx::query_as(&format!("SELECT id, name, note FROM {table} ORDER BY id"))
-                .fetch_all(&mut **sqlite_conn)
-                .await?;
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].id, 1);
-        assert_eq!(rows[0].name, "plain");
-        assert_eq!(rows[0].note.as_deref(), Some("tab\there"));
-        assert_eq!(rows[1].name, "unicode-naïve");
-        assert_eq!(rows[1].note.as_deref(), Some("two\nlines"));
-        assert_eq!(rows[2].name, "null-note");
-        assert_eq!(rows[2].note, None);
+        // 5. Type-aware fidelity check: PG itself compares src vs dst, so any
+        // BYTEA/JSONB/TIMESTAMPTZ/NULL drift surfaces as a non-empty diff.
+        // Run EXCEPT in both directions to catch missing AND extra rows.
+        let (src_minus_dst,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT id, name, note, blob, payload, ts FROM {src}
+                 EXCEPT
+                 SELECT id, name, note, blob, payload, ts FROM {dst}
+             ) diff"
+        ))
+        .fetch_one(&pg_pool)
+        .await?;
+        let (dst_minus_src,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT id, name, note, blob, payload, ts FROM {dst}
+                 EXCEPT
+                 SELECT id, name, note, blob, payload, ts FROM {src}
+             ) diff"
+        ))
+        .fetch_one(&pg_pool)
+        .await?;
 
-        // 5. Best-effort source cleanup.
-        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
-            .execute(&src_pool)
+        // If either is non-zero, dump the diff so the failure is debuggable.
+        if src_minus_dst != 0 || dst_minus_src != 0 {
+            let in_src: Vec<(i64, String)> = sqlx::query_as(&format!(
+                "SELECT id, name FROM {src} EXCEPT SELECT id, name FROM {dst} ORDER BY id"
+            ))
+            .fetch_all(&pg_pool)
+            .await
+            .unwrap_or_default();
+            let in_dst: Vec<(i64, String)> = sqlx::query_as(&format!(
+                "SELECT id, name FROM {dst} EXCEPT SELECT id, name FROM {src} ORDER BY id"
+            ))
+            .fetch_all(&pg_pool)
+            .await
+            .unwrap_or_default();
+            panic!(
+                "round-trip mismatch: src - dst = {src_minus_dst} rows {in_src:?}, \
+                 dst - src = {dst_minus_src} rows {in_dst:?}"
+            );
+        }
+
+        let (dst_count,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*)::BIGINT FROM {dst}"))
+            .fetch_one(&pg_pool)
+            .await?;
+        assert_eq!(dst_count, 4, "dst must contain exactly 4 rows post-load");
+
+        // 6. Cleanup. Best-effort; CI tears the container down anyway.
+        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {src}, {dst}"))
+            .execute(&pg_pool)
             .await;
         Ok(())
     }

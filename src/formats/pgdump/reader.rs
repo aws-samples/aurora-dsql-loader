@@ -8,14 +8,16 @@ use crate::formats::reader::{
 };
 use crate::io::{ByteReader, estimate_rows_in_range};
 
-/// Reader for plain pg_dump --data-only output, scoped to a single table's
-/// COPY FROM stdin block.
+/// Reader for pg_dump plain-text output, scoped to a single table's
+/// `COPY ... FROM stdin` block. DDL/SET/comment statements outside the
+/// targeted COPY block are ignored (running pg_dump with `--data-only` is
+/// recommended, not required).
 ///
 /// **NULL handling:** PG's `\N` is decoded by `escape::decode_field` to an
 /// empty string, since the loader's `Record { fields: Vec<String> }` shape
 /// carries strings only. The downstream worker (`coordination/worker.rs`)
-/// then maps empty strings to SQL NULL during binding, so functionally
-/// `\N → NULL` survives end-to-end. The trade-off is that real empty strings
+/// then maps empty strings to SQL NULL when generating the INSERT row text,
+/// so functionally `\N → NULL` survives end-to-end. The trade-off is that real empty strings
 /// AND whitespace-only strings (the worker `trim()`s before the empty check)
 /// become indistinguishable from NULL; if your dataset depends on either
 /// distinction, do not use `--format pgdump` until proper `Option<String>`

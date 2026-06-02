@@ -395,10 +395,10 @@ async fn skip_line(reader: &dyn ByteReader, pos: u64, size: u64) -> Result<u64> 
 /// Find the `\.` line that terminates a COPY data section. Returns the byte
 /// offset of the start of that line (i.e. the end of the data range).
 ///
-/// Streams the data range chunk-by-chunk and tracks just the first two bytes
-/// of each line plus its span — enough to recognize a `\.` terminator (with
-/// optional `\r` before the `\n`) without re-reading or buffering the line
-/// body. A TOASTed value can legitimately be hundreds of MB and we do not
+/// Streams the data range chunk-by-chunk and tracks the first two bytes,
+/// last byte, and span of each line — enough to recognize a `\.` terminator
+/// (with optional `\r` before the `\n`) without re-reading or buffering the
+/// line body. A TOASTed value can legitimately be hundreds of MB and we do not
 /// need its content, only its newline boundaries. Bounded by
 /// `MAX_DATA_LINE_BYTES` only as a malformed-file backstop on the per-line
 /// span between newlines.
@@ -439,8 +439,10 @@ async fn find_terminator(reader: &dyn ByteReader, start: u64, size: u64) -> Resu
     }
     // EOF without trailing newline: pg_dump always emits `\.\n`, but a
     // hand-truncated or interrupted file may end exactly at `\.` with no
-    // newline. The old read_line-based scanner handled this; preserve.
-    if is_terminator_pattern(span, first_byte, second_byte, last_byte) {
+    // newline. Accept only the exact `\.` shape — a `\.\r` at EOF would
+    // require the file to end mid-CRLF, which indicates corruption, not a
+    // valid terminator.
+    if span == 2 && first_byte == b'\\' && second_byte == b'.' {
         return Ok(Some(line_start));
     }
     Ok(None)
