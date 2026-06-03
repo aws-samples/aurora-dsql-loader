@@ -4251,10 +4251,10 @@ mod tests {
         .await?;
 
         // NOTE: empty TEXT (`note = ''`) and empty BYTEA (`'\x'`) are
-        // intentionally omitted. The loader's v1 NULL handling collapses
-        // empty strings to SQL NULL during INSERT generation, so a `''` in
-        // the source would round-trip as NULL — a documented trade-off
-        // (see PgDumpReader rustdoc), not a regression for this test.
+        // intentionally omitted. The loader collapses empty strings to SQL
+        // NULL during INSERT generation, so a `''` in the source would
+        // round-trip as NULL — a documented trade-off (see PgDumpReader
+        // rustdoc), not a regression for this test.
         sqlx::query(&format!(
             "INSERT INTO {src} (id, name, note, blob, payload, ts) VALUES
                 (1, 'plain',         E'tab\\there',  E'\\\\xDEADBEEF', '{{\"a\":1}}'::jsonb,  '2024-01-15 12:34:56+00'),

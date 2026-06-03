@@ -156,8 +156,12 @@ fn align_pgdump_schema_to_copy_columns(
 
     if copy_set != target_set {
         let target_names: Vec<&str> = resolved.columns.iter().map(|c| c.name.as_str()).collect();
-        let missing_in_target: Vec<&str> = copy_set.difference(&target_set).copied().collect();
-        let missing_in_dump: Vec<&str> = target_set.difference(&copy_set).copied().collect();
+        // Sort the diff lists so the bail message is deterministic across runs
+        // (HashSet::difference iteration order is not stable).
+        let mut missing_in_target: Vec<&str> = copy_set.difference(&target_set).copied().collect();
+        let mut missing_in_dump: Vec<&str> = target_set.difference(&copy_set).copied().collect();
+        missing_in_target.sort_unstable();
+        missing_in_dump.sort_unstable();
         anyhow::bail!(
             "pg_dump column-set mismatch for {}.{}:\n  \
              dump COPY columns:    {:?}\n  \
@@ -267,7 +271,8 @@ pub struct LoadResult {
     pub chunks_processed: usize,
     pub records_loaded: u64,
     pub records_failed: u64,
-    /// Estimated row count from file size (for mismatch detection)
+    /// Sum of per-chunk row estimates obtained by sampling the source bytes;
+    /// used to flag a large delta vs records actually loaded.
     pub estimated_rows: Option<u64>,
     pub duration: Duration,
     /// Detailed results for each chunk (accessed in integration tests)
@@ -752,11 +757,12 @@ impl Coordinator {
             }
         }
 
-        // --exclude-columns on resume must match the original job's exclusion set;
-        // the manifest is authoritative and silently dropping the flag would hide bugs.
-        // Compare as sets (sorted) because the manifest stores the list in schema order
-        // while the user-passed list is in CLI order - semantically equivalent lists
-        // should not trip the check.
+        // --exclude-columns on resume: the flag may be omitted (the manifest's list
+        // is authoritative), but if supplied it must match the manifest as a set.
+        // Avoids forcing operators to retype the list while still catching accidental
+        // drift. Compare as sets (sorted) because the manifest stores the list in
+        // schema order while the user-passed list is in CLI order — semantically
+        // equivalent lists should not trip the check.
         if !config.exclude_columns.is_empty() {
             let mut requested = config.exclude_columns.clone();
             let mut stored = manifest.table.excluded_columns.clone();

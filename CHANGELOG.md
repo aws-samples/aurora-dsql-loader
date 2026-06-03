@@ -29,6 +29,11 @@
   operators reading load logs. Existing customers using only ASCII letters,
   digits, and underscore are unaffected; customers using PG quoted
   identifiers with non-Latin characters are also unaffected.
+- `list-tables` now validates every emitted schema, table, and column name
+  for control bytes, Unicode bidi/format codepoints, and (on column names)
+  embedded commas, and aborts before printing any row when a hit is found.
+  Prevents a malicious dump from smuggling tab/newline/ANSI-escape bytes or
+  bidirectional spoofing into the TSV output that operators pipe into shells.
 
 ## [3.0.0] - 2026-05-26
 

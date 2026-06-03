@@ -369,7 +369,7 @@ fn validate_load_args(args: &LoadArgs) -> Result<()> {
             anyhow::bail!(
                 "create_table_if_missing (--if-not-exists) is not supported with \
                  pg_dump: schema inference from a COPY-format byte stream is not \
-                 implemented in v1; pre-create the target table"
+                 currently supported; pre-create the target table"
             );
         }
     }

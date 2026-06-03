@@ -147,7 +147,7 @@ async fn case_insensitive_copy_keyword() {
 }
 
 #[tokio::test]
-async fn no_column_list_is_supported() {
+async fn copy_without_column_list_is_rejected() {
     let data = b"COPY public.t FROM stdin;\n1\ta\n\\.\n";
     let reader = MockByteReader::new(data.to_vec());
     let err = find_copy_block(&reader, "public", "t").await.unwrap_err();
@@ -577,6 +577,21 @@ async fn find_terminator_handles_eof_without_trailing_newline() {
     // data_end points to the start of the `\.` line (offset of the `\\` byte).
     let expected_data_end = data.len() as u64 - 2; // \. is the last 2 bytes
     assert_eq!(block.data_end, expected_data_end);
+}
+
+#[tokio::test]
+async fn find_terminator_rejects_backslash_dot_cr_at_eof() {
+    // `\.\r` at EOF (no trailing `\n`) is NOT a valid terminator: the file
+    // ends mid-CRLF, which indicates corruption rather than a clean truncate.
+    // Pinning the deliberate strictness so a future "preserve more inputs"
+    // refactor doesn't silently accept a likely-malformed dump.
+    let data = b"COPY public.t (a) FROM stdin;\n1\n\\.\r";
+    let reader = MockByteReader::new(data.to_vec());
+    let result = find_copy_block(&reader, "public", "t").await;
+    assert!(
+        result.is_err(),
+        "\\.\\r at EOF must be rejected as MissingTerminator"
+    );
 }
 
 #[tokio::test]
