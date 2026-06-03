@@ -429,7 +429,7 @@ async fn find_terminator(reader: &dyn ByteReader, start: u64, size: u64) -> Resu
                     second_byte = b;
                 }
                 last_byte = b;
-                span = span.saturating_add(1);
+                span += 1;
                 if span > MAX_DATA_LINE_BYTES {
                     return Err(line_too_long(line_start, MAX_DATA_LINE_BYTES));
                 }
