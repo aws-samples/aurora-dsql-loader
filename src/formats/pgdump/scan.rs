@@ -73,16 +73,29 @@ async fn detect_non_plain_format(reader: &dyn ByteReader) -> Result<()> {
 }
 
 /// The byte range and metadata for a located COPY block.
+///
+/// The block spans `[header_start, block_end)` in the source file:
+/// `header_start` ... `data_start` is the `COPY ... FROM stdin;` line;
+/// `data_start` ... `data_end` is the data payload (no terminator);
+/// `data_end` ... `block_end` is the `\.` terminator line.
+/// The DDL between blocks lives in `[prev_block.block_end, next_block.header_start)`.
 #[derive(Debug, Clone)]
 pub struct CopyBlock {
     /// Schema name from the COPY statement (defaults to "public" if unqualified).
     pub schema: String,
     /// Table name from the COPY statement.
     pub table: String,
-    /// First byte of the first data line.
+    /// First byte of the `COPY ... FROM stdin;` header line. Used by
+    /// `extract_ddl` to slice out the DDL prefix that precedes this block.
+    pub header_start: u64,
+    /// First byte of the first data line (one past the header line's newline).
     pub data_start: u64,
     /// One past the last byte of the last data line (i.e. start of the `\.` terminator line).
     pub data_end: u64,
+    /// One past the trailing newline of the `\.` terminator line. Used by
+    /// `extract_ddl` to begin the next DDL slice immediately after the
+    /// terminator without re-scanning.
+    pub block_end: u64,
     /// Column names in the order declared by the COPY statement.
     pub columns: Vec<String>,
 }
@@ -142,6 +155,7 @@ pub async fn list_copy_blocks(reader: &dyn ByteReader) -> Result<Vec<CopyBlock>>
                 table,
                 columns,
             } => {
+                let header_start = pos;
                 let data_start = line_end;
                 let data_end = find_terminator(reader, data_start, size)
                     .await?
@@ -149,14 +163,17 @@ pub async fn list_copy_blocks(reader: &dyn ByteReader) -> Result<Vec<CopyBlock>>
                         schema: schema.clone(),
                         table: table.clone(),
                     })?;
+                let block_end = skip_line(reader, data_end, size).await?;
                 blocks.push(CopyBlock {
                     schema,
                     table,
+                    header_start,
                     data_start,
                     data_end,
+                    block_end,
                     columns,
                 });
-                pos = skip_line(reader, data_end, size).await?;
+                pos = block_end;
             }
         }
     }
@@ -188,6 +205,45 @@ pub async fn find_copy_block(
         .into());
     }
     Ok(first)
+}
+
+/// Extract the non-data (DDL) bytes from a pg_dump file: the prefix before
+/// the first COPY block, the DDL between blocks, and the suffix after the
+/// last block. Designed so the result can be fed directly to `dsql_lint::fix_sql`
+/// to produce DSQL-compatible DDL for the upcoming `migrate` subcommand.
+///
+/// Returns the bytes as a UTF-8 string. pg_dump writes the textual section of
+/// its plain-format output as UTF-8 (unrelated to the COPY data encoding);
+/// any non-UTF-8 byte in the DDL slices indicates either format corruption or
+/// a custom-format archive that the scanner should already have rejected.
+///
+/// `blocks` is the slice returned by [`list_copy_blocks`]; pass `&[]` for a
+/// schema-only dump (no data) and the entire file is returned as DDL.
+// Task 3.2 (transform_ddl) is the in-crate caller; until then this is only
+// exercised by unit tests, so silence the dead-code warning rather than
+// gating on `#[cfg(test)]` (the function ships in the public lib API).
+#[allow(dead_code)]
+pub async fn extract_ddl(reader: &dyn ByteReader, blocks: &[CopyBlock]) -> Result<String> {
+    let size = reader.size().await?;
+    let mut out: Vec<u8> = Vec::new();
+
+    let mut cursor = 0u64;
+    for block in blocks {
+        if block.header_start > cursor {
+            out.extend_from_slice(&reader.read_range(cursor, block.header_start).await?);
+        }
+        cursor = block.block_end;
+    }
+    if cursor < size {
+        out.extend_from_slice(&reader.read_range(cursor, size).await?);
+    }
+
+    String::from_utf8(out).map_err(|e| {
+        anyhow::anyhow!(
+            "pg_dump DDL section is not valid UTF-8 at byte {}: {e}",
+            e.utf8_error().valid_up_to()
+        )
+    })
 }
 
 /// Parse a single line as `COPY <schema>.<table> (col1, col2) FROM stdin;`

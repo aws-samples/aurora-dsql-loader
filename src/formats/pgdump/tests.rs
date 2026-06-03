@@ -1,6 +1,6 @@
 use super::escape::decode_field;
 use super::reader::PgDumpReader;
-use super::scan::{ScanError, find_copy_block, list_copy_blocks};
+use super::scan::{ScanError, extract_ddl, find_copy_block, list_copy_blocks};
 use crate::formats::FileReader;
 use crate::io::byte_reader::MockByteReader;
 use crate::io::{ByteReader, LocalFileByteReader};
@@ -653,6 +653,104 @@ async fn empty_or_tiny_files_do_not_trigger_format_detection() {
         err.downcast_ref::<ScanError>(),
         Some(ScanError::NotFound { .. })
     ));
+}
+
+#[tokio::test]
+async fn copy_block_records_header_start_and_block_end() {
+    // header_start points at the leading byte of the `COPY ...` line.
+    // block_end points one past the closing `\.` terminator line, so
+    // [block_end, next_block.header_start) is exactly the bytes between
+    // two data blocks (where pg_dump would interleave more DDL).
+    let reader = MockByteReader::new(SAMPLE.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert_eq!(blocks.len(), 2);
+
+    // First block: header starts where `COPY public.users` does.
+    let users = &blocks[0];
+    assert_eq!(
+        &SAMPLE[users.header_start as usize..users.header_start as usize + 4],
+        b"COPY"
+    );
+    // block_end is past the `\.\n`, so it must be > data_end and the byte
+    // before block_end is the trailing newline of the terminator line.
+    assert!(users.block_end > users.data_end);
+    assert_eq!(SAMPLE[(users.block_end - 1) as usize], b'\n');
+
+    // Sandwich invariant: between users.block_end and orders.header_start
+    // there is only DDL/whitespace (no `COPY` keyword).
+    let between = &SAMPLE[users.block_end as usize..blocks[1].header_start as usize];
+    let between_str = std::str::from_utf8(between).unwrap();
+    assert!(
+        !between_str.to_ascii_uppercase().contains("COPY"),
+        "between-blocks slice must not contain another COPY: {between_str:?}"
+    );
+}
+
+#[tokio::test]
+async fn extract_ddl_pulls_preamble_and_drops_data_blocks() {
+    // pg_dump output has DDL before the COPY blocks. extract_ddl returns
+    // exactly that DDL (and any trailing post-COPY DDL), with the data
+    // payload sliced out so the result can be fed straight into fix_sql.
+    let reader = MockByteReader::new(SAMPLE.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    // Preamble bytes survive...
+    assert!(ddl.contains("PostgreSQL database dump"));
+    assert!(ddl.contains("SET statement_timeout"));
+    // ...but the data rows do NOT (no `1\tAlice` / `1\t1`).
+    assert!(!ddl.contains("Alice"));
+    assert!(!ddl.contains("Bob"));
+    // ...and neither do the COPY headers themselves.
+    assert!(
+        !ddl.to_ascii_uppercase().contains("COPY "),
+        "DDL must not contain COPY headers, got: {ddl:?}"
+    );
+    // ...and the `\.` terminators are gone.
+    assert!(!ddl.contains("\\."));
+}
+
+#[tokio::test]
+async fn extract_ddl_with_no_copy_blocks_returns_full_input() {
+    // Schema-only dump (no data) -> all bytes are DDL.
+    let raw = b"-- preamble\nCREATE TABLE t (id integer);\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert!(blocks.is_empty());
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+    assert_eq!(ddl, std::str::from_utf8(raw).unwrap());
+}
+
+#[tokio::test]
+async fn extract_ddl_preserves_inter_block_ddl() {
+    // pg_dump emits ALTER TABLE / SET DEFAULT statements BETWEEN data blocks
+    // when SERIAL columns are involved. extract_ddl must preserve those —
+    // they are exactly the statements fix_sql collapses.
+    let raw = b"\
+-- pre\n\
+CREATE TABLE public.t (id integer);\n\
+COPY public.t (id) FROM stdin;\n\
+1\n\
+\\.\n\
+ALTER TABLE ONLY public.t ALTER COLUMN id SET DEFAULT nextval('public.t_seq'::regclass);\n\
+COPY public.u (id) FROM stdin;\n\
+2\n\
+\\.\n\
+-- post\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert_eq!(blocks.len(), 2);
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    assert!(ddl.contains("CREATE TABLE public.t"));
+    assert!(
+        ddl.contains("ALTER TABLE ONLY public.t"),
+        "inter-block DDL must be preserved, got: {ddl:?}"
+    );
+    assert!(ddl.contains("-- post"));
+    // Data rows and COPY lines are gone.
+    assert!(!ddl.to_ascii_uppercase().contains("COPY "));
+    assert!(!ddl.contains("\\."));
 }
 
 #[tokio::test]
