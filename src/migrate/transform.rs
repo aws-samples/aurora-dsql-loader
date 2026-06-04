@@ -13,12 +13,7 @@
 
 use dsql_lint::{FixResult as LintFixResult, fix_sql};
 
-// Task 3.4 (`run_migrate`) is the in-crate caller for the items below; until
-// then they are exercised only by unit tests, so silence dead-code warnings
-// at the use sites rather than gating on `#[cfg(test)]` (these ship in the
-// migrate module's intended-internal API).
 /// Outcome of running `dsql_lint::fix_sql` on a slice of DDL.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformResult {
     /// DSQL-compatible DDL produced by `fix_sql`. Empty input round-trips
@@ -38,7 +33,6 @@ pub struct TransformResult {
 /// Carries the rule as its serde string form rather than the upstream
 /// `LintRule` enum so we don't re-export `dsql-lint`'s public API and so
 /// upstream rule renames don't ripple into our callers.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     /// Stable string id for the rule that fired (e.g. `"serial_sequence_idiom"`,
@@ -60,7 +54,6 @@ pub struct Diagnostic {
 
 /// Run `dsql_lint::fix_sql` on the supplied DDL and split its diagnostics
 /// into the changes/unfixable pair the migrate orchestrator expects.
-#[allow(dead_code)]
 pub fn transform_ddl(ddl: &str) -> TransformResult {
     let out = fix_sql(ddl);
     let mut changes = Vec::new();
@@ -68,8 +61,9 @@ pub fn transform_ddl(ddl: &str) -> TransformResult {
 
     for d in out.diagnostics {
         let (bucket, fix_detail) = match &d.fix_result {
-            LintFixResult::Fixed(detail) => (&mut changes, Some(detail.clone())),
-            LintFixResult::FixedWithWarning(detail) => (&mut changes, Some(detail.clone())),
+            LintFixResult::Fixed(detail) | LintFixResult::FixedWithWarning(detail) => {
+                (&mut changes, Some(detail.clone()))
+            }
             LintFixResult::Unfixable => (&mut unfixable, None),
         };
         bucket.push(Diagnostic {

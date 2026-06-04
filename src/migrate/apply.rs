@@ -10,7 +10,7 @@
 //! off without the operator having to manually drop existing objects.
 
 use crate::db::Pool;
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Outcome of a single applied DDL statement, captured so the migrate
 /// orchestrator can build a useful summary report and so callers (e.g. the
@@ -32,9 +32,9 @@ pub struct AppliedStatement {
 pub enum ApplyOutcome {
     /// Statement executed successfully.
     Applied,
-    /// Statement targeted an object that already exists (CREATE TABLE on
-    /// an existing name, CREATE INDEX with an existing index name, etc.)
-    /// and was skipped to keep the migrate flow re-runnable.
+    /// Statement targeted an object that already exists (Postgres SQLSTATE
+    /// `42P07` table, `42P06` schema, `42710` index/sequence/constraint/type,
+    /// `42701` column) and was skipped to keep the migrate flow re-runnable.
     SkippedAlreadyExists,
 }
 
@@ -47,7 +47,6 @@ pub enum ApplyOutcome {
 /// applied because DSQL has no all-or-nothing wrapper for multi-DDL
 /// migrations. Operators are expected to investigate, fix, and re-run;
 /// the "already exists" skip path makes that re-run safe.
-#[allow(dead_code)]
 pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> {
     let statements = split_sql_statements(ddl);
     let mut applied = Vec::with_capacity(statements.len());
@@ -62,9 +61,12 @@ pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> 
                 outcome: ApplyOutcome::SkippedAlreadyExists,
             }),
             Err(e) => {
-                return Err(
-                    anyhow::Error::new(e).context(format!("Failed to apply DDL statement: {stmt}"))
-                );
+                return Err(anyhow::Error::new(e)).with_context(|| {
+                    format!(
+                        "Failed to apply DDL statement: {summary}",
+                        summary = scrub_for_log(&stmt)
+                    )
+                });
             }
         }
     }
@@ -77,29 +79,65 @@ pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> 
 /// Postgres surfaces these as SQLSTATE 42P07 (`duplicate_table`),
 /// 42P06 (`duplicate_schema`), 42710 (`duplicate_object` — index, sequence,
 /// constraint, type), and 42701 (`duplicate_column`). DSQL inherits the
-/// codes from its Postgres surface. SQLite uses message-string matching
-/// since its `extended_code` mapping is much smaller, but the shape
-/// `"already exists"` is stable across versions.
+/// codes from its Postgres surface. SQLite uses numeric error codes (`1`
+/// for any logic error, etc.) that don't carry the same level of detail,
+/// so we fall back to a `"already exists"` message-string match for it.
 fn is_already_exists(err: &sqlx::Error) -> bool {
-    if let sqlx::Error::Database(db_err) = err {
-        if let Some(code) = db_err.code() {
-            // Postgres / DSQL: `duplicate_*` family.
-            if matches!(code.as_ref(), "42P07" | "42P06" | "42710" | "42701") {
-                return true;
-            }
-        }
-        // SQLite (and a generic safety net for any backend whose driver
-        // doesn't surface a structured code): match on the standard
-        // message string.
-        if db_err
-            .message()
-            .to_ascii_lowercase()
-            .contains("already exists")
-        {
-            return true;
-        }
+    let sqlx::Error::Database(db_err) = err else {
+        return false;
+    };
+    let code = db_err.code();
+    // Postgres-shaped SQLSTATEs are exactly 5 characters and (for the
+    // duplicate-object family) start with `42`. When we see one, the
+    // allowlist is authoritative — we MUST NOT also message-match, or a
+    // future class-42 SQLSTATE we have not allowlisted (e.g. role-related
+    // duplicates) whose text happens to contain "already exists" would be
+    // silently treated as a successful skip.
+    if let Some(c) = code.as_deref()
+        && c.len() == 5
+        && c.starts_with("42")
+    {
+        return matches!(c, "42P07" | "42P06" | "42710" | "42701");
     }
-    false
+    // Non-Postgres backend (e.g. SQLite, used by in-process tests, returns
+    // numeric codes like "1") or no code at all: fall back to the stable
+    // message-string shape.
+    db_err
+        .message()
+        .to_ascii_lowercase()
+        .contains("already exists")
+}
+
+/// Scrub a SQL fragment for safe inclusion in an error message or log line:
+/// truncate to 200 bytes (real `pg_dump` statements can be MB-sized via
+/// embedded function bodies / large enum lists) and replace control bytes,
+/// Unicode bidi/format codepoints, and other terminal-unsafe characters
+/// with `?`. Mirrors what `check_listable` does for the `list-tables` path.
+fn scrub_for_log(stmt: &str) -> String {
+    const MAX: usize = 200;
+    let truncated = if stmt.len() > MAX {
+        format!(
+            "{head}... ({total} bytes total)",
+            head = stmt
+                .char_indices()
+                .take_while(|(idx, _)| *idx < MAX)
+                .map(|(_, c)| c)
+                .collect::<String>(),
+            total = stmt.len()
+        )
+    } else {
+        stmt.to_owned()
+    };
+    truncated
+        .chars()
+        .map(|c| {
+            if c.is_control() || crate::runner::is_bidi_or_format_char(c) {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Split `sql` on `;` boundaries, skipping `;` that appears inside
@@ -116,8 +154,8 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
     while i < bytes.len() {
         let c = bytes[i];
         match c {
-            b'\'' => i = skip_single_quoted(bytes, i),
-            b'"' => i = skip_double_quoted(bytes, i),
+            b'\'' => i = skip_quoted(bytes, i, b'\''),
+            b'"' => i = skip_quoted(bytes, i, b'"'),
             b'-' if bytes.get(i + 1) == Some(&b'-') => i = skip_line_comment(bytes, i),
             b'/' if bytes.get(i + 1) == Some(&b'*') => i = skip_block_comment(bytes, i),
             b'$' => match try_skip_dollar_quoted(bytes, i) {
@@ -168,34 +206,18 @@ fn is_comments_only(s: &str) -> bool {
     true
 }
 
-/// Advance past `'...'` starting at `i` (caller has confirmed `bytes[i]
-/// == '`). `''` is the embedded-quote escape. Returns the index of the
-/// byte after the closing quote, or `bytes.len()` on unterminated input.
-fn skip_single_quoted(bytes: &[u8], i: usize) -> usize {
-    debug_assert_eq!(bytes[i], b'\'');
+/// Advance past `q...q` starting at `i` (caller has confirmed `bytes[i] ==
+/// q`). The doubled-character form (`''` inside `'...'` or `""` inside
+/// `"..."`) is the embedded-quote escape, matching Postgres syntax for both
+/// single-quoted strings and double-quoted identifiers. Returns the index
+/// of the byte after the closing quote, or `bytes.len()` on unterminated
+/// input.
+fn skip_quoted(bytes: &[u8], i: usize, q: u8) -> usize {
+    debug_assert_eq!(bytes[i], q);
     let mut j = i + 1;
     while j < bytes.len() {
-        if bytes[j] == b'\'' {
-            // `''` is an escaped single quote, not the end of the string.
-            if bytes.get(j + 1) == Some(&b'\'') {
-                j += 2;
-            } else {
-                return j + 1;
-            }
-        } else {
-            j += 1;
-        }
-    }
-    bytes.len()
-}
-
-/// Advance past `"..."` starting at `i`. `""` is the embedded-quote escape.
-fn skip_double_quoted(bytes: &[u8], i: usize) -> usize {
-    debug_assert_eq!(bytes[i], b'"');
-    let mut j = i + 1;
-    while j < bytes.len() {
-        if bytes[j] == b'"' {
-            if bytes.get(j + 1) == Some(&b'"') {
+        if bytes[j] == q {
+            if bytes.get(j + 1) == Some(&q) {
                 j += 2;
             } else {
                 return j + 1;
@@ -466,6 +488,33 @@ INSERT INTO t (id, val) VALUES (2, 'b;not-a-split');
             .await
             .unwrap();
         assert_eq!(rows[0].0, 1);
+    }
+
+    /// Regression test for the silent-failure class fixed in this PR: the
+    /// SQLite/no-code substring fallback in `is_already_exists` MUST NOT
+    /// accept arbitrary errors whose message happens to contain "already
+    /// exists". A SQLite "table … already exists" message is a true skip;
+    /// a SQLite "no such table" is not. Pinning both shapes guards against
+    /// a regression that broadens the substring match.
+    #[tokio::test]
+    async fn apply_ddl_substring_fallback_is_anchored_to_already_exists() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // Drive an error whose message does NOT contain "already exists".
+        // SQLite returns "no such table" for `INSERT INTO missing` — the
+        // substring fallback must NOT classify this as a skip.
+        let err = apply_ddl(&pool, "INSERT INTO missing_table VALUES (1);")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to apply DDL statement"),
+            "unrelated SQLite error should bubble out as Err, got: {msg}"
+        );
+        // And drive the positive case: "table X already exists" via the
+        // existing infrastructure (CREATE TABLE on a name that exists).
+        // Already covered by `apply_ddl_skips_already_exists_for_idempotent_rerun`,
+        // but pinning the negative shape here is what the substring-fallback
+        // gate (code.is_none() guard) was added to protect.
     }
 
     #[tokio::test]

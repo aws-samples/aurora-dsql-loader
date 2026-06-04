@@ -198,12 +198,11 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     run_load_with_pool(pool, args).await
 }
 
-/// Build the connection pool from `args`, falling back to `args.test_pool`
-/// in `#[cfg(test)]` builds. Factored out of [`run_load`] so the migrate
-/// orchestrator can build a pool once and reuse it across the apply stage
-/// and every per-table load (the production path can't take the
-/// `#[cfg(test)] test_pool` shortcut, so a single helper keeps the two
-/// entry points using the same pool-acquisition logic).
+/// Build the connection pool from `args`, with the `#[cfg(test)] test_pool`
+/// shortcut applied first so SQLite-backed tests skip the IAM path. Pulled
+/// out of [`run_load`] so the body of `run_load` becomes "build pool, hand
+/// off to `run_load_with_pool`" — the migrate orchestrator drives
+/// `run_load_with_pool` directly with its own already-built pool.
 async fn build_pool(args: &LoadArgs) -> Result<crate::db::Pool> {
     #[cfg(test)]
     if let Some(test_pool) = args.test_pool.clone() {

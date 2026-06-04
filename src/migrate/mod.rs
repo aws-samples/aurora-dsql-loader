@@ -21,9 +21,3 @@ pub use orchestrator::{MigrateArgs, MigrateReport, TableLoadSummary, run_migrate
 // public API alongside it.
 pub use apply::{AppliedStatement, ApplyOutcome};
 pub use transform::Diagnostic;
-
-// Crate-internal: orchestrator's view of apply / transform.
-#[allow(unused_imports)]
-pub(crate) use apply::apply_ddl;
-#[allow(unused_imports)]
-pub(crate) use transform::{TransformResult, transform_ddl};

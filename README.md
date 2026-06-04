@@ -186,9 +186,14 @@ access yet.
   use the default `COPY FROM stdin` shape.
 - After loading explicit PK values into an `IDENTITY` column, the
   identity counter is NOT auto-advanced. The migrate report includes a
-  warning per converted column; reset with
-  `ALTER TABLE t ALTER COLUMN id RESTART WITH (max(id) + 1)` after the
-  load if the table is pre-populated.
+  warning per converted column; reset it after the load if the table is
+  pre-populated, e.g.:
+  ```sql
+  -- Look up the next value:
+  SELECT max(id) + 1 FROM t;
+  -- Then run, with <next> set to the value above:
+  ALTER TABLE t ALTER COLUMN id RESTART WITH <next>;
+  ```
 - Statements `dsql-lint` cannot auto-fix surface as `Unfixable`
   diagnostics. The migrate flow refuses to apply DDL while any
   unfixable diagnostic exists (the operator has to edit the dump and

@@ -319,14 +319,13 @@ struct MigrateCliArgs {
     debug: bool,
 }
 
-async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
-    use aurora_dsql_loader::runner::{ApplyOutcome, MigrateArgs, run_migrate};
+/// Wire up the global tracing subscriber. `quiet` keeps loader logs at
+/// `warn`; otherwise they are at `info`. `RUST_LOG` always overrides.
+/// Called by both `run_loader` and `run_migrate_cli`.
+fn init_tracing(quiet: bool) {
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    // Match `run_loader`'s tracing setup so log output is consistent
-    // between `load` and `migrate`. RUST_LOG wins if explicitly set.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if args.quiet {
+        if quiet {
             EnvFilter::new("aurora_dsql_loader=warn,sqlx=off")
         } else {
             EnvFilter::new("aurora_dsql_loader=info,sqlx=off")
@@ -334,19 +333,31 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
     });
     let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
 
-    let region = if let Some(r) = args.connection.region {
-        r
-    } else {
-        cli::extract_region_from_endpoint(&args.connection.endpoint).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not extract region from endpoint '{}'.\n\
-                 Expected format: xxx.dsql.REGION.on.aws.\n\
-                 Please specify --region explicitly.",
-                args.connection.endpoint
-            )
-        })?
-    };
+/// Pick the AWS region: explicit `--region` wins, otherwise extract from
+/// the DSQL endpoint hostname. Errors with a message pointing the operator
+/// at the expected endpoint shape.
+fn resolve_region(explicit: Option<&str>, endpoint: &str) -> anyhow::Result<String> {
+    if let Some(r) = explicit {
+        return Ok(r.to_owned());
+    }
+    cli::extract_region_from_endpoint(endpoint).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Could not extract region from endpoint '{}'.\n\
+             Expected format: xxx.dsql.REGION.on.aws (e.g., xxx.dsql.us-east-1.on.aws)\n\
+             Please specify --region explicitly.",
+            endpoint
+        )
+    })
+}
+
+async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
+    use aurora_dsql_loader::runner::{ApplyOutcome, MigrateArgs, run_migrate};
+
+    init_tracing(args.quiet);
+
+    let region = resolve_region(args.connection.region.as_deref(), &args.connection.endpoint)?;
 
     let chunk_size_bytes = cli::parse_size_string(&args.chunk_size)
         .map_err(|e| anyhow::anyhow!("Invalid chunk size '{}': {}", args.chunk_size, e))?;
@@ -467,18 +478,7 @@ async fn run_loader(
     load: LoadParams,
     output: OutputArgs,
 ) -> anyhow::Result<()> {
-    // Initialize tracing based on quiet mode
-    // RUST_LOG environment variable takes precedence if set
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if output.quiet {
-            EnvFilter::new("aurora_dsql_loader=warn,sqlx=off")
-        } else {
-            EnvFilter::new("aurora_dsql_loader=info,sqlx=off")
-        }
-    });
-    let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    init_tracing(output.quiet);
 
     // Setup output based on quiet flag
     if !output.quiet {
@@ -491,19 +491,7 @@ async fn run_loader(
         println!();
     }
 
-    // Extract region from endpoint if not provided
-    let region = if let Some(r) = connection.region {
-        r
-    } else {
-        cli::extract_region_from_endpoint(&connection.endpoint).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not extract region from endpoint '{}'.\n\
-                 Expected format: xxx.dsql.REGION.on.aws (e.g., xxx.dsql.us-east-1.on.aws)\n\
-                 Please specify --region explicitly.",
-                connection.endpoint
-            )
-        })?
-    };
+    let region = resolve_region(connection.region.as_deref(), &connection.endpoint)?;
 
     // Auto-detect format from file extension if not provided
     let format = if let Some(f) = &source.format {

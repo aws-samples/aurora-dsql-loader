@@ -18,7 +18,6 @@ use std::sync::Arc;
 /// info, the source URI of the pg_dump file, and the per-load knobs that
 /// the orchestrator threads into each per-table [`LoadArgs`].
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct MigrateArgs {
     /// DSQL endpoint (`<cluster>.dsql.<region>.on.aws`).
     pub endpoint: String,
@@ -49,8 +48,9 @@ pub struct MigrateArgs {
     /// `OnConflict::Error` — duplicate rows usually indicate a bug. The
     /// default mirrors what `run_load` accepts so this knob is opt-in.
     pub on_conflict: OnConflict,
-    /// Forwarded to `LoadArgs.quiet` / `debug` for log-level control.
+    /// Forwarded to `LoadArgs.quiet` for log-level control.
     pub quiet: bool,
+    /// Forwarded to `LoadArgs.debug` for log-level control.
     pub debug: bool,
     /// Test-only: caller-supplied `Pool` to short-circuit the DSQL IAM
     /// path. Mirrors `LoadArgs.test_pool` so SQLite-backed tests can
@@ -62,7 +62,6 @@ pub struct MigrateArgs {
 /// Final report from a migrate run. The CLI / library consumer prints
 /// this as a summary table; tests assert on the structured fields.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct MigrateReport {
     /// Statements that successfully ran against the cluster (or were
     /// skipped because the target already existed). Empty in `--dry-run`.
@@ -91,7 +90,6 @@ pub struct MigrateReport {
 /// [`LoadResult`](crate::runner::LoadResult) but flattens the fields the
 /// migrate report cares about so callers don't carry the full type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct TableLoadSummary {
     pub schema: String,
     pub table: String,
@@ -115,22 +113,17 @@ pub struct TableLoadSummary {
 /// When `args.dry_run` is set the function stops after step 4 (transform)
 /// — the operator gets the proposed DDL and the diagnostic split, no
 /// statements are sent to the cluster.
-#[allow(dead_code)]
 pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
-    // 1. Open the dump.
     let reader = open_source(&args).await?;
 
-    // 2. List COPY blocks.
     let blocks = list_copy_blocks(&*reader)
         .await
         .context("Failed to scan pg_dump for COPY blocks")?;
 
-    // 3. Extract DDL.
     let ddl = extract_ddl(&*reader, &blocks)
         .await
         .context("Failed to extract DDL from pg_dump")?;
 
-    // 4. Transform via dsql-lint.
     let TransformResult {
         fixed_sql,
         changes,
@@ -143,7 +136,8 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
     // are unfixable diagnostics — the operator must edit the dump first.
     // Crucially, both branches return BEFORE building a pool, so a
     // --dry-run review of an offline fixture works without IAM
-    // credentials or cluster access.
+    // credentials or cluster access. Pinned by tests::dry_run_does_not
+    // _build_pool and tests::unfixable_does_not_build_pool.
     if args.dry_run || !unfixable.is_empty() {
         return Ok(MigrateReport {
             ddl_applied: Vec::new(),
@@ -155,14 +149,12 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         });
     }
 
-    // 5/6. Apply DDL — pool is built lazily here so the steps above
-    // can run offline.
+    // Pool is built lazily here so the steps above can run offline.
     let pool = build_pool(&args).await?;
     let ddl_applied = apply_ddl(&pool, &fixed_sql)
         .await
         .context("Failed to apply DDL to cluster")?;
 
-    // 7. Per-table load.
     let mut tables = Vec::with_capacity(blocks.len());
     for block in &blocks {
         let load_args = build_load_args(&args, &block.table, &block.schema);
@@ -594,5 +586,107 @@ COPY public.t (id) FROM stdin;
             "expected an 'identity counter' warning, got: {:?}",
             report.warnings
         );
+    }
+
+    /// Symmetric guarantee to `dry_run_does_not_build_pool`: when
+    /// `transform_ddl` surfaces an `unfixable` diagnostic, the orchestrator
+    /// must short-circuit BEFORE building a pool. A future refactor that
+    /// re-orders `build_pool` above the unfixable branch (the same class of
+    /// bug already fixed for `dry_run`) would otherwise pass every other
+    /// test silently.
+    #[tokio::test]
+    async fn unfixable_does_not_build_pool() {
+        // Cross-file SET DEFAULT with no preceding sequence DECLARE in the
+        // same input is the canonical unfixable diagnostic from dsql-lint.
+        let dump = "\
+ALTER TABLE public.events ALTER COLUMN id SET DEFAULT nextval('public.events_id_seq'::regclass);
+COPY public.events (id) FROM stdin;
+1
+\\.
+";
+        let f = write_dump(dump);
+        let args = MigrateArgs {
+            endpoint: "doesnotexist.invalid".to_string(),
+            region: "us-east-1".to_string(),
+            username: "ignored".to_string(),
+            source_uri: file_uri(f.path()),
+            schema: "public".to_string(),
+            dry_run: false,
+            worker_count: 1,
+            batch_size: 1,
+            batch_concurrency: 1,
+            chunk_size_bytes: 1024,
+            on_conflict: OnConflict::Error,
+            quiet: true,
+            debug: false,
+            // Critically: NO test_pool. If the orchestrator tried to build
+            // a real pool against the bogus endpoint, this would fail.
+            test_pool: None,
+        };
+        let report = run_migrate(args).await.unwrap();
+        assert!(!report.ddl_unfixable.is_empty(), "must surface unfixable");
+        assert!(report.ddl_applied.is_empty());
+        assert!(report.tables.is_empty());
+        // dry_run echoes the input flag (false here); the offline-ness is
+        // independent of dry_run.
+        assert!(!report.dry_run);
+    }
+
+    /// Pin `run_migrate`'s error propagation when `apply_ddl` fails on a
+    /// statement after earlier statements have already landed. Surfaces:
+    /// (1) the error bubbles out as `Err` with context tagging the failing
+    /// SQL; (2) earlier statements remain applied (DSQL has no
+    /// multi-statement DDL transaction); (3) no per-table load runs after a
+    /// mid-apply failure. A future refactor that swallows the apply error
+    /// or proceeds to the load stage would silently regress.
+    #[tokio::test]
+    async fn run_migrate_propagates_mid_apply_error() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // The second statement parses cleanly (so dsql-lint does not flag
+        // it as unfixable) but fails at execute time against SQLite —
+        // INSERT into a non-existent table. The third statement must not
+        // run because apply stops at the first non-recoverable error.
+        let dump = "\
+CREATE TABLE valid_first (id INTEGER);
+INSERT INTO does_not_exist_at_apply VALUES (1);
+CREATE TABLE never_runs (id INTEGER);
+COPY public.valid_first (id) FROM stdin;
+1
+\\.
+";
+        let f = write_dump(dump);
+        let args = args_with_pool(&file_uri(f.path()), pool.clone(), false);
+        let err = run_migrate(args).await.unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("does_not_exist_at_apply"),
+            "error chain should identify the failing statement; got: {chain}"
+        );
+
+        let first_exists: i64 = pool
+            .fetch_all_with_binds::<(i64,)>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='valid_first'",
+                &[],
+            )
+            .await
+            .unwrap()[0]
+            .0;
+        assert_eq!(first_exists, 1, "first CREATE TABLE should have applied");
+        let third_exists: i64 = pool
+            .fetch_all_with_binds::<(i64,)>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='never_runs'",
+                &[],
+            )
+            .await
+            .unwrap()[0]
+            .0;
+        assert_eq!(third_exists, 0, "third CREATE TABLE must not have applied");
+        // No per-table load should have run after the apply failure.
+        let row_count: i64 = pool
+            .fetch_all_with_binds::<(i64,)>("SELECT COUNT(*) FROM valid_first", &[])
+            .await
+            .unwrap()[0]
+            .0;
+        assert_eq!(row_count, 0);
     }
 }
