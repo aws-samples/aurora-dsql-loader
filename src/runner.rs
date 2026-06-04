@@ -186,6 +186,40 @@ pub struct LoadResult {
 /// # }
 /// ```
 pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
+    let pool = build_pool(&args).await?;
+    run_load_with_pool(pool, args).await
+}
+
+/// Build the connection pool from `args`, falling back to `args.test_pool`
+/// in `#[cfg(test)]` builds. Factored out of [`run_load`] so the migrate
+/// orchestrator can build a pool once and reuse it across the apply stage
+/// and every per-table load (the production path can't take the
+/// `#[cfg(test)] test_pool` shortcut, so a single helper keeps the two
+/// entry points using the same pool-acquisition logic).
+async fn build_pool(args: &LoadArgs) -> Result<crate::db::Pool> {
+    #[cfg(test)]
+    if let Some(test_pool) = args.test_pool.clone() {
+        return Ok(test_pool);
+    }
+
+    let pool_args = PoolArgsBuilder::default()
+        .region(&args.region)
+        .endpoint(&args.endpoint)
+        .username(&args.username)
+        .build()?;
+    db_pool::pool::pool(pool_args).await
+}
+
+/// Run a load against an externally-supplied pool.
+///
+/// Identical to [`run_load`] except the caller owns pool construction —
+/// the migrate orchestrator uses this so it can apply DDL and run the
+/// per-table load against the same physical pool, avoiding repeated IAM
+/// auth and connection-establishment overhead.
+pub(crate) async fn run_load_with_pool(
+    pool: crate::db::Pool,
+    args: LoadArgs,
+) -> Result<LoadResult> {
     validate_load_args(&args)?;
 
     let delimited_config = maybe_delimited_config(&args);
@@ -197,29 +231,6 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().to_path_buf();
         (Some(temp_dir), path)
-    };
-
-    // Create connection pool (or use test pool if provided)
-    #[cfg(test)]
-    let pool = if let Some(test_pool) = args.test_pool {
-        test_pool
-    } else {
-        let pool_args = PoolArgsBuilder::default()
-            .region(&args.region)
-            .endpoint(&args.endpoint)
-            .username(&args.username)
-            .build()?;
-        db_pool::pool::pool(pool_args).await?
-    };
-
-    #[cfg(not(test))]
-    let pool = {
-        let pool_args = PoolArgsBuilder::default()
-            .region(&args.region)
-            .endpoint(&args.endpoint)
-            .username(&args.username)
-            .build()?;
-        db_pool::pool::pool(pool_args).await?
     };
 
     // Parse source URI

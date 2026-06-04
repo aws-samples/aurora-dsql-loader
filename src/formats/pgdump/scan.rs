@@ -219,10 +219,6 @@ pub async fn find_copy_block(
 ///
 /// `blocks` is the slice returned by [`list_copy_blocks`]; pass `&[]` for a
 /// schema-only dump (no data) and the entire file is returned as DDL.
-// Task 3.2 (transform_ddl) is the in-crate caller; until then this is only
-// exercised by unit tests, so silence the dead-code warning rather than
-// gating on `#[cfg(test)]` (the function ships in the public lib API).
-#[allow(dead_code)]
 pub async fn extract_ddl(reader: &dyn ByteReader, blocks: &[CopyBlock]) -> Result<String> {
     let size = reader.size().await?;
     let mut out: Vec<u8> = Vec::new();
