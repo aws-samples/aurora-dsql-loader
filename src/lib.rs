@@ -7,6 +7,7 @@ mod coordination;
 mod db;
 mod formats;
 mod io;
+mod migrate;
 mod telemetry;
 
 #[cfg(test)]
