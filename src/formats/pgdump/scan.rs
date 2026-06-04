@@ -217,6 +217,13 @@ pub async fn find_copy_block(
 /// any non-UTF-8 byte in the DDL slices indicates either format corruption or
 /// a custom-format archive that the scanner should already have rejected.
 ///
+/// Strips PostgreSQL 16+ pg_dump's `\restrict <token>` and
+/// `\unrestrict <token>` psql meta-commands — they are NOT SQL, they are
+/// psql-client directives that lock object names against concurrent
+/// ALTERs while psql replays the dump. Any downstream SQL parser
+/// (sqlparser, our dsql-lint) chokes on the leading backslash, and
+/// they have no semantic value outside psql.
+///
 /// `blocks` is the slice returned by [`list_copy_blocks`]; pass `&[]` for a
 /// schema-only dump (no data) and the entire file is returned as DDL.
 pub async fn extract_ddl(reader: &dyn ByteReader, blocks: &[CopyBlock]) -> Result<String> {
@@ -234,12 +241,50 @@ pub async fn extract_ddl(reader: &dyn ByteReader, blocks: &[CopyBlock]) -> Resul
         out.extend_from_slice(&reader.read_range(cursor, size).await?);
     }
 
-    String::from_utf8(out).map_err(|e| {
+    let raw = String::from_utf8(out).map_err(|e| {
         anyhow::anyhow!(
             "pg_dump DDL section is not valid UTF-8 at byte {}: {e}",
             e.utf8_error().valid_up_to()
         )
-    })
+    })?;
+    Ok(strip_psql_meta_commands(&raw))
+}
+
+/// Drop psql client meta-commands that pg_dump 16+ emits at the top and
+/// bottom of every dump. Tightly anchored: only `\restrict` and
+/// `\unrestrict` at the very start of a line, followed by whitespace
+/// or end-of-line. A `\restrict` inside a string literal or block
+/// comment is preserved verbatim because no SQL line ever starts with
+/// `\<keyword>` — that's a psql-only shape.
+fn strip_psql_meta_commands(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for line in input.split_inclusive('\n') {
+        if is_psql_meta_command_line(line) {
+            // Drop the entire line including its newline.
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Whether `line` is a psql meta-command we recognize (`\restrict ...`
+/// or `\unrestrict ...`). Matches at the start of the line (no leading
+/// whitespace allowed — psql parses these strictly) and only when the
+/// command name is followed by whitespace, EOL, or EOF; that prevents
+/// a hypothetical `\restricted_function` being mistaken for `\restrict`.
+fn is_psql_meta_command_line(line: &str) -> bool {
+    for cmd in ["\\restrict", "\\unrestrict"] {
+        if let Some(rest) = line.strip_prefix(cmd) {
+            // Must end here, end-of-line, or be followed by whitespace.
+            // Rules out `\restrictX` while accepting `\restrict tok\n`.
+            let next = rest.chars().next();
+            if matches!(next, None | Some(' ' | '\t' | '\n' | '\r')) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Parse a single line as `COPY <schema>.<table> (col1, col2) FROM stdin;`

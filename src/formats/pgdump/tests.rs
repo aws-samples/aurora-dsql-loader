@@ -754,6 +754,71 @@ COPY public.u (id) FROM stdin;\n\
 }
 
 #[tokio::test]
+async fn extract_ddl_strips_psql_restrict_meta_commands() {
+    // PostgreSQL 16+ pg_dump emits `\restrict <token>` at the top and
+    // `\unrestrict <token>` at the bottom of every dump. They are psql
+    // meta-commands, not SQL — any downstream SQL tool (a parser, our
+    // dsql-lint) chokes on the leading backslash. extract_ddl strips
+    // them so the migrate flow's transform stage sees clean SQL.
+    let raw = b"\
+\\restrict aB1xYz\n\
+\n\
+SET statement_timeout = 0;\n\
+CREATE TABLE public.t (id integer NOT NULL);\n\
+COPY public.t (id) FROM stdin;\n\
+1\n\
+\\.\n\
+\n\
+\\unrestrict aB1xYz\n\
+\n\
+-- complete\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert_eq!(blocks.len(), 1);
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    assert!(
+        !ddl.contains("\\restrict"),
+        "\\restrict meta-command should be stripped, got: {ddl:?}"
+    );
+    assert!(
+        !ddl.contains("\\unrestrict"),
+        "\\unrestrict meta-command should be stripped, got: {ddl:?}"
+    );
+    // Real DDL survives.
+    assert!(ddl.contains("SET statement_timeout"));
+    assert!(ddl.contains("CREATE TABLE"));
+    assert!(ddl.contains("-- complete"));
+}
+
+#[tokio::test]
+async fn extract_ddl_does_not_strip_lines_inside_unrelated_dollar_quotes() {
+    // A function body that happens to contain a `\restrict`-looking
+    // line as a string MUST NOT be touched. The filter is anchored on
+    // the line start and the exact known commands, not on a generic
+    // backslash regex; this test pins that.
+    let raw = b"\
+SET search_path = public;\n\
+CREATE FUNCTION f() RETURNS text AS $$\n\
+SELECT '\\restrict not a meta command'::text\n\
+$$ LANGUAGE sql;\n\
+COPY public.t (a) FROM stdin;\n\
+1\n\
+\\.\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    // The string literal stays put because the filter only matches
+    // a meta-command at the VERY START of a line, with the known
+    // command word, surrounded by whitespace.
+    assert!(
+        ddl.contains("'\\restrict not a meta command'"),
+        "string-literal `\\restrict` must NOT be stripped, got: {ddl:?}"
+    );
+}
+
+#[tokio::test]
 async fn read_chunk_handles_crlf_line_endings() {
     // pg_dump on Windows-flavored paths can produce CRLF; split_lines strips
     // the trailing \r per line. Assert decoded fields don't carry stray \r.
