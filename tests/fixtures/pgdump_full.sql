@@ -5,7 +5,9 @@
 -- shape `pg_dump -Fp` (no --data-only) emits for a real schema that uses:
 --   * SERIAL primary key   (the 4-statement expansion that dsql-lint collapses)
 --   * NOT NULL DEFAULT ''  (a rule dsql-lint preserves)
---   * UNIQUE constraint    (allowed in DSQL, no transform needed)
+--   * standalone ALTER ... ADD CONSTRAINT ... UNIQUE
+--                          (folded back onto CREATE TABLE by
+--                           dsql-lint's alter_add_unique_collapse rule)
 --   * FOREIGN KEY          (auto-removed by dsql-lint with a warning)
 --   * sync CREATE INDEX    (dsql-lint rewrites to CREATE INDEX ASYNC)
 -- Used by the orchestrator's offline smoke test to pin --dry-run behavior

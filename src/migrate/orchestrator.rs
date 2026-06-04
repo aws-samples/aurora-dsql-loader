@@ -637,7 +637,19 @@ COPY public.events (id) FROM stdin;
             test_pool: None,
         };
         let report = run_migrate(args).await.unwrap();
-        assert!(!report.ddl_unfixable.is_empty(), "must surface unfixable");
+        // Pin the specific rule, not just "non-empty unfixable" — if a
+        // future dsql-lint reclassifies cross-file SET DEFAULT under a
+        // different rule name (or worse, makes it fixable), the test
+        // surfaces here rather than silently passing for an unrelated
+        // reason.
+        assert!(
+            report
+                .ddl_unfixable
+                .iter()
+                .any(|d| d.rule == "at_unsupported_alter_column_set_default"),
+            "must surface at_unsupported_alter_column_set_default; got: {:?}",
+            report.ddl_unfixable
+        );
         assert!(report.ddl_applied.is_empty());
         assert!(report.tables.is_empty());
         // dry_run echoes the input flag (false here); the offline-ness is

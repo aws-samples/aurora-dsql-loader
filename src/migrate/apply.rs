@@ -109,10 +109,12 @@ fn is_already_exists(err: &sqlx::Error) -> bool {
 }
 
 /// Scrub a SQL fragment for safe inclusion in an error message or log line:
-/// truncate to 200 bytes (real `pg_dump` statements can be MB-sized via
-/// embedded function bodies / large enum lists) and replace control bytes,
-/// Unicode bidi/format codepoints, and other terminal-unsafe characters
-/// with `?`. Mirrors what `check_listable` does for the `list-tables` path.
+/// truncate at the first char boundary at or after 200 bytes (real `pg_dump`
+/// statements can be MB-sized via embedded function bodies / large enum
+/// lists) and replace control bytes, Unicode bidi/format codepoints, and
+/// other terminal-unsafe characters with `?`. Reuses the same character
+/// classes that `is_unsafe_for_listing` flags in the `list-tables` path,
+/// adapted for replace-instead-of-reject semantics.
 fn scrub_for_log(stmt: &str) -> String {
     const MAX: usize = 200;
     let truncated = if stmt.len() > MAX {
@@ -510,11 +512,10 @@ INSERT INTO t (id, val) VALUES (2, 'b;not-a-split');
             msg.contains("Failed to apply DDL statement"),
             "unrelated SQLite error should bubble out as Err, got: {msg}"
         );
-        // And drive the positive case: "table X already exists" via the
-        // existing infrastructure (CREATE TABLE on a name that exists).
-        // Already covered by `apply_ddl_skips_already_exists_for_idempotent_rerun`,
-        // but pinning the negative shape here is what the substring-fallback
-        // gate (code.is_none() guard) was added to protect.
+        // The positive "table X already exists" case is covered by
+        // `apply_ddl_skips_already_exists_for_idempotent_rerun`. This test
+        // pins the negative shape — what the class-42 SQLSTATE allowlist
+        // gate was added to protect against.
     }
 
     #[tokio::test]

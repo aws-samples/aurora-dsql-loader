@@ -158,6 +158,10 @@ connection pool:
       the migrate report flags each removal).
     - `CREATE INDEX` is rewritten to `CREATE INDEX ASYNC` and the
       `USING btree` clause is stripped (DSQL's only index method).
+    - Standalone `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE (...)` (the
+      shape pg_dump always emits, even when the source declared `UNIQUE`
+      inline) is folded back onto the matching `CREATE TABLE` as an
+      inline `UNIQUE` column constraint.
     - `JSONB` → `JSON`, `BIGSERIAL` → `BIGINT GENERATED ...`, etc.
 3. **Apply** the transformed DDL to the cluster, one statement per
    transaction (DSQL accepts only one DDL per txn). Already-existing

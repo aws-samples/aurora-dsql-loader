@@ -32,9 +32,11 @@ struct SourceArgs {
     source_uri: String,
 
     /// File format (csv, tsv, parquet, pgdump). Auto-detected from extension
-    /// for csv/tsv/parquet; pgdump must be specified explicitly. pgdump
-    /// requires plain (`-Fp`) `pg_dump --data-only` output and is not
-    /// compatible with --column-map, --exclude-columns, or --if-not-exists.
+    /// for csv/tsv/parquet; pgdump must be specified explicitly. The `load`
+    /// subcommand's pgdump format requires plain (`-Fp`) `pg_dump
+    /// --data-only` output and is not compatible with --column-map,
+    /// --exclude-columns, or --if-not-exists. (The `migrate` subcommand
+    /// reads a full `pg_dump -Fp` instead — see `migrate --help`.)
     #[arg(short, long)]
     format: Option<String>,
 
