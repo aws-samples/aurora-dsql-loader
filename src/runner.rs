@@ -8,6 +8,14 @@
 // Re-export OnConflict for external use
 pub use crate::coordination::manifest::OnConflict;
 
+// Re-export the migrate API so external consumers (and the CLI binary)
+// reach it through the same `runner::` namespace as `run_load`. The
+// types embedded in MigrateReport ride along.
+pub use crate::migrate::{
+    AppliedStatement, ApplyOutcome, Diagnostic as DdlDiagnostic, MigrateArgs, MigrateReport,
+    TableLoadSummary, run_migrate,
+};
+
 use anyhow::Result;
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;

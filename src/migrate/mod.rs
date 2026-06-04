@@ -9,12 +9,21 @@ mod apply;
 mod orchestrator;
 mod transform;
 
-// Task 3.5 (CLI subcommand) re-exports `run_migrate` and `MigrateArgs`
-// once main.rs dispatches to it. Until then keep the items reachable
-// via their submodule paths and silence the warnings centrally.
+// Public API: the orchestrator + its result/argument types are re-
+// exported through `crate::runner::` (the documented public surface)
+// so external consumers reach migrate through the same namespace as
+// `run_load`. Keep the structs `pub` here so `pub use` at the runner
+// layer can hoist them across the crate boundary.
+pub use orchestrator::{MigrateArgs, MigrateReport, TableLoadSummary, run_migrate};
+
+// Public surface of the report: AppliedStatement / ApplyOutcome /
+// Diagnostic are reachable through MigrateReport, so they ship in the
+// public API alongside it.
+pub use apply::{AppliedStatement, ApplyOutcome};
+pub use transform::Diagnostic;
+
+// Crate-internal: orchestrator's view of apply / transform.
 #[allow(unused_imports)]
-pub(crate) use apply::{AppliedStatement, ApplyOutcome, apply_ddl};
+pub(crate) use apply::apply_ddl;
 #[allow(unused_imports)]
-pub(crate) use orchestrator::{MigrateArgs, MigrateReport, TableLoadSummary, run_migrate};
-#[allow(unused_imports)]
-pub(crate) use transform::{Diagnostic, TransformResult, transform_ddl};
+pub(crate) use transform::{TransformResult, transform_ddl};
