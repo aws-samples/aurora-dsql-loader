@@ -52,7 +52,7 @@ ALTER SEQUENCE public.events_id_seq OWNED BY public.events.id;
 
 CREATE TABLE public.users (
     id integer NOT NULL,
-    email text NOT NULL UNIQUE
+    email text NOT NULL
 );
 
 CREATE SEQUENCE public.users_id_seq
@@ -109,6 +109,13 @@ ALTER TABLE ONLY public.events
 
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+
+--
+-- Name: users users_email_key; Type: CONSTRAINT
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_email_key UNIQUE (email);
 
 --
 -- Name: events_label_idx; Type: INDEX

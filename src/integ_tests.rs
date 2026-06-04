@@ -4563,6 +4563,16 @@ mod tests {
             "FK should be reported as auto-removed, got: {:?}",
             report.ddl_changes
         );
+        // UNIQUE on users.email folded back into the CREATE TABLE by
+        // alter_add_unique_collapse (dsql-lint 0.2.3).
+        assert!(
+            report
+                .ddl_changes
+                .iter()
+                .any(|d| d.rule == "alter_add_unique_collapse"),
+            "UNIQUE should be folded by alter_add_unique_collapse, got: {:?}",
+            report.ddl_changes
+        );
 
         // information_schema: dst tables exist with PK columns marked
         // as identity. PG's information_schema mirrors what DSQL
@@ -4599,6 +4609,23 @@ mod tests {
         assert_eq!(
             fk_count, 0,
             "{events_dst} must have NO foreign key constraints post-migrate"
+        );
+
+        // UNIQUE constraint on users.email survived: the source had
+        // `email TEXT NOT NULL UNIQUE`, which pg_dump normalizes to a
+        // standalone ALTER TABLE ADD CONSTRAINT users_email_key UNIQUE.
+        // dsql-lint 0.2.3's alter_add_unique_collapse rule folds that
+        // back onto the CREATE TABLE so DSQL accepts it.
+        let (users_unique_count,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM information_schema.table_constraints \
+             WHERE table_schema='public' AND table_name='{users_dst}' \
+             AND constraint_type='UNIQUE'"
+        ))
+        .fetch_one(&pg_pool)
+        .await?;
+        assert_eq!(
+            users_unique_count, 1,
+            "{users_dst} must have exactly 1 UNIQUE constraint (from collapse)"
         );
 
         // Row counts: 2 users, 3 events.

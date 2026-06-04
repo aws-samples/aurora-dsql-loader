@@ -565,6 +565,19 @@ COPY public.t (id) FROM stdin;
             report.ddl_changes
         );
 
+        // Standalone `ALTER TABLE ... ADD CONSTRAINT users_email_key
+        // UNIQUE (email)` (the form pg_dump always emits even when the
+        // source declared UNIQUE inline) folds back onto the CREATE
+        // TABLE. dsql-lint 0.2.3 added the rule.
+        assert!(
+            report
+                .ddl_changes
+                .iter()
+                .any(|d| d.rule == "alter_add_unique_collapse"),
+            "ALTER ADD UNIQUE should fold into CREATE TABLE, got: {:?}",
+            report.ddl_changes
+        );
+
         // Critical: nothing unfixable. If a future dsql-lint upgrade
         // starts flagging something in this fixture, that's a real
         // signal — the migrate happy-path no longer covers all the

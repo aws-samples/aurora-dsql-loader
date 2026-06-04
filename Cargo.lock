@@ -1475,9 +1475,9 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dsql-lint"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e0024385620979d8b7cb68dde02189e639a58a0b3a2e23df54a03372b8d570f"
+checksum = "7ae9e112ea42ec0a63ad531eec69c3e08320502360a900282f3aa6dbbb283905"
 dependencies = [
  "clap",
  "serde",
