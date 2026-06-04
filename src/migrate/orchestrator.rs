@@ -117,14 +117,6 @@ pub struct TableLoadSummary {
 /// statements are sent to the cluster.
 #[allow(dead_code)]
 pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
-    let pool = build_pool(&args).await?;
-    run_migrate_with_pool(pool, args).await
-}
-
-/// Same as [`run_migrate`] but takes a pre-built pool. Lets tests drive
-/// the full flow against an in-memory SQLite pool, and keeps the
-/// production path symmetric with `run_load_with_pool`.
-async fn run_migrate_with_pool(pool: Pool, args: MigrateArgs) -> Result<MigrateReport> {
     // 1. Open the dump.
     let reader = open_source(&args).await?;
 
@@ -149,6 +141,9 @@ async fn run_migrate_with_pool(pool: Pool, args: MigrateArgs) -> Result<MigrateR
 
     // Dry-run / unfixable short-circuit. We DO NOT apply DDL when there
     // are unfixable diagnostics — the operator must edit the dump first.
+    // Crucially, both branches return BEFORE building a pool, so a
+    // --dry-run review of an offline fixture works without IAM
+    // credentials or cluster access.
     if args.dry_run || !unfixable.is_empty() {
         return Ok(MigrateReport {
             ddl_applied: Vec::new(),
@@ -160,7 +155,9 @@ async fn run_migrate_with_pool(pool: Pool, args: MigrateArgs) -> Result<MigrateR
         });
     }
 
-    // 5/6. Apply DDL.
+    // 5/6. Apply DDL — pool is built lazily here so the steps above
+    // can run offline.
+    let pool = build_pool(&args).await?;
     let ddl_applied = apply_ddl(&pool, &fixed_sql)
         .await
         .context("Failed to apply DDL to cluster")?;
@@ -477,6 +474,125 @@ COPY public.t (id) FROM stdin;
             vec![ApplyOutcome::SkippedAlreadyExists],
             "pre-existing CREATE TABLE must be skipped, got: {:?}",
             report.ddl_applied
+        );
+    }
+
+    /// `--dry-run` MUST NOT build a connection pool — the operator runs
+    /// dry-run from a workstation that may not have IAM credentials or
+    /// network access to the cluster yet. Pinning this so the orchestrator
+    /// stays offline-friendly: setting `test_pool: None` and `dry_run:
+    /// true` and pointing at a real fixture must succeed regardless of
+    /// any DSQL endpoint validity.
+    ///
+    /// This is the regression test for the bug where `run_migrate`
+    /// unconditionally called `build_pool` before the dry-run branch.
+    #[tokio::test]
+    async fn dry_run_does_not_build_pool() {
+        let dump = write_dump(
+            "-- preamble\nCREATE TABLE t (id integer NOT NULL);\nCOPY public.t (id) FROM stdin;\n1\n\\.\n",
+        );
+        let args = MigrateArgs {
+            endpoint: "doesnotexist.invalid".to_string(),
+            region: "us-east-1".to_string(),
+            username: "ignored".to_string(),
+            source_uri: file_uri(dump.path()),
+            schema: "public".to_string(),
+            dry_run: true,
+            worker_count: 1,
+            batch_size: 1,
+            batch_concurrency: 1,
+            chunk_size_bytes: 1024,
+            on_conflict: OnConflict::Error,
+            quiet: true,
+            debug: false,
+            // Critically: NO test_pool. If the orchestrator tried to
+            // build a real pool against the bogus endpoint, this would
+            // fail. It must stay offline.
+            test_pool: None,
+        };
+        let report = run_migrate(args).await.unwrap();
+        assert!(report.dry_run);
+        assert!(report.ddl_applied.is_empty());
+        assert!(report.tables.is_empty());
+    }
+
+    /// Offline smoke test: feed a hand-authored full-dump fixture
+    /// through `run_migrate(..., dry_run=true)` and assert the
+    /// orchestrator produces the diagnostic shape we promise in the CLI
+    /// help / README. Covers the realistic shape pg_dump emits for a
+    /// schema with SERIAL PK + FK + sync index + NOT NULL DEFAULT — the
+    /// proof that all of dsql-lint's transforms compose end-to-end via
+    /// the migrate flow without touching a cluster.
+    #[tokio::test]
+    async fn dry_run_full_dump_fixture_collapses_idioms_and_strips_fk() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pgdump_full.sql");
+        let args = MigrateArgs {
+            endpoint: "doesnotexist.invalid".to_string(),
+            region: "us-east-1".to_string(),
+            username: "ignored".to_string(),
+            source_uri: file_uri(&fixture),
+            schema: "public".to_string(),
+            dry_run: true,
+            worker_count: 1,
+            batch_size: 1,
+            batch_concurrency: 1,
+            chunk_size_bytes: 1024,
+            on_conflict: OnConflict::Error,
+            quiet: true,
+            debug: false,
+            test_pool: None,
+        };
+        let report = run_migrate(args).await.unwrap();
+
+        // Both SERIAL columns collapse to inline identity. The fixture
+        // has two SERIAL PKs (events.id and users.id), so we expect
+        // exactly two `serial_sequence_idiom` change diagnostics.
+        let serial = report
+            .ddl_changes
+            .iter()
+            .filter(|d| d.rule == "serial_sequence_idiom")
+            .count();
+        assert_eq!(
+            serial, 2,
+            "expected 2 serial_sequence_idiom changes (events + users), got: {:?}",
+            report.ddl_changes
+        );
+
+        // Foreign key auto-removed (DSQL has no FK enforcement).
+        assert!(
+            report.ddl_changes.iter().any(|d| d.rule == "foreign_key"),
+            "FK should be reported as auto-removed, got: {:?}",
+            report.ddl_changes
+        );
+
+        // Sync CREATE INDEX rewritten to ASYNC, USING clause stripped.
+        assert!(
+            report.ddl_changes.iter().any(|d| d.rule == "index_async"),
+            "CREATE INDEX should be rewritten to ASYNC, got: {:?}",
+            report.ddl_changes
+        );
+
+        // Critical: nothing unfixable. If a future dsql-lint upgrade
+        // starts flagging something in this fixture, that's a real
+        // signal — the migrate happy-path no longer covers all the
+        // shapes we promise.
+        assert!(
+            report.ddl_unfixable.is_empty(),
+            "fixture must dry-run cleanly with zero unfixable, got: {:?}",
+            report.ddl_unfixable
+        );
+
+        // Warnings were collected from each change's fix_detail (one per
+        // change). Assert there's at least one identity-counter warning
+        // since that's the operator-action-required nudge for SERIAL.
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("identity counter")),
+            "expected an 'identity counter' warning, got: {:?}",
+            report.warnings
         );
     }
 }
