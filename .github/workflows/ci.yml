@@ -125,8 +125,7 @@ jobs:
     uses: ./.github/workflows/dsql-cluster-create.yml
     with:
       workflow_name: aurora-dsql-loader-pgdump-e2e
-    secrets:
-      IAM_ROLE: ${{ secrets.IAM_ROLE }}
+    secrets: inherit
     permissions:
       id-token: write
 
@@ -205,7 +204,6 @@ jobs:
     with:
       cluster-id: ${{ needs.create-cluster.outputs.cluster-id }}
       region: ${{ needs.create-cluster.outputs.region }}
-    secrets:
-      IAM_ROLE: ${{ secrets.IAM_ROLE }}
+    secrets: inherit
     permissions:
       id-token: write
