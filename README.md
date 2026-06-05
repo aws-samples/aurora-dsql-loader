@@ -200,6 +200,18 @@ access yet.
   collapsed and will surface as `Unfixable` — drop it from the dump or
   inline the sequence.
 
+**Destructive-statement caveat:** `migrate` is intended for fresh /
+empty DSQL clusters. `dsql-lint` does not flag `DROP TABLE`,
+`DROP SCHEMA`, `DROP INDEX`, `DELETE`, or `UPDATE` statements; if your
+dump contains them (typical with `pg_dump --clean`, which prepends
+`DROP TABLE IF EXISTS …` to every CREATE), the migrate flow will
+execute them against the target without confirmation. The
+already-exists skip path makes a re-run safe for `CREATE` collisions
+only — it does not prevent a `DROP` from destroying data on the
+target. If you need to refresh into a populated cluster, drop the
+`--clean` flag from `pg_dump` and either truncate the target tables
+manually or migrate into a fresh cluster.
+
 ### CSV/TSV header behavior
 
 By default, the loader treats every row of a CSV or TSV file as data — it does

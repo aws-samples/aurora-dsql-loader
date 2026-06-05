@@ -197,7 +197,11 @@ enum Command {
         #[arg(short, long)]
         source_uri: String,
 
-        /// Database schema the dump targets in DSQL.
+        /// Database schema the dump targets in DSQL. Informational
+        /// only: per-table routing follows each `COPY` block's
+        /// schema-qualified name in the dump itself, so this flag does
+        /// not override the dump's schema. Reserved for a future
+        /// dump-vs-target schema validation.
         #[arg(long, default_value = "public")]
         schema: String,
 
@@ -1129,6 +1133,15 @@ mod tests {
                 assert_eq!(on_conflict, "error");
                 assert!(!quiet);
                 assert!(!debug);
+                // The CLI default round-trips through `OnConflict::FromStr`
+                // to `OnConflict::Error`. A future enum-variant rename
+                // that breaks the round-trip would surface here even
+                // though the raw string default ("error") stays the same.
+                assert_eq!(
+                    on_conflict.parse::<OnConflict>().unwrap(),
+                    OnConflict::Error,
+                    "migrate --on-conflict default must parse to OnConflict::Error",
+                );
             }
             _ => panic!("expected Migrate"),
         }

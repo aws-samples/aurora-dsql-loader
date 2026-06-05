@@ -64,7 +64,7 @@ pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> 
                 return Err(anyhow::Error::new(e)).with_context(|| {
                     format!(
                         "Failed to apply DDL statement: {summary}",
-                        summary = scrub_for_log(&stmt)
+                        summary = safe_for_terminal(&stmt)
                     )
                 });
             }
@@ -111,11 +111,12 @@ fn is_already_exists(err: &sqlx::Error) -> bool {
 /// Scrub a SQL fragment for safe inclusion in an error message or log line:
 /// truncate at the first char boundary at or after 200 bytes (real `pg_dump`
 /// statements can be MB-sized via embedded function bodies / large enum
-/// lists) and replace control bytes, Unicode bidi/format codepoints, and
-/// other terminal-unsafe characters with `?`. Reuses the same character
-/// classes that `is_unsafe_for_listing` flags in the `list-tables` path,
-/// adapted for replace-instead-of-reject semantics.
-fn scrub_for_log(stmt: &str) -> String {
+/// lists) and replace control bytes / Unicode bidi-format codepoints with
+/// `?` so a multi-line SQL excerpt embedded in an anyhow chain doesn't
+/// re-flow the operator's terminal. Reuses the same character classes
+/// that `is_unsafe_for_listing` flags in the `list-tables` path, adapted
+/// for replace-instead-of-reject semantics.
+fn safe_for_terminal(stmt: &str) -> String {
     const MAX: usize = 200;
     let truncated = if stmt.len() > MAX {
         format!(
@@ -412,6 +413,48 @@ mod tests {
         assert_eq!(r, vec!["SELECT $1", "SELECT 2"]);
     }
 
+    // ---- adversarial / malformed-input shapes ----
+    //
+    // The splitter must terminate (no infinite loop, no OOB slice, no
+    // panic) on every well-formed UTF-8 input — including dumps a
+    // crafted file might emit. We do NOT require correct splitting on
+    // malformed input; we DO require these calls to return.
+
+    #[test]
+    fn unterminated_single_quote_consumes_to_eof() {
+        let r = split("INSERT INTO t VALUES ('unterminated;");
+        // Whatever the splitter decides about this malformed input,
+        // it must terminate and not panic.
+        assert!(r.len() <= 1, "unterminated quote: {r:?}");
+    }
+
+    #[test]
+    fn unterminated_dollar_quote_consumes_to_eof() {
+        // Documented behavior: an unterminated `$tag$` rolls forward to
+        // EOF rather than splitting on every `;` after it.
+        let r = split("CREATE FUNCTION f() RETURNS int AS $body$ SELECT 1; SELECT 2;");
+        assert_eq!(
+            r.len(),
+            1,
+            "unterminated dollar quote produced split: {r:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_block_comment_terminates_without_panic() {
+        // depth never returns to 0; the loop must still exit at EOF.
+        let r = split("SELECT 1; /* unterminated comment");
+        assert!(!r.is_empty());
+        assert_eq!(r[0], "SELECT 1");
+    }
+
+    #[test]
+    fn line_comment_without_trailing_newline_terminates() {
+        // EOF inside a line comment must not loop or OOB.
+        let r = split("SELECT 1; -- comment without newline");
+        assert_eq!(r, vec!["SELECT 1"]);
+    }
+
     // ---- apply_ddl integration ----
 
     #[tokio::test]
@@ -492,12 +535,12 @@ INSERT INTO t (id, val) VALUES (2, 'b;not-a-split');
         assert_eq!(rows[0].0, 1);
     }
 
-    /// Regression test for the silent-failure class fixed in this PR: the
-    /// SQLite/no-code substring fallback in `is_already_exists` MUST NOT
-    /// accept arbitrary errors whose message happens to contain "already
-    /// exists". A SQLite "table … already exists" message is a true skip;
-    /// a SQLite "no such table" is not. Pinning both shapes guards against
-    /// a regression that broadens the substring match.
+    /// Regression guard for the substring-fallback shape in
+    /// `is_already_exists`: the SQLite / no-code path must not accept
+    /// arbitrary errors whose message happens to contain "already
+    /// exists". A SQLite "table … already exists" is a true skip; a
+    /// SQLite "no such table" is not. Pinning the negative shape
+    /// prevents a regression that broadens the substring match.
     #[tokio::test]
     async fn apply_ddl_substring_fallback_is_anchored_to_already_exists() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -516,6 +559,23 @@ INSERT INTO t (id, val) VALUES (2, 'b;not-a-split');
         // `apply_ddl_skips_already_exists_for_idempotent_rerun`. This test
         // pins the negative shape — what the class-42 SQLSTATE allowlist
         // gate was added to protect against.
+    }
+
+    /// `safe_for_terminal` truncates large SQL excerpts so a multi-MB
+    /// statement (e.g. a large enum list or function body) doesn't flood
+    /// an anyhow chain. Pin the boundary + bytes-total suffix so a
+    /// future tweak doesn't silently change error message shape.
+    #[test]
+    fn safe_for_terminal_truncates_large_excerpts_with_byte_count() {
+        let stmt = "x".repeat(250);
+        let out = safe_for_terminal(&stmt);
+        assert!(out.starts_with(&"x".repeat(200)));
+        assert!(out.contains("(250 bytes total)"));
+        // Short inputs round-trip unchanged.
+        assert_eq!(
+            safe_for_terminal("CREATE TABLE t (id INT)"),
+            "CREATE TABLE t (id INT)"
+        );
     }
 
     #[tokio::test]

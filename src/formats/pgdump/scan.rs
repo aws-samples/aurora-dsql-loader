@@ -210,19 +210,19 @@ pub async fn find_copy_block(
 /// Extract the non-data (DDL) bytes from a pg_dump file: the prefix before
 /// the first COPY block, the DDL between blocks, and the suffix after the
 /// last block. Designed so the result can be fed directly to `dsql_lint::fix_sql`
-/// to produce DSQL-compatible DDL for the upcoming `migrate` subcommand.
+/// to produce DSQL-compatible DDL for the `migrate` subcommand.
 ///
 /// Returns the bytes as a UTF-8 string. pg_dump writes the textual section of
 /// its plain-format output as UTF-8 (unrelated to the COPY data encoding);
 /// any non-UTF-8 byte in the DDL slices indicates either format corruption or
 /// a custom-format archive that the scanner should already have rejected.
 ///
-/// Strips PostgreSQL 16+ pg_dump's `\restrict <token>` and
-/// `\unrestrict <token>` psql meta-commands — they are NOT SQL, they are
-/// psql-client directives that lock object names against concurrent
-/// ALTERs while psql replays the dump. Any downstream SQL parser
-/// (sqlparser, our dsql-lint) chokes on the leading backslash, and
-/// they have no semantic value outside psql.
+/// Strips two classes of pg_dump preamble that DSQL refuses:
+/// `\restrict` / `\unrestrict` psql meta-commands (CVE-2025-1094
+/// backports), and the `SET <param> = ...;` session GUCs pg_dump
+/// emits at the top of every dump (`statement_timeout`, `lock_timeout`,
+/// `client_encoding`, etc.) which DSQL rejects with
+/// "setting configuration parameter ... not supported".
 ///
 /// `blocks` is the slice returned by [`list_copy_blocks`]; pass `&[]` for a
 /// schema-only dump (no data) and the entire file is returned as DDL.
@@ -247,20 +247,39 @@ pub async fn extract_ddl(reader: &dyn ByteReader, blocks: &[CopyBlock]) -> Resul
             e.utf8_error().valid_up_to()
         )
     })?;
-    Ok(strip_psql_meta_commands(&raw))
+    Ok(strip_pgdump_preamble(&raw))
 }
 
-/// Drop psql client meta-commands that pg_dump 16+ emits at the top and
-/// bottom of every dump. Tightly anchored: only `\restrict` and
-/// `\unrestrict` at the very start of a line, followed by whitespace
-/// or end-of-line. A `\restrict` inside a string literal or block
-/// comment is preserved verbatim because no SQL line ever starts with
-/// `\<keyword>` — that's a psql-only shape.
-fn strip_psql_meta_commands(input: &str) -> String {
+/// pg_dump session GUCs DSQL rejects. Sourced from `pg_dump.c`'s
+/// `setupDumpWorker` / preamble emission — these are the always-on
+/// parameters every plain-format dump prints. Anything outside this
+/// allowlist (e.g. a customer-authored `SET search_path = ...;`) is
+/// preserved so a real apply error surfaces if DSQL doesn't accept it.
+const PGDUMP_REJECTED_SET_PARAMS: &[&str] = &[
+    "statement_timeout",
+    "lock_timeout",
+    "idle_in_transaction_session_timeout",
+    "transaction_timeout",
+    "client_encoding",
+    "standard_conforming_strings",
+    "check_function_bodies",
+    "xmloption",
+    "client_min_messages",
+    "row_security",
+    "default_tablespace",
+    "default_table_access_method",
+    "default_with_oids",
+];
+
+/// Drop pg_dump preamble lines DSQL refuses. Tightly anchored to
+/// start-of-line; the same caveat as the prior `\restrict` strip
+/// applies — a `$body$...$body$` whose interior begins with one of
+/// these tokens at column 0 would be (incorrectly) stripped, but
+/// pg_dump does not produce such bodies.
+fn strip_pgdump_preamble(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for line in input.split_inclusive('\n') {
-        if is_psql_meta_command_line(line) {
-            // Drop the entire line including its newline.
+        if is_strippable_preamble_line(line) {
             continue;
         }
         out.push_str(line);
@@ -268,23 +287,58 @@ fn strip_psql_meta_commands(input: &str) -> String {
     out
 }
 
-/// Whether `line` is a psql meta-command we recognize (`\restrict ...`
-/// or `\unrestrict ...`). Matches at the start of the line (no leading
-/// whitespace allowed — psql parses these strictly) and only when the
-/// command name is followed by whitespace, EOL, or EOF; that prevents
-/// a hypothetical `\restricted_function` being mistaken for `\restrict`.
-fn is_psql_meta_command_line(line: &str) -> bool {
+/// Whether `line` is one of the pg_dump preamble shapes we drop:
+/// `\restrict ...` / `\unrestrict ...` psql meta-commands, or
+/// `SET <param> = ...;` for a `<param>` in [`PGDUMP_REJECTED_SET_PARAMS`].
+fn is_strippable_preamble_line(line: &str) -> bool {
     for cmd in ["\\restrict", "\\unrestrict"] {
         if let Some(rest) = line.strip_prefix(cmd) {
-            // Must end here, end-of-line, or be followed by whitespace.
-            // Rules out `\restrictX` while accepting `\restrict tok\n`.
             let next = rest.chars().next();
             if matches!(next, None | Some(' ' | '\t' | '\n' | '\r')) {
                 return true;
             }
         }
     }
-    false
+    is_pgdump_session_set_line(line)
+}
+
+/// Match `SET <param>` (case-insensitive on `SET`, exact on the param
+/// name) at the very start of the line, with `<param>` in the
+/// allowlist. The remainder of the line is not parsed — the line is
+/// dropped wholesale because pg_dump always emits these as a single
+/// `SET ident = value;` per line.
+fn is_pgdump_session_set_line(line: &str) -> bool {
+    let trimmed_eol = line.trim_end_matches(['\n', '\r']);
+    let after_set = match trimmed_eol.as_bytes().get(..3) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(b"SET") => &trimmed_eol[3..],
+        _ => return false,
+    };
+    let rest = after_set.trim_start_matches([' ', '\t']);
+    if rest.len() == after_set.len() {
+        // No whitespace after `SET` → not a SET statement.
+        return false;
+    }
+    // Read the next identifier (alpha + alpha/digit/underscore).
+    let mut end = 0;
+    for (i, c) in rest.char_indices() {
+        let ok = if i == 0 {
+            c.is_ascii_alphabetic() || c == '_'
+        } else {
+            c.is_ascii_alphanumeric() || c == '_'
+        };
+        if !ok {
+            end = i;
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    let ident = &rest[..end];
+    if ident.is_empty() {
+        return false;
+    }
+    PGDUMP_REJECTED_SET_PARAMS
+        .iter()
+        .any(|p| ident.eq_ignore_ascii_case(p))
 }
 
 /// Parse a single line as `COPY <schema>.<table> (col1, col2) FROM stdin;`

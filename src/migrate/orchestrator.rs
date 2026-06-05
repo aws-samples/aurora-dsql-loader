@@ -150,7 +150,9 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         });
     }
 
-    // Pool is built lazily here so the steps above can run offline.
+    // Pool is built lazily here so dry-run / unfixable short-circuits
+    // skip the DSQL IAM round-trip; for an offline (`file://`) fixture
+    // the entire run stays cluster-free up to this point.
     let pool = build_pool(&args).await?;
     let ddl_applied = apply_ddl(&pool, &fixed_sql)
         .await

@@ -693,9 +693,9 @@ async fn extract_ddl_pulls_preamble_and_drops_data_blocks() {
     let blocks = list_copy_blocks(&reader).await.unwrap();
     let ddl = extract_ddl(&reader, &blocks).await.unwrap();
 
-    // Preamble bytes survive...
+    // Comment preamble survives (SET preambles get stripped — covered by
+    // extract_ddl_strips_pg_dump_session_set_preamble).
     assert!(ddl.contains("PostgreSQL database dump"));
-    assert!(ddl.contains("SET statement_timeout"));
     // ...but the data rows do NOT (no `1\tAlice` / `1\t1`).
     assert!(!ddl.contains("Alice"));
     assert!(!ddl.contains("Bob"));
@@ -784,9 +784,51 @@ COPY public.t (id) FROM stdin;\n\
         "\\unrestrict meta-command should be stripped, got: {ddl:?}"
     );
     // Real DDL survives.
-    assert!(ddl.contains("SET statement_timeout"));
     assert!(ddl.contains("CREATE TABLE"));
     assert!(ddl.contains("-- complete"));
+}
+
+#[tokio::test]
+async fn extract_ddl_strips_pg_dump_session_set_preamble() {
+    // pg_dump emits a block of `SET <param> = ...;` lines at the top of
+    // every plain-format dump (statement_timeout, lock_timeout, etc.).
+    // DSQL rejects these as "setting configuration parameter ... not
+    // supported", so extract_ddl drops them. Customer-authored SETs
+    // outside the allowlist (e.g. `SET search_path`) are preserved.
+    let raw = b"\
+SET statement_timeout = 0;\n\
+SET lock_timeout = 0;\n\
+SET client_encoding = 'UTF8';\n\
+SET standard_conforming_strings = on;\n\
+SET row_security = off;\n\
+SET search_path = public;\n\
+SET default_tablespace = '';\n\
+SET default_table_access_method = heap;\n\
+\n\
+CREATE TABLE public.t (id integer NOT NULL);\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    for stripped in [
+        "SET statement_timeout",
+        "SET lock_timeout",
+        "SET client_encoding",
+        "SET standard_conforming_strings",
+        "SET row_security",
+        "SET default_tablespace",
+        "SET default_table_access_method",
+    ] {
+        assert!(
+            !ddl.contains(stripped),
+            "{stripped} should be stripped, got: {ddl:?}"
+        );
+    }
+    assert!(
+        ddl.contains("SET search_path"),
+        "non-allowlisted SET must survive (apply layer surfaces real errors), got: {ddl:?}"
+    );
+    assert!(ddl.contains("CREATE TABLE"));
 }
 
 #[tokio::test]
