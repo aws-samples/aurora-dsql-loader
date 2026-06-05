@@ -471,7 +471,6 @@ async fn read_line_rejects_pathological_unbounded_header() {
     // A "line" in the SQL preamble with no newline byte must not buffer
     // unboundedly. The header path uses MAX_HEADER_LINE_BYTES (1 MiB), so
     // a 2 MiB no-newline input exercises the cap without taking forever.
-    use crate::io::ByteReader;
     struct GiantNoNewline(u64);
     #[async_trait::async_trait]
     impl ByteReader for GiantNoNewline {
@@ -499,7 +498,6 @@ async fn find_terminator_errors_on_truncated_body_without_newlines() {
     // a MissingTerminator error rather than spin or grow memory unbounded.
     // 2 MiB body keeps the test fast; the production 1 GiB cap is the same
     // code path with a larger fixture.
-    use crate::io::ByteReader;
     struct HeaderThenJunk;
     #[async_trait::async_trait]
     impl ByteReader for HeaderThenJunk {

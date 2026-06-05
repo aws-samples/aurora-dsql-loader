@@ -11,14 +11,28 @@ mod tests {
             coordinator::LoadResult,
             manifest::{
                 ChunkResultFile, ChunkStatus, LocalManifestStorage, ManifestStorage, OnConflict,
+                ParquetConfig,
             },
         },
-        db::{Pool, SchemaInferrer, pool::PoolConnection},
-        formats::{DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader},
+        db::{
+            Pool, SchemaInferrer,
+            pool::{PoolArgsBuilder, PoolConnection, pool as build_dsql_pool},
+        },
+        formats::{
+            DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader,
+            parquet::GenericParquetReader,
+        },
         io::LocalFileByteReader,
-        runner::{Format, LoadArgs, run_load},
+        runner::{Format, LoadArgs, MigrateArgs, run_load, run_migrate},
     };
+    use arrow::array::*;
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
     use std::collections::{HashMap, HashSet};
+    use std::io::Write;
+    use std::process::Command;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::fs::{self, File};
@@ -245,20 +259,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_parquet_load() {
-        use crate::coordination::manifest::ParquetConfig;
-        use crate::formats::FileReader;
-        use crate::formats::parquet::GenericParquetReader;
-        use arrow::array::*;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
-
         let temp_dir = TempDir::new().unwrap();
 
         // Create a test Parquet file
         let parquet_path = temp_dir.path().join("test.parquet");
-        let schema = Schema::new(vec![
+        let schema = ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("value", DataType::Float64, false),
@@ -516,17 +521,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_parquet_load() {
-        use arrow::array::*;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
-
         let temp_dir = TempDir::new().unwrap();
 
         // Create a test Parquet file
         let parquet_path = temp_dir.path().join("runner_test.parquet");
-        let schema = Schema::new(vec![
+        let schema = ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("value", DataType::Float64, false),
@@ -2922,14 +2921,6 @@ mod tests {
     /// reader is a Parquet reader (not just CSV).
     #[tokio::test]
     async fn test_exclude_columns_parquet() {
-        use crate::coordination::manifest::ParquetConfig;
-        use crate::formats::parquet::GenericParquetReader;
-        use arrow::array::*;
-        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        use arrow::record_batch::RecordBatch;
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
-
         let temp_dir = TempDir::new().unwrap();
         let parquet_path = temp_dir.path().join("exclude.parquet");
         let arrow_schema = ArrowSchema::new(vec![
@@ -4014,8 +4005,6 @@ mod tests {
 
     #[tokio::test]
     async fn pgdump_loads_via_run_load() -> anyhow::Result<()> {
-        use std::io::Write;
-
         // pg_dump-shaped fixture: real tab bytes between fields, COPY header
         // followed by data lines, terminated by a literal `\.` line.
         let mut f = tempfile::NamedTempFile::new()?;
@@ -4088,8 +4077,6 @@ mod tests {
 
     #[tokio::test]
     async fn pgdump_errors_when_table_not_in_dump() -> anyhow::Result<()> {
-        use std::io::Write;
-
         let mut f = tempfile::NamedTempFile::new()?;
         writeln!(f, "COPY public.other (a) FROM stdin;")?;
         writeln!(f, "1")?;
@@ -4126,8 +4113,6 @@ mod tests {
 
     #[tokio::test]
     async fn pgdump_reorders_columns_when_target_order_differs() -> anyhow::Result<()> {
-        use std::io::Write;
-
         // pg_dump emits (id, name, note); target table column order is shuffled.
         // The loader must reorder by name so values land in the right columns.
         let mut f = tempfile::NamedTempFile::new()?;
@@ -4196,8 +4181,6 @@ mod tests {
     /// CI sets it via the `postgres` service container.
     #[tokio::test]
     async fn pgdump_real_binary_round_trip_pg_to_pg() -> anyhow::Result<()> {
-        use std::process::Command;
-
         let Some(source_pg_url) = std::env::var("PGDUMP_E2E_SOURCE_URL")
             .ok()
             .filter(|v| !v.is_empty())
@@ -4409,10 +4392,6 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn pgdump_migrate_real_full_dump_collapses_serial_strips_fk() -> anyhow::Result<()> {
-        use crate::db::pool::{PoolArgsBuilder, pool as build_dsql_pool};
-        use crate::runner::{MigrateArgs, run_migrate};
-        use std::process::Command;
-
         let source_pg_url = std::env::var("PGDUMP_E2E_SOURCE_URL")
             .map_err(|_| anyhow::anyhow!("PGDUMP_E2E_SOURCE_URL must be set"))?;
         let dsql_endpoint = std::env::var("LOADER_DSQL_E2E_ENDPOINT").map_err(|_| {
@@ -4636,8 +4615,6 @@ mod tests {
 
     #[tokio::test]
     async fn pgdump_errors_on_column_set_mismatch() -> anyhow::Result<()> {
-        use std::io::Write;
-
         // Target table has an extra column not present in the dump's COPY clause.
         // Reordering cannot rescue this — the sets diverge.
         let mut f = tempfile::NamedTempFile::new()?;

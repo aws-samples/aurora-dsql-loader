@@ -24,12 +24,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
-use crate::coordination::manifest::{LocalManifestStorage, ParquetConfig};
+use crate::coordination::manifest::{LocalManifestStorage, ParquetConfig, PgDumpConfig};
 use crate::coordination::{Coordinator, DsqlConfig, FileFormat, LoadConfigBuilder};
 use crate::db::pool::PoolArgsBuilder;
 use crate::db::{self as db_pool, SchemaInferrer};
+use crate::formats::pgdump::list_copy_blocks;
 use crate::formats::{DelimitedConfig, ReaderFactory};
-use crate::io::SourceUri;
+use crate::io::{LocalFileByteReader, S3ByteReader, SourceUri};
 
 /// File format for the source data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,15 +282,12 @@ pub(crate) async fn run_load_with_pool(
             (config.has_header, FileFormat::Tsv(config))
         }
         Format::Parquet => (false, FileFormat::Parquet(ParquetConfig::default())),
-        Format::PgDump => {
-            use crate::coordination::manifest::PgDumpConfig;
-            (
-                false,
-                FileFormat::PgDump(PgDumpConfig {
-                    copy_columns: pgdump_columns,
-                }),
-            )
-        }
+        Format::PgDump => (
+            false,
+            FileFormat::PgDump(PgDumpConfig {
+                copy_columns: pgdump_columns,
+            }),
+        ),
     };
 
     // Create manifest storage
@@ -451,9 +449,6 @@ pub struct PgDumpTable {
 /// today; future versions may add a built-in `--all-tables` mode that uses the
 /// same primitive internally.
 pub async fn list_pgdump_tables(source_uri: &str) -> Result<Vec<PgDumpTable>> {
-    use crate::formats::pgdump::list_copy_blocks;
-    use crate::io::{LocalFileByteReader, S3ByteReader};
-
     let parsed = SourceUri::parse(source_uri)?;
     let blocks = match parsed {
         SourceUri::Local(path) => {
@@ -509,6 +504,7 @@ fn maybe_delimited_config(args: &LoadArgs) -> Option<DelimitedConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn format_parse_accepts_pgdump() {
@@ -592,7 +588,6 @@ mod tests {
 
     #[tokio::test]
     async fn list_pgdump_tables_reports_each_block() -> Result<()> {
-        use std::io::Write;
         let mut f = tempfile::NamedTempFile::new()?;
         writeln!(f, "-- preamble")?;
         writeln!(f, "COPY public.users (id, name) FROM stdin;")?;
@@ -617,7 +612,6 @@ mod tests {
 
     #[tokio::test]
     async fn list_pgdump_tables_empty_for_no_copy_blocks() -> Result<()> {
-        use std::io::Write;
         let mut f = tempfile::NamedTempFile::new()?;
         writeln!(f, "-- nothing here")?;
         f.flush()?;

@@ -1,7 +1,10 @@
-use aurora_dsql_loader::runner::{Format, LoadArgs, OnConflict, run_load};
+use aurora_dsql_loader::runner::{
+    ApplyOutcome, Format, LoadArgs, MigrateArgs, OnConflict, run_load, run_migrate,
+};
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[derive(Parser, Clone)]
 struct Args {
@@ -325,7 +328,6 @@ struct MigrateCliArgs {
 /// `warn`; otherwise they are at `info`. `RUST_LOG` always overrides.
 /// Called by both `run_loader` and `run_migrate_cli`.
 fn init_tracing(quiet: bool) {
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if quiet {
             EnvFilter::new("aurora_dsql_loader=warn,sqlx=off")
@@ -355,8 +357,6 @@ fn resolve_region(explicit: Option<&str>, endpoint: &str) -> anyhow::Result<Stri
 }
 
 async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
-    use aurora_dsql_loader::runner::{ApplyOutcome, MigrateArgs, run_migrate};
-
     init_tracing(args.quiet);
 
     let region = resolve_region(args.connection.region.as_deref(), &args.connection.endpoint)?;

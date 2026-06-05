@@ -4,6 +4,7 @@
 //! pays the IAM/connection-establishment cost only once.
 
 use crate::db::Pool;
+use crate::db::pool::{PoolArgsBuilder, pool as build_dsql_pool};
 use crate::formats::pgdump::{extract_ddl, list_copy_blocks};
 use crate::io::{ByteReader, LocalFileByteReader, S3ByteReader, SourceUri};
 use crate::migrate::apply::{AppliedStatement, apply_ddl};
@@ -194,13 +195,12 @@ async fn build_pool(args: &MigrateArgs) -> Result<Pool> {
     if let Some(p) = args.test_pool.clone() {
         return Ok(p);
     }
-    use crate::db::pool::{PoolArgsBuilder, pool};
     let pool_args = PoolArgsBuilder::default()
         .region(&args.region)
         .endpoint(&args.endpoint)
         .username(&args.username)
         .build()?;
-    pool(pool_args).await
+    build_dsql_pool(pool_args).await
 }
 
 /// Open the source dump as a `ByteReader`. Mirrors what

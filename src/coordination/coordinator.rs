@@ -1106,6 +1106,7 @@ impl Coordinator {
 #[cfg(test)]
 mod exclusion_tests {
     use super::*;
+    use crate::coordination::manifest::PgDumpConfig;
     use crate::db::schema::{Column, Schema, SqlType};
 
     fn mk_schema(names: &[&str]) -> Schema {
@@ -1210,7 +1211,6 @@ mod exclusion_tests {
     }
 
     fn mk_pgdump_load_config(copy_columns: Vec<String>) -> LoadConfig {
-        use crate::coordination::manifest::PgDumpConfig;
         LoadConfigBuilder::default()
             .source_uri("dummy".to_string())
             .target_table("things".to_string())
