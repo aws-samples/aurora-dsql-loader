@@ -580,6 +580,22 @@ COPY public.t (id) FROM stdin;
             report.ddl_changes
         );
 
+        // Standalone `ALTER TABLE ... ADD CONSTRAINT events_pkey PRIMARY
+        // KEY (id)` (the form pg_dump always emits — PG stores PK
+        // separately) folds back onto the CREATE TABLE. dsql-lint 0.2.4
+        // added the rule. The fixture has two such ALTERs (events_pkey,
+        // users_pkey), so we expect exactly two collapse diagnostics.
+        let pk_collapse = report
+            .ddl_changes
+            .iter()
+            .filter(|d| d.rule == "alter_add_primary_key_collapse")
+            .count();
+        assert_eq!(
+            pk_collapse, 2,
+            "expected 2 alter_add_primary_key_collapse changes (events + users), got: {:?}",
+            report.ddl_changes
+        );
+
         // Critical: nothing unfixable. If a future dsql-lint upgrade
         // starts flagging something in this fixture, that's a real
         // signal — the migrate happy-path no longer covers all the
