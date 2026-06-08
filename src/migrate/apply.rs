@@ -109,7 +109,7 @@ fn is_already_exists(err: &sqlx::Error) -> bool {
 }
 
 /// Make a SQL fragment safe to embed in a terminal-bound error message
-/// or log line: truncate at the first char boundary at or after 200 bytes
+/// or log line: truncate at the last char boundary at or before 200 bytes
 /// (real `pg_dump` statements can be MB-sized via embedded function bodies
 /// or large enum lists) and replace control bytes / Unicode bidi-format
 /// codepoints with `?` so a multi-line SQL excerpt in an anyhow chain

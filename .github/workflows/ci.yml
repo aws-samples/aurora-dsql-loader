@@ -7,11 +7,13 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
-# Cancel an in-flight run when a new commit lands on the same ref so two
-# rapid pushes don't provision two parallel real-DSQL clusters.
+# Serialize runs on the same ref so two rapid pushes to the same branch
+# don't provision two parallel real-DSQL clusters. `cancel-in-progress: false`
+# is deliberate: cancelling mid-run can interrupt the e2e-dsql -> delete-cluster
+# chain and leak the provisioned cluster, so we queue instead.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
