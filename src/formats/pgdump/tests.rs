@@ -9,51 +9,51 @@ use tempfile::NamedTempFile;
 
 #[test]
 fn decode_plain_text() {
-    assert_eq!(decode_field(b"hello"), "hello");
+    assert_eq!(decode_field(b"hello"), ("hello".into(), false));
 }
 
 #[test]
-fn decode_empty() {
-    assert_eq!(decode_field(b""), "");
+fn decode_empty_is_not_null() {
+    // Genuine empty string is distinct from `\N`; only the latter is NULL.
+    assert_eq!(decode_field(b""), (String::new(), false));
 }
 
 #[test]
-fn decode_null_sentinel_is_empty_string() {
-    // \N is the COPY-format NULL sentinel; the reader decodes it to "" and
-    // the worker then maps "" → SQL NULL during binding.
-    assert_eq!(decode_field(b"\\N"), "");
+fn decode_null_sentinel() {
+    // `\N` is the COPY-format NULL sentinel; decoder reports is_null=true.
+    assert_eq!(decode_field(b"\\N"), (String::new(), true));
 }
 
 #[test]
 fn decode_escape_t_n_r_etc() {
-    assert_eq!(decode_field(b"a\\tb"), "a\tb");
-    assert_eq!(decode_field(b"a\\nb"), "a\nb");
-    assert_eq!(decode_field(b"a\\rb"), "a\rb");
-    assert_eq!(decode_field(b"a\\\\b"), "a\\b");
+    assert_eq!(decode_field(b"a\\tb"), ("a\tb".into(), false));
+    assert_eq!(decode_field(b"a\\nb"), ("a\nb".into(), false));
+    assert_eq!(decode_field(b"a\\rb"), ("a\rb".into(), false));
+    assert_eq!(decode_field(b"a\\\\b"), ("a\\b".into(), false));
 }
 
 #[test]
 fn decode_hex_escape() {
     // \x41 → 'A'
-    assert_eq!(decode_field(b"\\x41"), "A");
+    assert_eq!(decode_field(b"\\x41"), ("A".into(), false));
     // \x4 (single hex digit) → byte 0x04
-    assert_eq!(decode_field(b"\\x4"), "\u{4}");
+    assert_eq!(decode_field(b"\\x4"), ("\u{4}".into(), false));
     // \x with no digits → literal \x
-    assert_eq!(decode_field(b"\\xZ"), "\\xZ");
+    assert_eq!(decode_field(b"\\xZ"), ("\\xZ".into(), false));
 }
 
 #[test]
 fn decode_octal_escape() {
     // \101 → 'A'
-    assert_eq!(decode_field(b"\\101"), "A");
+    assert_eq!(decode_field(b"\\101"), ("A".into(), false));
     // \1 → byte 0x01
-    assert_eq!(decode_field(b"\\1"), "\u{1}");
+    assert_eq!(decode_field(b"\\1"), ("\u{1}".into(), false));
 }
 
 #[test]
 fn decode_unknown_escape_drops_backslash() {
     // PG behavior: \q → q
-    assert_eq!(decode_field(b"\\q"), "q");
+    assert_eq!(decode_field(b"\\q"), ("q".into(), false));
 }
 
 #[test]
@@ -61,18 +61,18 @@ fn decode_backslash_n_inside_value_is_not_null() {
     // \N is only NULL when it is the entire field. As a per-character escape
     // it falls into the unknown-escape arm, where the backslash is dropped
     // and the `N` passes through, so b"x\\N" decodes to "xN".
-    assert_eq!(decode_field(b"x\\N"), "xN");
+    assert_eq!(decode_field(b"x\\N"), ("xN".into(), false));
 }
 
 #[test]
 fn decode_trailing_backslash_passes_through() {
-    assert_eq!(decode_field(b"abc\\"), "abc\\");
+    assert_eq!(decode_field(b"abc\\"), ("abc\\".into(), false));
 }
 
 #[test]
 fn decode_multi_byte_utf8() {
     let bytes = "café".as_bytes();
-    assert_eq!(decode_field(bytes), "café");
+    assert_eq!(decode_field(bytes), ("café".into(), false));
 }
 
 const SAMPLE: &[u8] = b"\
@@ -276,6 +276,34 @@ async fn pgdump_reader_columns_are_exposed() {
     let byte_reader = LocalFileByteReader::new(f.path());
     let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
     assert_eq!(reader.columns(), &["id", "name"]);
+}
+
+#[tokio::test]
+async fn read_chunk_distinguishes_null_from_empty_string() {
+    // Pins the fix for the empty-string-collapses-to-NULL bug: a row
+    // with `\N` and a row with a genuine empty string between two tabs
+    // must surface as `nulls[i]=true` and `nulls[i]=false` respectively,
+    // so a column with `NOT NULL DEFAULT ''` round-trips through migrate.
+    let mut f = NamedTempFile::new().unwrap();
+    writeln!(f, "COPY public.t (a, b) FROM stdin;").unwrap();
+    // empty string in column b
+    writeln!(f, "1\t").unwrap();
+    // \N (real NULL) in column b
+    writeln!(f, "2\t\\N").unwrap();
+    writeln!(f, "\\.").unwrap();
+    f.flush().unwrap();
+
+    let byte_reader = LocalFileByteReader::new(f.path());
+    let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
+    let meta = reader.metadata().await.unwrap();
+    let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
+    let data = reader.read_chunk(&chunks[0]).await.unwrap();
+
+    assert_eq!(data.records.len(), 2);
+    assert_eq!(data.records[0].fields, vec!["1", ""]);
+    assert_eq!(data.records[0].nulls, vec![false, false]);
+    assert_eq!(data.records[1].fields, vec!["2", ""]);
+    assert_eq!(data.records[1].nulls, vec![false, true]);
 }
 
 #[tokio::test]

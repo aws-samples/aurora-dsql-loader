@@ -33,14 +33,24 @@ fn apply_field_exclusion(
     let mut first_mismatch: Option<(usize, usize)> = None;
     for (idx, record) in records.into_iter().enumerate() {
         if record.fields.len() == full_len {
-            let kept: Vec<String> = record
+            let kept_fields: Vec<String> = record
                 .fields
                 .into_iter()
                 .enumerate()
                 .filter(|(i, _)| !excluded_set.contains(i))
                 .map(|(_, f)| f)
                 .collect();
-            filtered.push(Record { fields: kept });
+            let kept_nulls: Vec<bool> = record
+                .nulls
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !excluded_set.contains(i))
+                .map(|(_, n)| n)
+                .collect();
+            filtered.push(Record {
+                fields: kept_fields,
+                nulls: kept_nulls,
+            });
         } else {
             first_mismatch.get_or_insert((idx, record.fields.len()));
             mismatch += 1;
@@ -533,10 +543,11 @@ impl Worker {
                 .iter()
                 .enumerate()
                 .map(|(col_idx, field)| {
-                    let trimmed = field.trim();
-
-                    // Handle NULL values (empty strings become NULL)
-                    if trimmed.is_empty() {
+                    // NULL is whatever the reader said it was. CSV/TSV/parquet
+                    // set `nulls[i] = trimmed.is_empty()` to preserve their
+                    // legacy empty→NULL convention; pg_dump sets it only for
+                    // `\N` so genuine empty strings round-trip.
+                    if record.nulls.get(col_idx).copied().unwrap_or(false) {
                         return "NULL".to_string();
                     }
 
@@ -932,9 +943,9 @@ mod field_exclusion_tests {
     use super::*;
 
     fn mk_record(fields: &[&str]) -> Record {
-        Record {
-            fields: fields.iter().map(|s| s.to_string()).collect(),
-        }
+        let fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        let nulls = fields.iter().map(|f| f.trim().is_empty()).collect();
+        Record { fields, nulls }
     }
 
     #[test]
@@ -1001,6 +1012,7 @@ mod field_exclusion_tests {
             let records: Vec<Record> = (0..record_count)
                 .map(|r| Record {
                     fields: (0..full_len).map(|i| format!("r{}_c{}", r, i)).collect(),
+                    nulls: vec![false; full_len],
                 })
                 .collect();
 
@@ -1032,6 +1044,7 @@ mod field_exclusion_tests {
 
             let records = vec![Record {
                 fields: (0..actual_len).map(|i| format!("c{}", i)).collect(),
+                nulls: vec![false; actual_len],
             }];
             let (filtered, mismatch, first) =
                 apply_field_exclusion(records, &excluded_positions, full_len);

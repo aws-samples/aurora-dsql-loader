@@ -46,12 +46,12 @@ pub fn record_batch_to_records(batch: &RecordBatch) -> Result<Vec<Record>> {
     // Transpose to rows
     let mut records = Vec::with_capacity(num_rows);
     for row_idx in 0..num_rows {
-        let fields = column_strings
+        let fields: Vec<String> = column_strings
             .iter()
             .map(|col| col[row_idx].clone())
             .collect();
-
-        records.push(Record { fields });
+        let nulls = fields.iter().map(|f| f.trim().is_empty()).collect();
+        records.push(Record { fields, nulls });
     }
 
     Ok(records)

@@ -4,16 +4,17 @@
 //! "Text Format" section: a backslash introduces an escape sequence.
 
 /// Decode one COPY-text-format field. Input is the raw bytes between tabs
-/// (or between start-of-line and tab). The whole-field literal `\N` is
-/// returned as an empty string — the loader's `Record { fields: Vec<String> }`
-/// shape doesn't carry NULLs, and the worker's binding path already maps
-/// empty strings to SQL NULL, so `\N → NULL` survives end-to-end. The
-/// trade-off (real empty strings and whitespace-only strings collapse to
-/// NULL too) is documented on `PgDumpReader`.
-pub fn decode_field(input: &[u8]) -> String {
+/// (or between start-of-line and tab). Returns `(decoded_text, is_null)`
+/// — the whole-field literal `\N` is the only encoding pg_dump uses for
+/// SQL NULL, and is distinct from a genuine empty string.
+pub fn decode_field(input: &[u8]) -> (String, bool) {
     if input == b"\\N" {
-        return String::new();
+        return (String::new(), true);
     }
+    (decode_non_null(input), false)
+}
+
+fn decode_non_null(input: &[u8]) -> String {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {

@@ -27,10 +27,22 @@ pub struct Chunk {
     pub estimated_rows: Option<u64>,
 }
 
-/// A single record (row) from the file
+/// A single record (row) from the file.
+///
+/// `nulls[i]` is the authoritative SQL-NULL marker for `fields[i]`. Each
+/// reader populates it according to its format's NULL convention:
+/// - **pg_dump:** `\N` → null, genuine empty string → not null. Preserves
+///   the `\N` vs `""` distinction pg_dump emits at the byte level.
+/// - **CSV / TSV / parquet:** any field whose trimmed text is empty → null.
+///   Mirrors the legacy worker-side inference these formats relied on
+///   before the mask existed.
+///
+/// The worker uses the mask verbatim — no further inference — so each
+/// format owns its NULL semantics end-to-end.
 #[derive(Debug, Clone)]
 pub struct Record {
     pub fields: Vec<String>,
+    pub nulls: Vec<bool>,
 }
 
 /// Data from a chunk read
