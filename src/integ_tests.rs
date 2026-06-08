@@ -4030,10 +4030,9 @@ mod tests {
         assert_eq!(result.records_loaded, 3);
         assert_eq!(result.records_failed, 0);
 
-        // `note` for row 1 was `\N` → loaded as SQL NULL by the worker (empty
-        // strings are coerced to NULL). Bind it as `Option<String>` so the
-        // sqlx decode path doesn't error on UnexpectedNullError before our
-        // assertions run.
+        // `note` for row 1 was `\N` → loaded as SQL NULL. Bind as
+        // `Option<String>` so the sqlx decode path doesn't error on
+        // UnexpectedNullError before assertions run.
         #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
         struct ThingRow {
             id: i64,
@@ -4234,10 +4233,12 @@ mod tests {
         .await?;
 
         // NOTE: empty TEXT (`note = ''`) and empty BYTEA (`'\x'`) are
-        // intentionally omitted. The loader collapses empty strings to SQL
-        // NULL during INSERT generation, so a `''` in the source would
-        // round-trip as NULL — a documented trade-off (see PgDumpReader
-        // rustdoc), not a regression for this test.
+        // intentionally omitted from this round-trip seed. The pg_dump
+        // reader preserves the `\N` vs empty-string distinction (see
+        // `PgDumpReader` rustdoc and `read_chunk_distinguishes_null_from_empty_string`),
+        // but this test pre-dates that fix and seeds only NULL for `note`;
+        // adding an empty-string row here would broaden the round-trip
+        // assertion shape and is tracked separately.
         sqlx::query(&format!(
             "INSERT INTO {src} (id, name, note, blob, payload, ts) VALUES
                 (1, 'plain',         E'tab\\there',  E'\\\\xDEADBEEF', '{{\"a\":1}}'::jsonb,  '2024-01-15 12:34:56+00'),
@@ -4518,7 +4519,7 @@ mod tests {
             report.ddl_changes
         );
         // UNIQUE on users.email folded back into the CREATE TABLE by
-        // alter_add_unique_collapse (dsql-lint 0.2.3).
+        // alter_add_unique_collapse.
         assert!(
             report
                 .ddl_changes

@@ -108,14 +108,13 @@ fn is_already_exists(err: &sqlx::Error) -> bool {
         .contains("already exists")
 }
 
-/// Scrub a SQL fragment for safe inclusion in an error message or log line:
-/// truncate at the first char boundary at or after 200 bytes (real `pg_dump`
-/// statements can be MB-sized via embedded function bodies / large enum
-/// lists) and replace control bytes / Unicode bidi-format codepoints with
-/// `?` so a multi-line SQL excerpt embedded in an anyhow chain doesn't
-/// re-flow the operator's terminal. Reuses the same character classes
-/// that `is_unsafe_for_listing` flags in the `list-tables` path, adapted
-/// for replace-instead-of-reject semantics.
+/// Make a SQL fragment safe to embed in a terminal-bound error message
+/// or log line: truncate at the first char boundary at or after 200 bytes
+/// (real `pg_dump` statements can be MB-sized via embedded function bodies
+/// or large enum lists) and replace control bytes / Unicode bidi-format
+/// codepoints with `?` so a multi-line SQL excerpt in an anyhow chain
+/// doesn't re-flow the operator's terminal. Reuses the same character
+/// classes that `is_unsafe_for_listing` flags in the `list-tables` path.
 fn safe_for_terminal(stmt: &str) -> String {
     const MAX: usize = 200;
     let truncated = if stmt.len() > MAX {
@@ -413,12 +412,7 @@ mod tests {
         assert_eq!(r, vec!["SELECT $1", "SELECT 2"]);
     }
 
-    // ---- adversarial / malformed-input shapes ----
-    //
-    // The splitter must terminate (no infinite loop, no OOB slice, no
-    // panic) on every well-formed UTF-8 input — including dumps a
-    // crafted file might emit. We do NOT require correct splitting on
-    // malformed input; we DO require these calls to return.
+    // ---- malformed-input shapes: splitter must terminate, not panic ----
 
     #[test]
     fn unterminated_single_quote_consumes_to_eof() {
@@ -576,6 +570,20 @@ INSERT INTO t (id, val) VALUES (2, 'b;not-a-split');
             safe_for_terminal("CREATE TABLE t (id INT)"),
             "CREATE TABLE t (id INT)"
         );
+    }
+
+    /// The other half of `safe_for_terminal`: control bytes (ANSI escape)
+    /// and Unicode bidi/format codepoints get replaced with `?`. A refactor
+    /// that drops the replace pass would not fail the truncation test
+    /// alone, so pin the defang behavior independently.
+    #[test]
+    fn safe_for_terminal_replaces_control_and_bidi_chars() {
+        let input = "ok\x1b[31mred\x1b[0m \u{202e}drow \u{200b}zwsp";
+        let out = safe_for_terminal(input);
+        assert!(!out.contains('\x1b'), "control byte leaked: {out:?}");
+        assert!(!out.contains('\u{202e}'), "RTL override leaked: {out:?}");
+        assert!(!out.contains('\u{200b}'), "ZWSP leaked: {out:?}");
+        assert!(out.contains("ok"), "plain text dropped: {out:?}");
     }
 
     #[tokio::test]

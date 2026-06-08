@@ -16,6 +16,11 @@
   objects are skipped on apply, so a re-run after a partial failure is
   safe. Statements `dsql-lint` cannot auto-fix surface as Unfixable
   diagnostics; the flow refuses to apply DDL while any are present.
+  Intended for fresh / empty DSQL clusters: `dsql-lint` does not flag
+  `DROP TABLE` / `DROP SCHEMA` / `DROP INDEX` / `DELETE` / `UPDATE`,
+  so a `pg_dump --clean` dump (which prepends `DROP IF EXISTS`)
+  applied against a populated cluster will execute those statements
+  without confirmation.
 - New `--format pgdump` option to load data directly from `pg_dump --data-only`
   output. Locates the `COPY <schema>.<table> FROM stdin;` block matching the
   target table, ignores DDL and other tables, and decodes PG COPY text-format

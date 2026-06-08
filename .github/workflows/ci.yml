@@ -7,6 +7,12 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# Cancel an in-flight run when a new commit lands on the same ref so two
+# rapid pushes don't provision two parallel real-DSQL clusters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -132,7 +138,9 @@ jobs:
   e2e-dsql:
     name: E2E (real DSQL cluster)
     needs: [e2e-changes, create-cluster]
-    if: needs.e2e-changes.outputs.should-run == 'true'
+    # Skip cleanly if create-cluster failed; otherwise this job runs with
+    # an empty endpoint env var and surfaces a misleading test failure.
+    if: needs.e2e-changes.outputs.should-run == 'true' && needs.create-cluster.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

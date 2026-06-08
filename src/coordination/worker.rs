@@ -543,10 +543,11 @@ impl Worker {
                 .iter()
                 .enumerate()
                 .map(|(col_idx, field)| {
-                    // NULL is whatever the reader said it was. CSV/TSV/parquet
-                    // set `nulls[i] = trimmed.is_empty()` to preserve their
-                    // legacy empty→NULL convention; pg_dump sets it only for
-                    // `\N` so genuine empty strings round-trip.
+                    // The reader sets `nulls[i]` per its format's convention:
+                    // CSV/TSV/parquet flag trimmed-empty fields (preserving the
+                    // legacy empty→NULL inference that used to live here);
+                    // pg_dump flags only `\N` so genuine empty strings round-trip.
+                    // Worker just consults the mask.
                     if record.nulls.get(col_idx).copied().unwrap_or(false) {
                         return "NULL".to_string();
                     }

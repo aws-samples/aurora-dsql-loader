@@ -218,10 +218,11 @@ pub async fn find_copy_block(
 /// a custom-format archive that the scanner should already have rejected.
 ///
 /// Strips two classes of pg_dump preamble that DSQL refuses:
-/// `\restrict` / `\unrestrict` psql meta-commands (CVE-2025-1094
-/// backports), and the `SET <param> = ...;` session GUCs pg_dump
-/// emits at the top of every dump (`statement_timeout`, `lock_timeout`,
-/// `client_encoding`, etc.) which DSQL rejects with
+/// `\restrict` / `\unrestrict` psql meta-commands (PG17+ psql client
+/// directives that lock object names within a script), and the
+/// `SET <param> = ...;` session GUCs pg_dump emits at the top of
+/// every dump (`statement_timeout`, `lock_timeout`, `client_encoding`,
+/// etc.) which DSQL rejects with
 /// "setting configuration parameter ... not supported".
 ///
 /// `blocks` is the slice returned by [`list_copy_blocks`]; pass `&[]` for a

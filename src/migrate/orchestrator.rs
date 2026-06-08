@@ -570,7 +570,7 @@ COPY public.t (id) FROM stdin;
         // Standalone `ALTER TABLE ... ADD CONSTRAINT users_email_key
         // UNIQUE (email)` (the form pg_dump always emits even when the
         // source declared UNIQUE inline) folds back onto the CREATE
-        // TABLE. dsql-lint 0.2.3 added the rule.
+        // TABLE.
         assert!(
             report
                 .ddl_changes
@@ -582,9 +582,9 @@ COPY public.t (id) FROM stdin;
 
         // Standalone `ALTER TABLE ... ADD CONSTRAINT events_pkey PRIMARY
         // KEY (id)` (the form pg_dump always emits — PG stores PK
-        // separately) folds back onto the CREATE TABLE. dsql-lint 0.2.4
-        // added the rule. The fixture has two such ALTERs (events_pkey,
-        // users_pkey), so we expect exactly two collapse diagnostics.
+        // separately) folds back onto the CREATE TABLE. The fixture has
+        // two such ALTERs (events_pkey, users_pkey), so we expect
+        // exactly two collapse diagnostics.
         let pk_collapse = report
             .ddl_changes
             .iter()

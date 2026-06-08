@@ -197,11 +197,9 @@ enum Command {
         #[arg(short, long)]
         source_uri: String,
 
-        /// Database schema the dump targets in DSQL. Informational
-        /// only: per-table routing follows each `COPY` block's
-        /// schema-qualified name in the dump itself, so this flag does
-        /// not override the dump's schema. Reserved for a future
-        /// dump-vs-target schema validation.
+        /// Schema the dump targets in DSQL. Informational only —
+        /// per-table routing reads each `COPY` block's schema-qualified
+        /// name in the dump itself; this flag does not override it.
         #[arg(long, default_value = "public")]
         schema: String,
 
