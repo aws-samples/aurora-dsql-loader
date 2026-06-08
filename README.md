@@ -332,26 +332,6 @@ See [Aurora DSQL Troubleshooting](https://docs.aws.amazon.com/aurora-dsql/latest
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
-### Running the pgdump E2E test locally
-
-The `pgdump_migrate_real_full_dump_collapses_serial_strips_fk` test is
-`#[ignore]` because it needs a Postgres source and a real DSQL cluster.
-CI's `e2e-dsql` job provisions a per-run cluster; locally, point at one
-you own:
-
-```bash
-PGDUMP_E2E_SOURCE_URL=postgres://localhost:5432/mydb \
-LOADER_DSQL_E2E_ENDPOINT=<cluster>.dsql.us-east-1.on.aws \
-LOADER_DSQL_E2E_REGION=us-east-1 \
-AWS_PROFILE=<profile> \
-cargo test --lib pgdump_migrate_real_full_dump -- --ignored --nocapture
-```
-
-CI requires an `IAM_ROLE` repo secret (OIDC role ARN) with
-`dsql:CreateCluster`, `dsql:DeleteCluster`, `dsql:GetCluster`,
-`dsql:TagResource`, and `dsql:DbConnectAdmin` on the test account's
-clusters.
-
 ## License
 
 MIT-0 License. See [LICENSE](LICENSE) file.
