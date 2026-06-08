@@ -352,4 +352,30 @@ mod tests {
         assert_eq!(data.records[0].fields[0].as_deref(), Some("1"));
         assert_eq!(data.records[0].fields[1].as_deref(), Some("Alice"));
     }
+
+    /// Pin the trim-empty rule used by CSV/TSV/parquet readers and by
+    /// `mk_record` in worker tests. A regression here would silently
+    /// flip empty/whitespace handling for those formats.
+    #[test]
+    fn record_from_text_fields_trim_empty_rule() {
+        let r = Record::from_text_fields(vec![
+            "value".into(), // non-empty → Some
+            "".into(),      // empty → None
+            "   ".into(),   // whitespace-only → None (trim-empty)
+            "\t\n".into(),  // mixed whitespace → None
+            " v ".into(),   // surrounded by whitespace, non-empty → Some
+            "0".into(),     // literal "0" is non-empty → Some
+        ]);
+        assert_eq!(
+            r.fields,
+            vec![
+                Some("value".into()),
+                None,
+                None,
+                None,
+                Some(" v ".into()),
+                Some("0".into()),
+            ]
+        );
+    }
 }

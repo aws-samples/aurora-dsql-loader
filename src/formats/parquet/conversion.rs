@@ -1,9 +1,10 @@
 //! Conversion from Arrow RecordBatch to row-based Records.
 //!
 //! This module converts Arrow's columnar format to the string-based Record format
-//! used throughout the loader. All values are converted to strings, with nulls
-//! represented as empty strings. The worker will later parse these strings back
-//! to typed values based on the target schema.
+//! used throughout the loader. Each Arrow cell is stringified by `array_to_strings`
+//! (Arrow null → `""`); rows are then folded through `Record::from_text_fields`,
+//! which maps any trimmed-empty field to `None` — preserving the legacy
+//! parquet "trim-empty → NULL" inference end-to-end.
 
 use anyhow::{Context, Result};
 use arrow::array::*;
@@ -17,10 +18,11 @@ use arrow::record_batch::RecordBatch;
 
 use crate::formats::reader::Record;
 
-/// Convert an Arrow RecordBatch to a vector of Records
+/// Convert an Arrow RecordBatch to a vector of Records.
 ///
-/// This bridges Arrow's columnar format to the row-based Record format expected by workers.
-/// All values are converted to strings, with nulls represented as empty strings.
+/// Each Arrow cell is stringified (Arrow null → `""`); rows are then folded
+/// through `Record::from_text_fields`, so trimmed-empty fields (including
+/// Arrow nulls) become `None` in the resulting `Record.fields`.
 pub fn record_batch_to_records(batch: &RecordBatch) -> Result<Vec<Record>> {
     let num_rows = batch.num_rows();
     let num_columns = batch.num_columns();
