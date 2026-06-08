@@ -29,20 +29,31 @@ pub struct Chunk {
 
 /// A single record (row) from the file.
 ///
-/// `nulls[i]` is the authoritative SQL-NULL marker for `fields[i]`. Each
-/// reader populates it according to its format's NULL convention:
-/// - **pg_dump:** `\N` → null, genuine empty string → not null. Preserves
+/// Each reader populates `fields[i]` according to its format's NULL convention:
+/// - **pg_dump:** `\N` → `None`, genuine empty string → `Some("")`. Preserves
 ///   the `\N` vs `""` distinction pg_dump emits at the byte level.
-/// - **CSV / TSV / parquet:** any field whose trimmed text is empty → null.
-///   Mirrors the legacy worker-side inference these formats relied on
-///   before the mask existed.
+/// - **CSV / TSV / parquet:** any field whose trimmed text is empty → `None`.
+///   Mirrors the legacy worker-side inference these formats relied on.
 ///
-/// The worker uses the mask verbatim — no further inference — so each
-/// format owns its NULL semantics end-to-end.
+/// The worker uses the discriminator verbatim — no further inference — so
+/// each format owns its NULL semantics end-to-end.
 #[derive(Debug, Clone)]
 pub struct Record {
-    pub fields: Vec<String>,
-    pub nulls: Vec<bool>,
+    pub fields: Vec<Option<String>>,
+}
+
+impl Record {
+    /// Construct a record from raw text fields under the trim-empty
+    /// convention: any field whose trimmed text is empty becomes `None`.
+    /// Used by CSV/TSV/parquet; pg_dump constructs `Record { fields: ... }`
+    /// directly from its byte-level NULL discriminator.
+    pub fn from_text_fields(fields: Vec<String>) -> Self {
+        let fields = fields
+            .into_iter()
+            .map(|f| if f.trim().is_empty() { None } else { Some(f) })
+            .collect();
+        Self { fields }
+    }
 }
 
 /// Data from a chunk read
@@ -338,7 +349,7 @@ mod tests {
 
         assert_eq!(data.records.len(), 3);
         assert_eq!(data.records[0].fields.len(), 3);
-        assert_eq!(data.records[0].fields[0], "1");
-        assert_eq!(data.records[0].fields[1], "Alice");
+        assert_eq!(data.records[0].fields[0].as_deref(), Some("1"));
+        assert_eq!(data.records[0].fields[1].as_deref(), Some("Alice"));
     }
 }

@@ -95,8 +95,7 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
                         continue;
                     }
                     let fields: Vec<String> = record.iter().map(|s| s.to_string()).collect();
-                    let nulls = fields.iter().map(|f| f.trim().is_empty()).collect();
-                    records.push(Record { fields, nulls });
+                    records.push(Record::from_text_fields(fields));
                 }
                 Err(e) => {
                     if e.is_io_error() {

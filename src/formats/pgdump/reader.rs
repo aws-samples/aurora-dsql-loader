@@ -14,9 +14,10 @@ use crate::io::{ByteReader, estimate_rows_in_range};
 /// recommended, not required).
 ///
 /// **NULL handling:** the literal `\N` is the only NULL marker pg_dump emits
-/// in COPY text format. `escape::decode_field` returns `(decoded, is_null)`,
-/// and we propagate `is_null` into `Record.nulls` so the worker emits SQL NULL
-/// only for `\N` and never collapses a genuine empty string into NULL.
+/// in COPY text format. `escape::decode_field` returns `Option<String>` —
+/// `None` for `\N`, `Some("")` for a genuine empty field — which flows
+/// directly into `Record.fields`, so the worker emits SQL NULL only for
+/// `\N` and never collapses an empty string into NULL.
 pub struct PgDumpReader<R: ByteReader> {
     reader: R,
     block: CopyBlock,
@@ -79,16 +80,15 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
                 continue;
             }
 
-            // `\N` is the only NULL marker; `is_null` flows into Record.nulls
-            // so the worker can preserve the empty-string vs NULL distinction.
-            let (fields, nulls): (Vec<String>, Vec<bool>) =
-                line.split(|&b| b == b'\t').map(decode_field).unzip();
+            // `\N` decodes to `None`; genuine empty string decodes to `Some("")`.
+            let fields: Vec<Option<String>> =
+                line.split(|&b| b == b'\t').map(decode_field).collect();
 
             if fields.len() != expected_columns {
                 parse_errors += 1;
                 continue;
             }
-            records.push(Record { fields, nulls });
+            records.push(Record { fields });
         }
 
         Ok(ChunkData {

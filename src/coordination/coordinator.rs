@@ -436,10 +436,10 @@ impl Coordinator {
                 .await
                 .context("Failed to read sample data for schema inference")?;
 
-            let field_values: Vec<Vec<String>> = sample_data
+            let field_values: Vec<Vec<Option<String>>> = sample_data
                 .records
-                .iter()
-                .map(|record| record.fields.clone())
+                .into_iter()
+                .map(|record| record.fields)
                 .collect();
 
             let inferred_schema = self

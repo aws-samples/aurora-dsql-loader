@@ -302,10 +302,11 @@ mod tests {
         assert_eq!(data.records.len(), 50);
         assert!(data.bytes_read > 0);
 
-        // Check first record
-        assert_eq!(data.records[0].fields[0], "0");
-        assert_eq!(data.records[0].fields[1], "name_0");
-        assert_eq!(data.records[0].fields[2], "0");
+        // Check first record (row 0: id=0, name="name_0", value=0).
+        // id=0 trims to "0" (non-empty) → Some; value=0 → "0" → Some.
+        assert_eq!(data.records[0].fields[0].as_deref(), Some("0"));
+        assert_eq!(data.records[0].fields[1].as_deref(), Some("name_0"));
+        assert_eq!(data.records[0].fields[2].as_deref(), Some("0"));
     }
 
     #[tokio::test]

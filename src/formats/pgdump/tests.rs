@@ -9,51 +9,51 @@ use tempfile::NamedTempFile;
 
 #[test]
 fn decode_plain_text() {
-    assert_eq!(decode_field(b"hello"), ("hello".into(), false));
+    assert_eq!(decode_field(b"hello"), Some("hello".into()));
 }
 
 #[test]
 fn decode_empty_is_not_null() {
     // Genuine empty string is distinct from `\N`; only the latter is NULL.
-    assert_eq!(decode_field(b""), (String::new(), false));
+    assert_eq!(decode_field(b""), Some(String::new()));
 }
 
 #[test]
 fn decode_null_sentinel() {
-    // `\N` is the COPY-format NULL sentinel; decoder reports is_null=true.
-    assert_eq!(decode_field(b"\\N"), (String::new(), true));
+    // `\N` is the COPY-format NULL sentinel; decoder returns None.
+    assert_eq!(decode_field(b"\\N"), None);
 }
 
 #[test]
 fn decode_escape_t_n_r_etc() {
-    assert_eq!(decode_field(b"a\\tb"), ("a\tb".into(), false));
-    assert_eq!(decode_field(b"a\\nb"), ("a\nb".into(), false));
-    assert_eq!(decode_field(b"a\\rb"), ("a\rb".into(), false));
-    assert_eq!(decode_field(b"a\\\\b"), ("a\\b".into(), false));
+    assert_eq!(decode_field(b"a\\tb"), Some("a\tb".into()));
+    assert_eq!(decode_field(b"a\\nb"), Some("a\nb".into()));
+    assert_eq!(decode_field(b"a\\rb"), Some("a\rb".into()));
+    assert_eq!(decode_field(b"a\\\\b"), Some("a\\b".into()));
 }
 
 #[test]
 fn decode_hex_escape() {
     // \x41 → 'A'
-    assert_eq!(decode_field(b"\\x41"), ("A".into(), false));
+    assert_eq!(decode_field(b"\\x41"), Some("A".into()));
     // \x4 (single hex digit) → byte 0x04
-    assert_eq!(decode_field(b"\\x4"), ("\u{4}".into(), false));
+    assert_eq!(decode_field(b"\\x4"), Some("\u{4}".into()));
     // \x with no digits → literal \x
-    assert_eq!(decode_field(b"\\xZ"), ("\\xZ".into(), false));
+    assert_eq!(decode_field(b"\\xZ"), Some("\\xZ".into()));
 }
 
 #[test]
 fn decode_octal_escape() {
     // \101 → 'A'
-    assert_eq!(decode_field(b"\\101"), ("A".into(), false));
+    assert_eq!(decode_field(b"\\101"), Some("A".into()));
     // \1 → byte 0x01
-    assert_eq!(decode_field(b"\\1"), ("\u{1}".into(), false));
+    assert_eq!(decode_field(b"\\1"), Some("\u{1}".into()));
 }
 
 #[test]
 fn decode_unknown_escape_drops_backslash() {
     // PG behavior: \q → q
-    assert_eq!(decode_field(b"\\q"), ("q".into(), false));
+    assert_eq!(decode_field(b"\\q"), Some("q".into()));
 }
 
 #[test]
@@ -61,18 +61,18 @@ fn decode_backslash_n_inside_value_is_not_null() {
     // \N is only NULL when it is the entire field. As a per-character escape
     // it falls into the unknown-escape arm, where the backslash is dropped
     // and the `N` passes through, so b"x\\N" decodes to "xN".
-    assert_eq!(decode_field(b"x\\N"), ("xN".into(), false));
+    assert_eq!(decode_field(b"x\\N"), Some("xN".into()));
 }
 
 #[test]
 fn decode_trailing_backslash_passes_through() {
-    assert_eq!(decode_field(b"abc\\"), ("abc\\".into(), false));
+    assert_eq!(decode_field(b"abc\\"), Some("abc\\".into()));
 }
 
 #[test]
 fn decode_multi_byte_utf8() {
     let bytes = "café".as_bytes();
-    assert_eq!(decode_field(bytes), ("café".into(), false));
+    assert_eq!(decode_field(bytes), Some("café".into()));
 }
 
 const SAMPLE: &[u8] = b"\
@@ -281,9 +281,9 @@ async fn pgdump_reader_columns_are_exposed() {
 #[tokio::test]
 async fn read_chunk_distinguishes_null_from_empty_string() {
     // Pins the fix for the empty-string-collapses-to-NULL bug: a row
-    // with `\N` and a row with a genuine empty string between two tabs
-    // must surface as `nulls[i]=true` and `nulls[i]=false` respectively,
-    // so a column with `NOT NULL DEFAULT ''` round-trips through migrate.
+    // with `\N` decodes to `None` and a row with a genuine empty string
+    // between two tabs decodes to `Some("")`, so a column with
+    // `NOT NULL DEFAULT ''` round-trips through migrate.
     let mut f = NamedTempFile::new().unwrap();
     writeln!(f, "COPY public.t (a, b) FROM stdin;").unwrap();
     // empty string in column b
@@ -300,10 +300,11 @@ async fn read_chunk_distinguishes_null_from_empty_string() {
     let data = reader.read_chunk(&chunks[0]).await.unwrap();
 
     assert_eq!(data.records.len(), 2);
-    assert_eq!(data.records[0].fields, vec!["1", ""]);
-    assert_eq!(data.records[0].nulls, vec![false, false]);
-    assert_eq!(data.records[1].fields, vec!["2", ""]);
-    assert_eq!(data.records[1].nulls, vec![false, true]);
+    assert_eq!(
+        data.records[0].fields,
+        vec![Some("1".into()), Some("".into())]
+    );
+    assert_eq!(data.records[1].fields, vec![Some("2".into()), None]);
 }
 
 #[tokio::test]
@@ -325,9 +326,19 @@ async fn read_chunk_decodes_rows_and_escapes() {
     assert_eq!(data.records.len(), 3);
     assert_eq!(data.parse_errors, 0);
 
-    assert_eq!(data.records[0].fields, vec!["1", "hello", "world"]);
-    assert_eq!(data.records[1].fields, vec!["2", "", "line\nbreak"]);
-    assert_eq!(data.records[2].fields, vec!["3", "a\tb", "\\esc"]);
+    assert_eq!(
+        data.records[0].fields,
+        vec![Some("1".into()), Some("hello".into()), Some("world".into())]
+    );
+    // Row 2: column b was `\N` → None; column c is "line\nbreak".
+    assert_eq!(
+        data.records[1].fields,
+        vec![Some("2".into()), None, Some("line\nbreak".into())]
+    );
+    assert_eq!(
+        data.records[2].fields,
+        vec![Some("3".into()), Some("a\tb".into()), Some("\\esc".into())]
+    );
 }
 
 #[tokio::test]
@@ -898,6 +909,12 @@ async fn read_chunk_handles_crlf_line_endings() {
     let chunk_data = pg_reader.read_chunk(&chunks[0]).await.unwrap();
     assert_eq!(chunk_data.records.len(), 2);
     assert_eq!(chunk_data.parse_errors, 0);
-    assert_eq!(chunk_data.records[0].fields, vec!["1", "widget"]);
-    assert_eq!(chunk_data.records[1].fields, vec!["2", "gizmo"]);
+    assert_eq!(
+        chunk_data.records[0].fields,
+        vec![Some("1".into()), Some("widget".into())]
+    );
+    assert_eq!(
+        chunk_data.records[1].fields,
+        vec![Some("2".into()), Some("gizmo".into())]
+    );
 }

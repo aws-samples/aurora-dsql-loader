@@ -50,8 +50,7 @@ pub fn record_batch_to_records(batch: &RecordBatch) -> Result<Vec<Record>> {
             .iter()
             .map(|col| col[row_idx].clone())
             .collect();
-        let nulls = fields.iter().map(|f| f.trim().is_empty()).collect();
-        records.push(Record { fields, nulls });
+        records.push(Record::from_text_fields(fields));
     }
 
     Ok(records)
@@ -307,9 +306,18 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].fields, vec!["1", "100"]);
-        assert_eq!(records[1].fields, vec!["2", "200"]);
-        assert_eq!(records[2].fields, vec!["3", "300"]);
+        assert_eq!(
+            records[0].fields,
+            vec![Some("1".into()), Some("100".into())]
+        );
+        assert_eq!(
+            records[1].fields,
+            vec![Some("2".into()), Some("200".into())]
+        );
+        assert_eq!(
+            records[2].fields,
+            vec![Some("3".into()), Some("300".into())]
+        );
     }
 
     #[test]
@@ -323,9 +331,10 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].fields, vec!["Alice"]);
-        assert_eq!(records[1].fields, vec![""]); // Null becomes empty string
-        assert_eq!(records[2].fields, vec!["Bob"]);
+        assert_eq!(records[0].fields, vec![Some("Alice".into())]);
+        // Arrow null → array_to_strings emits "" → from_text_fields → None.
+        assert_eq!(records[1].fields, vec![None]);
+        assert_eq!(records[2].fields, vec![Some("Bob".into())]);
     }
 
     #[test]
@@ -339,9 +348,9 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].fields, vec!["1.5"]);
-        assert_eq!(records[1].fields, vec!["2.7"]);
-        assert_eq!(records[2].fields, vec![f64::consts::PI.to_string()]);
+        assert_eq!(records[0].fields, vec![Some("1.5".into())]);
+        assert_eq!(records[1].fields, vec![Some("2.7".into())]);
+        assert_eq!(records[2].fields, vec![Some(f64::consts::PI.to_string())]);
     }
 
     #[test]
@@ -355,9 +364,9 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].fields, vec!["true"]);
-        assert_eq!(records[1].fields, vec!["false"]);
-        assert_eq!(records[2].fields, vec!["true"]);
+        assert_eq!(records[0].fields, vec![Some("true".into())]);
+        assert_eq!(records[1].fields, vec![Some("false".into())]);
+        assert_eq!(records[2].fields, vec![Some("true".into())]);
     }
 
     #[test]
@@ -374,8 +383,8 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].fields, vec!["1970-01-01"]);
-        assert_eq!(records[1].fields, vec!["2022-01-01"]);
+        assert_eq!(records[0].fields, vec![Some("1970-01-01".into())]);
+        assert_eq!(records[1].fields, vec![Some("2022-01-01".into())]);
     }
 
     #[test]
@@ -406,8 +415,25 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].fields, vec!["1", "Alice", "100.5", "true"]);
-        assert_eq!(records[1].fields, vec!["2", "Bob", "", "false"]);
+        assert_eq!(
+            records[0].fields,
+            vec![
+                Some("1".into()),
+                Some("Alice".into()),
+                Some("100.5".into()),
+                Some("true".into()),
+            ]
+        );
+        // balance is Arrow-null for row 2 → "" → from_text_fields → None.
+        assert_eq!(
+            records[1].fields,
+            vec![
+                Some("2".into()),
+                Some("Bob".into()),
+                None,
+                Some("false".into()),
+            ]
+        );
     }
 
     #[test]

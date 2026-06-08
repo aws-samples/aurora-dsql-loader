@@ -4,14 +4,14 @@
 //! "Text Format" section: a backslash introduces an escape sequence.
 
 /// Decode one COPY-text-format field. Input is the raw bytes between tabs
-/// (or between start-of-line and tab). Returns `(decoded_text, is_null)`
-/// — the whole-field literal `\N` is the only encoding pg_dump uses for
-/// SQL NULL, and is distinct from a genuine empty string.
-pub fn decode_field(input: &[u8]) -> (String, bool) {
+/// (or between start-of-line and tab). Returns `None` for SQL NULL —
+/// the whole-field literal `\N` is the only encoding pg_dump uses for
+/// it, distinct from a genuine empty string which decodes to `Some("")`.
+pub fn decode_field(input: &[u8]) -> Option<String> {
     if input == b"\\N" {
-        return (String::new(), true);
+        return None;
     }
-    (decode_non_null(input), false)
+    Some(decode_non_null(input))
 }
 
 fn decode_non_null(input: &[u8]) -> String {
