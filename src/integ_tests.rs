@@ -4381,15 +4381,12 @@ mod tests {
         Ok(())
     }
 
-    /// Customer-shape E2E: seed PG, `pg_dump`, run the loader migrate
-    /// flow into a real DSQL cluster, assert the destination is
-    /// DSQL-compatible (SERIAL → identity, FK gone, UNIQUE collapsed,
-    /// row counts match). `#[ignore]` — needs PG + DSQL cluster + IAM.
-    /// CI's `e2e-dsql` job opts in via `--ignored`. Locally:
-    ///   PGDUMP_E2E_SOURCE_URL=postgres://... \
-    ///   LOADER_DSQL_E2E_ENDPOINT=<cluster>.dsql.<region>.on.aws \
-    ///   LOADER_DSQL_E2E_REGION=us-east-1 AWS_PROFILE=<p> \
-    ///   cargo test --lib pgdump_migrate_real_full_dump -- --ignored --nocapture
+    /// Customer-shape E2E: seed PG with one construct per dsql-lint rule
+    /// the migrate flow rewrites, plus every data-fidelity case the COPY
+    /// decoder must preserve, then `pg_dump` → `run_migrate` → real DSQL
+    /// cluster and assert the destination matches the source byte-for-byte.
+    /// `#[ignore]` — needs PG + DSQL cluster + IAM. CI's `e2e-dsql` job
+    /// opts in via `--ignored`.
     #[tokio::test]
     #[ignore]
     async fn pgdump_migrate_real_full_dump_collapses_serial_strips_fk() -> anyhow::Result<()> {
@@ -4418,7 +4415,16 @@ mod tests {
         let users_src = format!("e2e_users_{suffix}");
         let events_src = format!("e2e_events_{suffix}");
 
-        // One construct per dsql-lint rule — regression in any surfaces here.
+        // SCHEMA — one construct per rewrite rule:
+        //   users.id        SERIAL PRIMARY KEY    → serial_sequence_idiom
+        //   users.email     UNIQUE inline         → alter_add_unique_collapse
+        //   events.id       SERIAL PRIMARY KEY    → serial_sequence_idiom
+        //                                           + alter_add_primary_key_collapse
+        //   events.user_id  REFERENCES            → foreign_key (removed)
+        //   events.payload  JSONB                 → json_type
+        //   events_label_idx CREATE INDEX … USING btree
+        //                                         → index_async + index_using
+        //   events.note     NOT NULL DEFAULT ''   (preserved as-is)
         sqlx::query(&format!(
             "CREATE TABLE {users_src} (
                 id SERIAL PRIMARY KEY,
@@ -4432,7 +4438,9 @@ mod tests {
                 id SERIAL PRIMARY KEY,
                 label TEXT NOT NULL,
                 note TEXT NOT NULL DEFAULT '',
-                user_id INTEGER REFERENCES {users_src}(id)
+                user_id INTEGER REFERENCES {users_src}(id),
+                payload JSONB,
+                created_at TIMESTAMPTZ NOT NULL
             )"
         ))
         .execute(&pg_pool)
@@ -4448,11 +4456,34 @@ mod tests {
         ))
         .execute(&pg_pool)
         .await?;
+
+        // DATA — every row exercises a distinct decode/encode boundary the
+        // pgdump reader+worker chain must preserve. The destination assertions
+        // below check each `note` value byte-for-byte, so a regression in any
+        // single decode arm fails this test loudly.
+        //
+        // Row 1: plain text + JSON object + microsecond TS.
+        // Row 2: empty `note` in NOT NULL DEFAULT '' col — pins the
+        //        commit-07c0196 fix that `\N` ≠ `""` end-to-end.
+        // Row 3: tab inside `note` — encoded as `\t` in COPY.
+        // Row 4: newline inside `note` — encoded as `\n` in COPY; must NOT
+        //        split rows. JSON null literal (distinct from SQL NULL).
+        // Row 5: multi-byte UTF-8 in `note`.
+        // Row 6: literal backslash in `note` (encoded `\\` in COPY).
+        // Row 7: literal `\N` text inside `note` — encoded `\\N` in COPY,
+        //        MUST NOT be misread as the NULL sentinel.
+        // Row 8: NULL `note` is impossible (NOT NULL); NULL `user_id`,
+        //        `payload`, AND a microsecond TS at year boundary.
         sqlx::query(&format!(
-            "INSERT INTO {events_src} (label, note, user_id) VALUES
-                ('alpha', 'first', 1),
-                ('beta', '', 2),
-                ('gamma', 'gamma-note', NULL)"
+            "INSERT INTO {events_src} (label, note, user_id, payload, created_at) VALUES
+                ('alpha',   'first',                  1,    '{{\"k\":\"v\"}}'::jsonb,                  '2024-01-15 12:34:56.789012+00'),
+                ('beta',    '',                       2,    '[1,2,3,null]'::jsonb,                     '2024-06-30 23:59:59.123456+00'),
+                ('gamma',   E'tab\\there',            1,    '{{\"nested\":{{\"a\":[true,false]}}}}'::jsonb, '2024-03-15 09:30:00.000001+00'),
+                ('delta',   E'two\\nlines',           2,    'null'::jsonb,                              '2025-02-28 12:00:00+00'),
+                ('epsilon', 'unicode-naïve-café',     1,    '\"plain string\"'::jsonb,                  '2025-07-04 18:00:00+00'),
+                ('zeta',    E'back\\\\slash',         2,    '42'::jsonb,                                '2024-12-31 23:59:59.999999+00'),
+                ('eta',     E'null-\\\\N-marker',     1,    '[]'::jsonb,                                '2025-01-01 00:00:00+00'),
+                ('theta',   'no-fk',                  NULL, NULL,                                       '2025-12-31 00:00:00+00')"
         ))
         .execute(&pg_pool)
         .await?;
@@ -4496,36 +4527,37 @@ mod tests {
 
         let report = run_migrate(args).await?;
 
+        // ── Stage 1: dsql-lint diagnostic shape ────────────────────────
         assert!(
             report.ddl_unfixable.is_empty(),
             "no unfixable diagnostics expected on this fixture, got: {:?}",
             report.ddl_unfixable
         );
-        // Both SERIAL idioms collapsed.
+        let rule_count = |r: &str| report.ddl_changes.iter().filter(|d| d.rule == r).count();
         assert_eq!(
-            report
-                .ddl_changes
-                .iter()
-                .filter(|d| d.rule == "serial_sequence_idiom")
-                .count(),
+            rule_count("serial_sequence_idiom"),
             2,
-            "expected 2 serial_sequence_idiom changes, got: {:?}",
+            "expected 2 serial_sequence_idiom (users.id + events.id), got: {:?}",
             report.ddl_changes
         );
-        // FK auto-removed.
         assert!(
-            report.ddl_changes.iter().any(|d| d.rule == "foreign_key"),
+            rule_count("foreign_key") >= 1,
             "FK should be reported as auto-removed, got: {:?}",
             report.ddl_changes
         );
-        // UNIQUE on users.email folded back into the CREATE TABLE by
-        // alter_add_unique_collapse.
         assert!(
-            report
-                .ddl_changes
-                .iter()
-                .any(|d| d.rule == "alter_add_unique_collapse"),
-            "UNIQUE should be folded by alter_add_unique_collapse, got: {:?}",
+            rule_count("alter_add_unique_collapse") >= 1,
+            "UNIQUE should fold via alter_add_unique_collapse, got: {:?}",
+            report.ddl_changes
+        );
+        assert!(
+            rule_count("json_type") >= 1,
+            "JSONB → JSON rewrite should fire for events.payload, got: {:?}",
+            report.ddl_changes
+        );
+        assert!(
+            rule_count("index_async") >= 1,
+            "CREATE INDEX → CREATE INDEX ASYNC should fire, got: {:?}",
             report.ddl_changes
         );
 
@@ -4539,29 +4571,22 @@ mod tests {
         )
         .await?;
 
-        // SERIAL → identity.
-        let (users_id_is_identity,): (String,) = sqlx::query_as(&format!(
-            "SELECT is_identity FROM information_schema.columns \
-             WHERE table_schema='public' AND table_name='{users_src}' AND column_name='id'"
-        ))
-        .fetch_one(&dsql_pool)
-        .await?;
-        assert_eq!(
-            users_id_is_identity, "YES",
-            "{users_src}.id must be is_identity=YES post-migrate"
-        );
-        let (events_id_is_identity,): (String,) = sqlx::query_as(&format!(
-            "SELECT is_identity FROM information_schema.columns \
-             WHERE table_schema='public' AND table_name='{events_src}' AND column_name='id'"
-        ))
-        .fetch_one(&dsql_pool)
-        .await?;
-        assert_eq!(
-            events_id_is_identity, "YES",
-            "{events_src}.id must be is_identity=YES post-migrate"
-        );
+        // ── Stage 2: schema shape on the destination ───────────────────
+        // SERIAL → identity on both PK columns.
+        for (table, col) in [(&users_src, "id"), (&events_src, "id")] {
+            let (is_identity,): (String,) = sqlx::query_as(&format!(
+                "SELECT is_identity FROM information_schema.columns \
+                 WHERE table_schema='public' AND table_name='{table}' AND column_name='{col}'"
+            ))
+            .fetch_one(&dsql_pool)
+            .await?;
+            assert_eq!(
+                is_identity, "YES",
+                "{table}.{col} must be is_identity=YES post-migrate"
+            );
+        }
 
-        // FK auto-removed.
+        // FK auto-removed: zero FOREIGN KEY constraints on events.
         let (fk_count,): (i64,) = sqlx::query_as(&format!(
             "SELECT COUNT(*) FROM information_schema.table_constraints \
              WHERE table_schema='public' AND table_name='{events_src}' \
@@ -4569,10 +4594,7 @@ mod tests {
         ))
         .fetch_one(&dsql_pool)
         .await?;
-        assert_eq!(
-            fk_count, 0,
-            "{events_src} must have NO foreign key constraints in DSQL"
-        );
+        assert_eq!(fk_count, 0, "{events_src} must have 0 FK constraints");
 
         // Inline UNIQUE survives the pg_dump → ALTER → collapse round-trip.
         let (users_unique_count,): (i64,) = sqlx::query_as(&format!(
@@ -4584,22 +4606,157 @@ mod tests {
         .await?;
         assert_eq!(
             users_unique_count, 1,
-            "{users_src} must have exactly 1 UNIQUE constraint (from collapse)"
+            "{users_src} must have exactly 1 UNIQUE constraint"
         );
 
-        // Row counts: data made it through apply + load.
-        let (users_count,): (i64,) =
-            sqlx::query_as(&format!("SELECT COUNT(*)::BIGINT FROM {users_src}"))
-                .fetch_one(&dsql_pool)
-                .await?;
-        let (events_count,): (i64,) =
-            sqlx::query_as(&format!("SELECT COUNT(*)::BIGINT FROM {events_src}"))
-                .fetch_one(&dsql_pool)
-                .await?;
-        assert_eq!(users_count, 2, "{users_src} row count mismatch in DSQL");
-        assert_eq!(events_count, 3, "{events_src} row count mismatch in DSQL");
+        // JSONB → JSON: post-migrate column data_type is `json`, not `jsonb`.
+        let (payload_type,): (String,) = sqlx::query_as(&format!(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema='public' AND table_name='{events_src}' AND column_name='payload'"
+        ))
+        .fetch_one(&dsql_pool)
+        .await?;
+        assert_eq!(
+            payload_type, "json",
+            "{events_src}.payload must be data_type='json' (not 'jsonb')"
+        );
 
-        // Best-effort cleanup (per-run CI cluster is torn down anyway).
+        // NOT NULL DEFAULT '' preserved on events.note.
+        let (note_nullable, note_default): (String, Option<String>) = sqlx::query_as(&format!(
+            "SELECT is_nullable, column_default FROM information_schema.columns \
+             WHERE table_schema='public' AND table_name='{events_src}' AND column_name='note'"
+        ))
+        .fetch_one(&dsql_pool)
+        .await?;
+        assert_eq!(note_nullable, "NO", "events.note must remain NOT NULL");
+        assert!(
+            note_default.as_deref().is_some_and(|d| d.contains("''")),
+            "events.note default must contain '', got {:?}",
+            note_default
+        );
+
+        // ── Stage 3: data fidelity, byte-for-byte ──────────────────────
+        // Decode each row at the destination and assert exact-equal against
+        // what we seeded. A regression in any single COPY-decode arm
+        // (escape, multi-byte, `\N` ambiguity, JSONB→JSON cast) shows up here.
+        #[derive(Debug, sqlx::FromRow)]
+        struct EventRow {
+            label: String,
+            note: String,
+            user_id: Option<i32>,
+            payload: Option<serde_json::Value>,
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let rows: Vec<EventRow> = sqlx::query_as(&format!(
+            "SELECT label, note, user_id, payload, created_at \
+             FROM {events_src} ORDER BY label"
+        ))
+        .fetch_all(&dsql_pool)
+        .await?;
+        assert_eq!(rows.len(), 8, "all 8 events rows must round-trip");
+
+        // Helper to find a row by label so the assertion list reads top-to-bottom.
+        let find = |label: &str| {
+            rows.iter()
+                .find(|r| r.label == label)
+                .unwrap_or_else(|| panic!("missing label={label}"))
+        };
+
+        // Row 1: plain.
+        let r = find("alpha");
+        assert_eq!(r.note, "first");
+        assert_eq!(r.user_id, Some(1));
+        assert_eq!(r.payload, Some(serde_json::json!({"k": "v"})));
+
+        // Row 2: empty `note` in NOT NULL DEFAULT '' must stay empty (NOT NULL).
+        // This is the iter-1 commit-07c0196 regression pin.
+        let r = find("beta");
+        assert_eq!(r.note, "", "empty `note` collapsed to NULL or got mangled");
+        assert_eq!(r.payload, Some(serde_json::json!([1, 2, 3, null])));
+
+        // Row 3: real tab byte inside `note`.
+        let r = find("gamma");
+        assert_eq!(r.note, "tab\there");
+        assert_eq!(
+            r.payload,
+            Some(serde_json::json!({"nested": {"a": [true, false]}}))
+        );
+
+        // Row 4: real newline byte inside `note` — MUST NOT split rows.
+        // JSON null literal preserved as Some(Value::Null).
+        let r = find("delta");
+        assert_eq!(r.note, "two\nlines");
+        assert_eq!(r.payload, Some(serde_json::Value::Null));
+
+        // Row 5: multi-byte UTF-8 in `note`.
+        let r = find("epsilon");
+        assert_eq!(r.note, "unicode-naïve-café");
+        assert_eq!(
+            r.payload,
+            Some(serde_json::Value::String("plain string".to_string()))
+        );
+
+        // Row 6: single backslash in `note` (encoded `\\` in COPY).
+        let r = find("zeta");
+        assert_eq!(r.note, "back\\slash");
+        assert_eq!(r.payload, Some(serde_json::json!(42)));
+
+        // Row 7: literal text `null-\N-marker` — the `\N` here is data, not the
+        // NULL sentinel. pg_dump emits this as `null-\\N-marker`; the loader's
+        // `decode_field` must NOT collapse the embedded `\N` to NULL.
+        let r = find("eta");
+        assert_eq!(
+            r.note, "null-\\N-marker",
+            "literal `\\N` inside data was misread as NULL sentinel"
+        );
+        assert_eq!(r.payload, Some(serde_json::json!([])));
+
+        // Row 8: NULL on user_id and payload preserved as SQL NULL.
+        let r = find("theta");
+        assert_eq!(r.note, "no-fk");
+        assert!(
+            r.user_id.is_none(),
+            "user_id should be SQL NULL, got {:?}",
+            r.user_id
+        );
+        assert!(
+            r.payload.is_none(),
+            "payload should be SQL NULL, got {:?}",
+            r.payload
+        );
+
+        // TIMESTAMPTZ microsecond fidelity: pin two extreme cases.
+        // alpha = 2024-01-15 12:34:56.789012 UTC (six-digit fractional).
+        let alpha_ts = find("alpha").created_at;
+        let expected_alpha = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:34:56.789012Z")?
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            alpha_ts, expected_alpha,
+            "TIMESTAMPTZ microsecond precision lost on alpha"
+        );
+        // zeta = end-of-year 2024 with .999999 microseconds.
+        let zeta_ts = find("zeta").created_at;
+        let expected_zeta = chrono::DateTime::parse_from_rfc3339("2024-12-31T23:59:59.999999Z")?
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            zeta_ts, expected_zeta,
+            "TIMESTAMPTZ microsecond lost on zeta"
+        );
+
+        // Users data sanity (UNIQUE round-trip + identity column).
+        #[derive(Debug, sqlx::FromRow)]
+        struct UserRow {
+            email: String,
+        }
+        let user_rows: Vec<UserRow> =
+            sqlx::query_as(&format!("SELECT email FROM {users_src} ORDER BY email"))
+                .fetch_all(&dsql_pool)
+                .await?;
+        let emails: Vec<&str> = user_rows.iter().map(|u| u.email.as_str()).collect();
+        assert_eq!(emails, vec!["a@example.com", "b@example.com"]);
+
+        // ── Cleanup: best-effort (per-run CI cluster is torn down anyway).
         let _ = sqlx::query(&format!(
             "DROP TABLE IF EXISTS {events_src}, {users_src} CASCADE"
         ))
