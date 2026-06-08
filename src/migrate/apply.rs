@@ -109,12 +109,14 @@ fn is_already_exists(err: &sqlx::Error) -> bool {
 }
 
 /// Make a SQL fragment safe to embed in a terminal-bound error message
-/// or log line: truncate at the last char boundary at or before 200 bytes
-/// (real `pg_dump` statements can be MB-sized via embedded function bodies
-/// or large enum lists) and replace control bytes / Unicode bidi-format
-/// codepoints with `?` so a multi-line SQL excerpt in an anyhow chain
-/// doesn't re-flow the operator's terminal. Reuses the same character
-/// classes that `is_unsafe_for_listing` flags in the `list-tables` path.
+/// or log line: keep chars whose start byte is below 200 (so the head
+/// can extend up to 3 bytes past 200 when a multi-byte char starts just
+/// before the cap — real `pg_dump` statements can be MB-sized via
+/// embedded function bodies or large enum lists) and replace control
+/// bytes / Unicode bidi-format codepoints with `?` so a multi-line SQL
+/// excerpt in an anyhow chain doesn't re-flow the operator's terminal.
+/// Reuses the same character classes that `is_unsafe_for_listing` flags
+/// in the `list-tables` path.
 fn safe_for_terminal(stmt: &str) -> String {
     const MAX: usize = 200;
     let truncated = if stmt.len() > MAX {
@@ -557,14 +559,31 @@ INSERT INTO t (id, val) VALUES (2, 'b;not-a-split');
 
     /// `safe_for_terminal` truncates large SQL excerpts so a multi-MB
     /// statement (e.g. a large enum list or function body) doesn't flood
-    /// an anyhow chain. Pin the boundary + bytes-total suffix so a
-    /// future tweak doesn't silently change error message shape.
+    /// an anyhow chain. Pin both the ASCII-tail and the multi-byte-tail
+    /// boundary semantics so a future tweak doesn't silently change error
+    /// message shape.
     #[test]
     fn safe_for_terminal_truncates_large_excerpts_with_byte_count() {
+        // ASCII tail: head is exactly 200 bytes, suffix names original size.
         let stmt = "x".repeat(250);
         let out = safe_for_terminal(&stmt);
-        assert!(out.starts_with(&"x".repeat(200)));
+        let head = out.split_once("...").unwrap().0;
+        assert_eq!(head.len(), 200);
+        assert_eq!(head, "x".repeat(200));
         assert!(out.contains("(250 bytes total)"));
+
+        // Multi-byte tail: a 2-byte char starting at byte 199 is kept whole
+        // (predicate is on start index, so head extends to 201 bytes).
+        // Pinning this so a future "true floor_char_boundary" refactor is
+        // a deliberate spec change, not silent drift.
+        let mut multi = "a".repeat(199);
+        multi.push('é');
+        multi.push_str(&"b".repeat(50));
+        let out = safe_for_terminal(&multi);
+        let head = out.split_once("...").unwrap().0;
+        assert_eq!(head.len(), 201);
+        assert!(head.ends_with('é'));
+
         // Short inputs round-trip unchanged.
         assert_eq!(
             safe_for_terminal("CREATE TABLE t (id INT)"),
