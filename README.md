@@ -152,8 +152,10 @@ connection pool:
    `CREATE INDEX` → `CREATE INDEX ASYNC`). See the dsql-lint docs for
    the full rule set.
 3. **Apply** the transformed DDL to the cluster, one statement per
-   transaction (DSQL accepts only one DDL per txn). Already-existing
-   objects are skipped, so a re-run after a partial failure is safe.
+   transaction (DSQL accepts only one DDL per txn). On re-run,
+   already-created tables / indexes / constraints / columns are skipped
+   by name so you can resume past a partial failure — schema-drift
+   detection is on you, the skip matches identity, not definition.
 4. **Load** each `COPY` block's data using the same connection pool —
    no IAM round-trips between stages.
 
