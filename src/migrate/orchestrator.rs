@@ -9,10 +9,11 @@ use crate::formats::pgdump::{extract_ddl, list_copy_blocks};
 use crate::io::{ByteReader, LocalFileByteReader, S3ByteReader, SourceUri};
 use crate::migrate::apply::{AppliedStatement, apply_ddl};
 use crate::migrate::transform::{Diagnostic, TransformResult, transform_ddl};
-use crate::runner::{Format, LoadArgs, OnConflict, run_load_with_pool};
+use crate::runner::{Format, LoadArgs, OnConflict, run_load_with_pool_for_pgdump_block};
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Caller-supplied configuration for a migrate run. Holds the connection
@@ -96,6 +97,11 @@ pub struct TableLoadSummary {
     pub table: String,
     pub records_loaded: u64,
     pub records_failed: u64,
+    /// Path to the persisted manifest dir when this table had failures.
+    /// Mirrors `LoadResult.persisted_manifest_dir` — the operator needs
+    /// it to inspect the failed-row chunks. `None` when the table loaded
+    /// cleanly or when `--manifest-dir` was supplied (caller-owned).
+    pub persisted_manifest_dir: Option<PathBuf>,
 }
 
 /// Drive the end-to-end migrate flow against a real (or test) cluster.
@@ -115,21 +121,31 @@ pub struct TableLoadSummary {
 /// — the operator gets the proposed DDL and the diagnostic split, no
 /// statements are sent to the cluster.
 pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
-    let reader = open_source(&args).await?;
+    let (reader, aws_config) = open_source(&args).await?;
 
     let blocks = list_copy_blocks(&*reader)
         .await
         .context("Failed to scan pg_dump for COPY blocks")?;
+    tracing::info!(
+        copy_blocks = blocks.len(),
+        "migrate: scanned pg_dump for COPY blocks"
+    );
 
     let ddl = extract_ddl(&*reader, &blocks)
         .await
         .context("Failed to extract DDL from pg_dump")?;
+    tracing::info!(ddl_bytes = ddl.len(), "migrate: extracted DDL");
 
     let TransformResult {
         fixed_sql,
         changes,
         unfixable,
     } = transform_ddl(&ddl);
+    tracing::info!(
+        changes = changes.len(),
+        unfixable = unfixable.len(),
+        "migrate: dsql-lint transform complete"
+    );
 
     let warnings = collect_warnings(&changes);
 
@@ -158,24 +174,39 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         .await
         .context("Failed to apply DDL to cluster")?;
 
+    // Halt on the first table with `records_failed > 0`. DSQL doesn't
+    // enforce FKs, so continuing would silently load child rows against
+    // a partially-loaded parent and the final report would look healthy.
+    // The pre-resolved `blocks` and `aws_config` are threaded through so
+    // each load skips the dump rescan + credential-chain walk.
     let mut tables = Vec::with_capacity(blocks.len());
     for block in &blocks {
         let load_args = build_load_args(&args, &block.table, &block.schema);
-        let r = run_load_with_pool(pool.clone(), load_args)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to load table {schema}.{table}",
-                    schema = block.schema,
-                    table = block.table,
-                )
-            })?;
+        let r = run_load_with_pool_for_pgdump_block(
+            pool.clone(),
+            load_args,
+            block.clone(),
+            aws_config.as_ref(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to load table {schema}.{table}",
+                schema = block.schema,
+                table = block.table,
+            )
+        })?;
+        let records_failed = r.records_failed;
         tables.push(TableLoadSummary {
             schema: block.schema.clone(),
             table: block.table.clone(),
             records_loaded: r.records_loaded,
-            records_failed: r.records_failed,
+            records_failed,
+            persisted_manifest_dir: r.persisted_manifest_dir,
         });
+        if records_failed > 0 {
+            break;
+        }
     }
 
     Ok(MigrateReport {
@@ -205,21 +236,28 @@ async fn build_pool(args: &MigrateArgs) -> Result<Pool> {
     build_dsql_pool(pool_args).await
 }
 
-/// Open the source dump as a `ByteReader`. Mirrors what
-/// `runner::list_pgdump_tables` does so the two entry points see the same
-/// inputs (and reject the same things — e.g. `s3://` without an AWS
-/// config).
-async fn open_source(args: &MigrateArgs) -> Result<Arc<dyn ByteReader>> {
+/// Open the source dump as a `ByteReader` and return the
+/// `aws_config::SdkConfig` (or `None` for `file://`) alongside it so the
+/// per-table load loop can reuse the same config rather than rebuilding
+/// it once per table. Migrate uses an explicit region (the cluster's),
+/// unlike `list_pgdump_tables` which has no `--region` flag and falls
+/// back to the AWS env default.
+async fn open_source(
+    args: &MigrateArgs,
+) -> Result<(Arc<dyn ByteReader>, Option<aws_config::SdkConfig>)> {
     let parsed = SourceUri::parse(&args.source_uri)?;
     Ok(match parsed {
-        SourceUri::Local(path) => Arc::new(LocalFileByteReader::new(&path)),
+        SourceUri::Local(path) => (Arc::new(LocalFileByteReader::new(&path)), None),
         SourceUri::S3 { bucket, key } => {
             let aws_config = aws_config::defaults(BehaviorVersion::latest())
                 .region(Region::new(args.region.clone()))
                 .load()
                 .await;
             let s3 = Arc::new(aws_sdk_s3::Client::new(&aws_config));
-            Arc::new(S3ByteReader::new(s3, bucket, key))
+            (
+                Arc::new(S3ByteReader::new(s3, bucket, key)),
+                Some(aws_config),
+            )
         }
     })
 }

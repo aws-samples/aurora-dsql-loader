@@ -169,8 +169,9 @@ aurora-dsql-loader migrate \
   --dry-run
 ```
 
-The dry run runs entirely offline (no IAM calls, no cluster contact),
-so you can review a dump from a workstation that doesn't have DSQL
+The dry run is offline for `file://` sources; for `s3://`, AWS config
+still loads to fetch the dump but DSQL itself is not contacted. Either
+way you can review a dump from a workstation that doesn't have DSQL
 access yet.
 
 **Known limits:**

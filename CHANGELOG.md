@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [Unreleased]
 
 ### Added
 - New `migrate` subcommand for one-command pg_dump → DSQL migration. Reads
@@ -12,7 +12,8 @@
   `CREATE INDEX ASYNC`), applies it one statement per transaction
   (DSQL constraint), then loads each COPY block's data using the same
   connection pool. `--dry-run` prints the proposed DDL + diagnostic split
-  without touching the cluster (runs entirely offline). Already-existing
+  without touching the cluster (offline for `file://` sources; for
+  `s3://`, AWS config still loads to fetch the dump). Already-existing
   objects are skipped on apply, so a re-run after a partial failure is
   safe. Statements `dsql-lint` cannot auto-fix surface as Unfixable
   diagnostics; the flow refuses to apply DDL while any are present.
@@ -40,6 +41,17 @@
   binary file.
 
 ### Changed
+- `migrate` now scans the dump for COPY blocks once and reuses the
+  resolved blocks + AWS config across every per-table load. Previously
+  each table re-walked the entire dump and re-ran the credential chain
+  — so an N-table S3 dump cost N+1 full file scans and N+1 credential
+  walks. Functional behavior unchanged.
+- `migrate` halts on the first table whose load reports failed records
+  and exits non-zero. With no foreign-key enforcement on DSQL,
+  continuing past a partially-loaded parent would silently load child
+  rows pointing at missing parents. The CLI prints the persisted
+  manifest path so the operator can inspect the failed chunks before
+  re-running.
 - `--schema` and `--table` (all formats) now reject identifiers containing
   embedded `"`, `\`, NUL, control bytes, or Unicode bidi/format codepoints
   (RLM, LRM, RTL/LTR overrides, ZWSP, BOM, line/paragraph separators, bidi

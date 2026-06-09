@@ -69,11 +69,29 @@ jobs:
             exit 1
           fi
 
-          echo "Waiting for cluster $CLUSTER_ID to become active..."
-          aws dsql wait cluster-active --identifier "$CLUSTER_ID"
-
+          # Persist the id to outputs IMMEDIATELY, before `wait`. If the
+          # runner is cancelled or crashes during `wait` the cluster is
+          # already created and tagged; without this line the output is
+          # empty and the `delete-cluster` step has nothing to target,
+          # leaving an orphaned cluster.
           {
             echo "cluster-id=$CLUSTER_ID"
             echo "cluster-endpoint=${CLUSTER_ID}.dsql.${{ env.AWS_REGION }}.on.aws"
             echo "region=${{ env.AWS_REGION }}"
           } >> "$GITHUB_OUTPUT"
+
+          echo "Waiting for cluster $CLUSTER_ID to become active..."
+          aws dsql wait cluster-active --identifier "$CLUSTER_ID"
+
+      - name: Clean up orphaned cluster on failure
+        if: ${{ failure() || cancelled() }}
+        run: |
+          # Belt-and-suspenders: if `wait` failed or the job was
+          # cancelled, the cluster may exist but no caller will receive
+          # a cluster-id output, so the downstream delete job won't run.
+          # Delete it here using the id captured by the create step.
+          CLUSTER_ID="${{ steps.create.outputs.cluster-id }}"
+          if [ -n "$CLUSTER_ID" ] && [ "$CLUSTER_ID" != "null" ]; then
+            echo "Deleting orphan cluster $CLUSTER_ID"
+            aws dsql delete-cluster --identifier "$CLUSTER_ID" || true
+          fi

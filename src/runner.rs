@@ -16,7 +16,7 @@ pub use crate::migrate::{
     TableLoadSummary, run_migrate,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -195,6 +195,10 @@ pub struct LoadResult {
 /// # }
 /// ```
 pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
+    // Fail fast on bad args before paying for IAM + pool open. The
+    // downstream entry point re-validates (cheap) so library callers
+    // who skip `run_load` still get the same checks.
+    validate_load_args(&args)?;
     let pool = build_pool(&args).await?;
     run_load_with_pool(pool, args).await
 }
@@ -218,12 +222,11 @@ async fn build_pool(args: &LoadArgs) -> Result<crate::db::Pool> {
     db_pool::pool::pool(pool_args).await
 }
 
-/// Run a load against an externally-supplied pool.
-///
-/// Identical to [`run_load`] except the caller owns pool construction —
-/// the migrate orchestrator uses this so it can apply DDL and run the
-/// per-table load against the same physical pool, avoiding repeated IAM
-/// auth and connection-establishment overhead.
+/// Run a load against an externally-supplied pool. Identical to
+/// [`run_load`] except the caller owns pool construction. The migrate
+/// orchestrator uses [`run_load_with_pool_for_pgdump_block`] instead —
+/// it pre-resolves the COPY block and reuses one `aws_config` across
+/// every table.
 pub(crate) async fn run_load_with_pool(
     pool: crate::db::Pool,
     args: LoadArgs,
@@ -231,33 +234,21 @@ pub(crate) async fn run_load_with_pool(
     validate_load_args(&args)?;
 
     let delimited_config = maybe_delimited_config(&args);
-
-    // Set up manifest directory (use temp dir if not provided)
-    let (mut temp_dir, manifest_dir_path) = if let Some(dir) = args.manifest_dir {
-        (None, dir)
-    } else {
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().to_path_buf();
-        (Some(temp_dir), path)
-    };
-
-    // Parse source URI
     let parsed_uri = SourceUri::parse(&args.source_uri)?;
 
-    // Load AWS config (needed for S3 access)
+    // Build the file reader. The pg_dump path here scans the dump to find
+    // the matching COPY block; migrate has already done that and uses
+    // `run_load_with_pool_for_pgdump_block` below to skip the rescan.
     let aws_config = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(args.region.clone()))
         .load()
         .await;
-
-    // Create reader factory and file reader
     let reader_factory = ReaderFactory::new(&aws_config);
     let (file_reader, pgdump_columns) = match args.format {
         Format::PgDump => {
-            let (reader, cols) = reader_factory
+            reader_factory
                 .create_pgdump_reader(&parsed_uri, &args.schema, &args.target_table)
-                .await?;
-            (reader, cols)
+                .await?
         }
         _ => {
             let reader = reader_factory
@@ -271,7 +262,67 @@ pub(crate) async fn run_load_with_pool(
         }
     };
 
-    // Determine file format config based on format
+    run_load_with_pool_and_reader(pool, args, file_reader, pgdump_columns, delimited_config).await
+}
+
+/// Migrate-only entry point: load one pg_dump COPY block using a
+/// pre-resolved [`CopyBlock`] (no dump rescan) and a caller-supplied
+/// `aws_config` (no second credential-chain walk). The orchestrator
+/// scans the dump exactly once at startup and threads the result
+/// through here per table. `aws_config` is required for `s3://`
+/// sources and ignored for `file://`.
+///
+/// Caller invariant: `block.schema` and `block.table` must match the
+/// equivalent fields on `args` — this entry point trusts the block
+/// instead of running `find_copy_block`.
+pub(crate) async fn run_load_with_pool_for_pgdump_block(
+    pool: crate::db::Pool,
+    args: LoadArgs,
+    block: crate::formats::pgdump::CopyBlock,
+    aws_config: Option<&aws_config::SdkConfig>,
+) -> Result<LoadResult> {
+    use crate::formats::pgdump::PgDumpReader;
+
+    validate_load_args(&args)?;
+
+    let delimited_config = maybe_delimited_config(&args);
+    let parsed_uri = SourceUri::parse(&args.source_uri)?;
+
+    let pgdump_columns = block.columns.clone();
+    let file_reader: Arc<dyn crate::formats::reader::FileReader> = match &parsed_uri {
+        SourceUri::Local(path) => {
+            let byte_reader = crate::io::LocalFileByteReader::new(path);
+            Arc::new(PgDumpReader::from_block(byte_reader, block))
+        }
+        SourceUri::S3 { bucket, key } => {
+            let cfg = aws_config.context(
+                "internal: run_load_with_pool_for_pgdump_block needs aws_config for s3:// sources",
+            )?;
+            let s3 = Arc::new(aws_sdk_s3::Client::new(cfg));
+            let byte_reader = crate::io::S3ByteReader::new(s3, bucket.clone(), key.clone());
+            Arc::new(PgDumpReader::from_block(byte_reader, block))
+        }
+    };
+
+    run_load_with_pool_and_reader(pool, args, file_reader, pgdump_columns, delimited_config).await
+}
+
+async fn run_load_with_pool_and_reader(
+    pool: crate::db::Pool,
+    args: LoadArgs,
+    file_reader: Arc<dyn crate::formats::reader::FileReader>,
+    pgdump_columns: Vec<String>,
+    delimited_config: Option<DelimitedConfig>,
+) -> Result<LoadResult> {
+    // Set up manifest directory (use temp dir if not provided)
+    let (mut temp_dir, manifest_dir_path) = if let Some(dir) = args.manifest_dir {
+        (None, dir)
+    } else {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().to_path_buf();
+        (Some(temp_dir), path)
+    };
+
     let (has_header, file_format) = match args.format {
         Format::Csv => {
             let config = delimited_config.unwrap_or_else(DelimitedConfig::csv);
@@ -290,16 +341,10 @@ pub(crate) async fn run_load_with_pool(
         ),
     };
 
-    // Create manifest storage
     let manifest_storage = Arc::new(LocalManifestStorage::new(manifest_dir_path));
-
-    // Create schema inferrer
     let schema_inferrer = SchemaInferrer { has_header };
-
-    // Create coordinator
     let coordinator = Coordinator::new(manifest_storage, file_reader, schema_inferrer, pool);
 
-    // Build load config
     let load_config = LoadConfigBuilder::default()
         .source_uri(args.source_uri)
         .target_table(args.target_table)
@@ -323,19 +368,15 @@ pub(crate) async fn run_load_with_pool(
         .exclude_columns(args.exclude_columns)
         .build()?;
 
-    // Run the load
     let result = coordinator.run_load(&load_config).await?;
 
-    // If there were errors and we used a temp directory, persist it for debugging
     let persisted_manifest_dir = if result.records_failed > 0 && temp_dir.is_some() {
         let temp = temp_dir.take().unwrap();
-        let persisted_path = temp.keep();
-        Some(persisted_path)
+        Some(temp.keep())
     } else {
         None
     };
 
-    // Convert to public LoadResult type
     Ok(LoadResult {
         job_id: result.job_id,
         chunks_processed: result.chunks_processed,

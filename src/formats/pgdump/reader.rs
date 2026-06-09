@@ -31,6 +31,13 @@ impl<R: ByteReader> PgDumpReader<R> {
         Ok(Self { reader, block })
     }
 
+    /// Build from a pre-resolved [`CopyBlock`]. Lets the migrate path reuse a
+    /// single dump scan across N tables instead of re-walking the file
+    /// once per table inside `find_copy_block`.
+    pub fn from_block(reader: R, block: CopyBlock) -> Self {
+        Self { reader, block }
+    }
+
     /// Column names declared in the COPY statement, in order.
     pub fn columns(&self) -> &[String] {
         &self.block.columns

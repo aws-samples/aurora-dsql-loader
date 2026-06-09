@@ -469,7 +469,30 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
                     String::new()
                 }
             );
+            if let Some(path) = &t.persisted_manifest_dir {
+                println!("    Failed-row manifest: {}", path.display());
+            }
         }
+        // The orchestrator halts on the first failed table. If the last
+        // entry has failures, the operator needs to know the run was
+        // truncated — without FK enforcement on DSQL, continuing would
+        // silently load child rows against missing parents.
+        if report.tables.last().is_some_and(|t| t.records_failed > 0) {
+            let n = report.tables.len();
+            let suffix = if n == 1 { "" } else { "s" };
+            println!();
+            println!(
+                "Halted after {n} table{suffix} due to load failures. \
+                 Inspect the manifest above before re-running."
+            );
+        }
+    }
+
+    // Mirror `run_loader`: any per-table failures must surface as a
+    // non-zero exit so a wrapping `migrate && deploy.sh` doesn't ship
+    // an app pointed at a partially-loaded cluster.
+    if report.tables.iter().any(|t| t.records_failed > 0) {
+        std::process::exit(1);
     }
 
     Ok(())

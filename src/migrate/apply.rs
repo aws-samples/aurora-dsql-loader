@@ -32,9 +32,9 @@ pub struct AppliedStatement {
 pub enum ApplyOutcome {
     /// Statement executed successfully.
     Applied,
-    /// Statement targeted an object that already exists (Postgres SQLSTATE
-    /// `42P07` table, `42P06` schema, `42710` index/sequence/constraint/type,
-    /// `42701` column) and was skipped to keep the migrate flow re-runnable.
+    /// Statement targeted an object that already exists (see
+    /// [`is_already_exists`] for the SQLSTATE allowlist) and was skipped
+    /// to keep the migrate flow re-runnable.
     SkippedAlreadyExists,
 }
 
@@ -49,8 +49,16 @@ pub enum ApplyOutcome {
 /// the "already exists" skip path makes that re-run safe.
 pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> {
     let statements = split_sql_statements(ddl);
-    let mut applied = Vec::with_capacity(statements.len());
-    for stmt in statements {
+    let total = statements.len();
+    tracing::info!(statements = total, "applying DDL");
+    let mut applied = Vec::with_capacity(total);
+    for (i, stmt) in statements.into_iter().enumerate() {
+        tracing::debug!(
+            statement = i + 1,
+            total,
+            preview = %safe_for_terminal(&stmt),
+            "applying DDL statement"
+        );
         match pool.execute_query(&stmt).await {
             Ok(()) => applied.push(AppliedStatement {
                 sql: stmt,
@@ -76,12 +84,20 @@ pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> 
 /// Whether a sqlx error represents a target object that already exists
 /// (so the migrate flow can skip it for idempotency on re-run).
 ///
-/// Postgres surfaces these as SQLSTATE 42P07 (`duplicate_table`),
-/// 42P06 (`duplicate_schema`), 42710 (`duplicate_object` — index, sequence,
-/// constraint, type), and 42701 (`duplicate_column`). DSQL inherits the
-/// codes from its Postgres surface. SQLite uses numeric error codes (`1`
-/// for any logic error, etc.) that don't carry the same level of detail,
-/// so we fall back to a `"already exists"` message-string match for it.
+/// On DSQL, the reachable shapes are:
+/// - `42P07` — `duplicate_table` (also emitted for duplicate index;
+///   ALTER ADD CONSTRAINT and CREATE TYPE ENUM are `0A000` unsupported,
+///   so the index/constraint/type codes don't surface from pg_dump).
+/// - `42P06` — `duplicate_schema`.
+/// - `42701` — `duplicate_column`.
+/// - `42723` — `duplicate_function` (pg_dump emits `CREATE FUNCTION
+///   ... LANGUAGE sql` and DSQL surfaces this on re-apply).
+/// - `42710` — `duplicate_object` on Postgres; kept defensively for
+///   parity though not currently reachable through DSQL.
+///
+/// SQLite uses numeric error codes (`1` for any logic error, etc.) that
+/// don't carry the same level of detail, so we fall back to a
+/// `"already exists"` message-string match for it.
 fn is_already_exists(err: &sqlx::Error) -> bool {
     let sqlx::Error::Database(db_err) = err else {
         return false;
@@ -97,7 +113,7 @@ fn is_already_exists(err: &sqlx::Error) -> bool {
         && c.len() == 5
         && c.starts_with("42")
     {
-        return matches!(c, "42P07" | "42P06" | "42710" | "42701");
+        return matches!(c, "42P07" | "42P06" | "42710" | "42701" | "42723");
     }
     // Non-Postgres backend (e.g. SQLite, used by in-process tests, returns
     // numeric codes like "1") or no code at all: fall back to the stable
