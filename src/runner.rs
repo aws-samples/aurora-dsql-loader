@@ -28,7 +28,7 @@ use crate::coordination::manifest::{LocalManifestStorage, ParquetConfig, PgDumpC
 use crate::coordination::{Coordinator, DsqlConfig, FileFormat, LoadConfigBuilder};
 use crate::db::pool::PoolArgsBuilder;
 use crate::db::{self as db_pool, SchemaInferrer};
-use crate::formats::pgdump::list_copy_blocks;
+use crate::formats::pgdump::{CopyBlock, PgDumpReader, list_copy_blocks};
 use crate::formats::{DelimitedConfig, ReaderFactory};
 use crate::io::{LocalFileByteReader, S3ByteReader, SourceUri};
 
@@ -278,11 +278,9 @@ pub(crate) async fn run_load_with_pool(
 pub(crate) async fn run_load_with_pool_for_pgdump_block(
     pool: crate::db::Pool,
     args: LoadArgs,
-    block: crate::formats::pgdump::CopyBlock,
+    block: CopyBlock,
     aws_config: Option<&aws_config::SdkConfig>,
 ) -> Result<LoadResult> {
-    use crate::formats::pgdump::PgDumpReader;
-
     validate_load_args(&args)?;
 
     let delimited_config = maybe_delimited_config(&args);
@@ -291,7 +289,7 @@ pub(crate) async fn run_load_with_pool_for_pgdump_block(
     let pgdump_columns = block.columns.clone();
     let file_reader: Arc<dyn crate::formats::reader::FileReader> = match &parsed_uri {
         SourceUri::Local(path) => {
-            let byte_reader = crate::io::LocalFileByteReader::new(path);
+            let byte_reader = LocalFileByteReader::new(path);
             Arc::new(PgDumpReader::from_block(byte_reader, block))
         }
         SourceUri::S3 { bucket, key } => {
@@ -299,7 +297,7 @@ pub(crate) async fn run_load_with_pool_for_pgdump_block(
                 "internal: run_load_with_pool_for_pgdump_block needs aws_config for s3:// sources",
             )?;
             let s3 = Arc::new(aws_sdk_s3::Client::new(cfg));
-            let byte_reader = crate::io::S3ByteReader::new(s3, bucket.clone(), key.clone());
+            let byte_reader = S3ByteReader::new(s3, bucket.clone(), key.clone());
             Arc::new(PgDumpReader::from_block(byte_reader, block))
         }
     };

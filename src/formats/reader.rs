@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::delimited::reader::GenericDelimitedReader;
 use super::parquet::GenericParquetReader;
+use super::pgdump::PgDumpReader;
 use crate::io::{
     ByteReader, LocalFileByteReader, S3ByteReader, SourceUri, estimate_rows_in_range,
     find_next_record_boundary,
@@ -255,7 +256,6 @@ impl ReaderFactory {
         schema: &str,
         table: &str,
     ) -> Result<(Arc<dyn FileReader>, Vec<String>)> {
-        use crate::formats::pgdump::PgDumpReader;
         match source_uri {
             SourceUri::Local(path) => {
                 let byte_reader = LocalFileByteReader::new(path);
