@@ -260,7 +260,12 @@ fn skip_line_comment(bytes: &[u8], i: usize) -> usize {
 }
 
 /// Advance past a `/* ... */` block comment. Postgres allows nested
-/// block comments, so we track depth.
+/// block comments, so we track depth. Returns the index of the byte
+/// after `*/`, or `bytes.len()` on unterminated input — same shape as
+/// [`skip_quoted`] and [`skip_line_comment`] so the splitter never
+/// re-enters the loop on byte content the comment was supposed to
+/// consume (a stray `;` inside an unterminated `/* ... */` would
+/// otherwise be misread as a statement boundary).
 fn skip_block_comment(bytes: &[u8], i: usize) -> usize {
     debug_assert_eq!(&bytes[i..i + 2], b"/*");
     let mut j = i + 2;
@@ -278,7 +283,7 @@ fn skip_block_comment(bytes: &[u8], i: usize) -> usize {
             _ => j += 1,
         }
     }
-    j
+    if depth == 0 { j } else { bytes.len() }
 }
 
 /// If `bytes[i..]` opens a dollar-quoted string (`$tag$...$tag$` or
@@ -458,6 +463,16 @@ mod tests {
         let r = split("SELECT 1; /* unterminated comment");
         assert!(!r.is_empty());
         assert_eq!(r[0], "SELECT 1");
+    }
+
+    #[test]
+    fn unterminated_block_comment_does_not_split_on_inner_semicolon() {
+        // Regression: `skip_block_comment` previously returned the
+        // pre-EOF index when depth never hit 0, so the splitter
+        // re-entered the loop on bytes inside the unterminated
+        // comment. A `;` there was misread as a statement boundary.
+        let r = split("SELECT 1; /* unterminated; SELECT 2");
+        assert_eq!(r, vec!["SELECT 1"]);
     }
 
     #[test]

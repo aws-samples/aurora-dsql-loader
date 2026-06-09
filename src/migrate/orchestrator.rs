@@ -265,7 +265,9 @@ async fn open_source(
 /// Build the `LoadArgs` for a single COPY block. Forwards the migrate
 /// knobs and fills in the pg_dump-specific defaults (no header, no
 /// delimiter overrides, no column mappings — pg_dump COPY is positional
-/// and the loader's pg_dump reader handles column reordering internally).
+/// and the coordinator reorders the target schema by column name to
+/// match the COPY clause; see `align_pgdump_schema_to_copy_columns` in
+/// `coordination::coordinator`).
 fn build_load_args(args: &MigrateArgs, table: &str, schema: &str) -> LoadArgs {
     LoadArgs {
         endpoint: args.endpoint.clone(),

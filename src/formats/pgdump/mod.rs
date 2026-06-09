@@ -1,7 +1,12 @@
-//! PostgreSQL pg_dump (plain --data-only) input format.
+//! PostgreSQL pg_dump (plain `-Fp`) format support.
 //!
-//! Parses the `COPY <schema>.<table> (cols...) FROM stdin;` ... `\.` block
-//! emitted by `pg_dump` and feeds rows through the existing FileReader pipeline.
+//! Two related primitives live here:
+//! - [`PgDumpReader`] — feeds the rows of one `COPY <schema>.<table>
+//!   (cols...) FROM stdin;` ... `\.` block through the FileReader
+//!   pipeline. Used by the `load --format pgdump` path.
+//! - [`extract_ddl`] / [`list_copy_blocks`] — scan a full dump (DDL +
+//!   data, no `--data-only`) and slice the non-data DDL between COPY
+//!   blocks. Used by the migrate orchestrator.
 
 mod escape;
 mod reader;

@@ -2,8 +2,7 @@
 //! it for DSQL via `dsql-lint`, apply it to the cluster, then load the data.
 //!
 //! Composed of small, testable pieces (extract / transform / apply / load),
-//! glued together by [`run_migrate`] — see the per-task spec in
-//! `docs/plans/2026-06-02-pgdump-migrate-three-layer.md`.
+//! glued together by [`run_migrate`].
 
 mod apply;
 mod orchestrator;
