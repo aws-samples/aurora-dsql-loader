@@ -1014,20 +1014,14 @@ COPY public.t (id, x) FROM stdin;
         );
     }
 
-    /// L1 cross-check: a parser-injected drop must surface as
-    /// `LoaderDropped(N)` even when L2 looks clean (target_delta ==
-    /// records_loaded). We can't easily inject a parser drop into pgdump
-    /// inside this test (the reader is well-behaved on a fresh dump), so
-    /// this test validates the verdict shape via direct `classify()` —
-    /// the integration coverage for L1 lives at the unit-test level
-    /// already. The integration value here is that the orchestrator
-    /// would forward `source_rows: Some(...)` through to `classify`.
+    /// Symmetric to unfixable_does_not_build_pool with verify=Count
+    /// requested: when transform_ddl surfaces unfixable, no tables load
+    /// and no verify outcomes get built. Pins that a future change which
+    /// runs verify before the unfixable short-circuit would surface
+    /// here — the design doc calls this out as a critical safety
+    /// invariant.
     #[tokio::test]
     async fn run_migrate_verify_unfixable_short_circuits_no_verify_outcome() {
-        // Symmetric to unfixable_does_not_build_pool: when
-        // transform_ddl surfaces unfixable, no tables load and no verify
-        // outcomes get built. Pins that a future change which runs
-        // verify before the unfixable short-circuit would surface here.
         let pool = Pool::sqlite_in_memory().await.unwrap();
         let dump = "\
 ALTER TABLE public.events ALTER COLUMN id SET DEFAULT nextval('public.events_id_seq'::regclass);

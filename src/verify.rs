@@ -34,6 +34,15 @@ pub enum VerifyMode {
     #[default]
     Off,
     /// L2 is on: pre/post `count(*)` per loaded table.
+    ///
+    /// **Sole-writer assumption.** L2 compares `target_post -
+    /// target_pre` against `records_loaded`. If anyone else writes to
+    /// the same target table between pre-count and post-count the
+    /// verdict reflects the combined delta — concurrent inserts surface
+    /// as `ExtraTarget`, concurrent deletes as `MissingTarget`. The
+    /// operator owns ensuring no other writer touches the target during
+    /// the load window. `migrate` against a fresh cluster satisfies
+    /// this by construction.
     Count,
 }
 
@@ -267,9 +276,13 @@ mod tests {
     }
 
     #[test]
-    fn l1_drop_takes_precedence_over_l2_match() {
-        // L2 looks fine in isolation (delta == loaded) but L1 sees a drop.
-        // The drop is the more actionable signal, so it wins.
+    fn l1_drop_takes_precedence_over_l2_missing_target() {
+        // Both layers see a problem: L1 sees 10 rows dropped before the
+        // DB layer (source=100 vs loaded=90), L2 sees 10 rows missing
+        // at the target (delta=80 vs loaded=90 under Error). L1 is the
+        // root cause — without it the L2 shortfall has no explanation —
+        // so its verdict wins. A regression that returns `MissingTarget`
+        // here would hide the L1 signal behind a downstream symptom.
         let v = classify(inputs(
             VerifyMode::Count,
             OnConflict::Error,
@@ -277,7 +290,7 @@ mod tests {
             90,
             0,
             Some(0),
-            Some(90),
+            Some(80),
         ));
         assert_eq!(v, VerifyVerdict::LoaderDropped(10));
     }

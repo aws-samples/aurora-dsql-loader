@@ -5019,4 +5019,105 @@ mod tests {
         assert_eq!(v.target_post_count, Some(5));
         Ok(())
     }
+
+    /// Regression: `--if-not-exists` + `--verify=count` against a table
+    /// that already exists with rows must NOT report `ExtraTarget`. The
+    /// flag is idempotent; an operator who runs the same load twice is
+    /// the canonical case. Earlier impl recorded `target_pre_count = 0`
+    /// unconditionally when create_table_if_missing was true, producing
+    /// a false `ExtraTarget(N)` on every re-run. Fix: skip L2 entirely
+    /// in this mode; report L1-only Match.
+    #[tokio::test]
+    async fn csv_load_with_if_not_exists_and_verify_count_skips_l2() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "verify.csv", 10).await;
+
+        // Pre-create the target with rows already present — simulates a
+        // prior run that loaded data, plus the operator re-running with
+        // --if-not-exists for idempotency.
+        let pool =
+            setup_sqlite_table("verify_idem", "id TEXT, name TEXT, value TEXT, amount TEXT").await;
+        if let Ok(mut conn) = pool.acquire().await
+            && let crate::db::pool::PoolConnection::Sqlite(ref mut c) = conn
+        {
+            sqlx::query("INSERT INTO verify_idem VALUES ('99', 'pre', '0.5', '0')")
+                .execute(&mut **c)
+                .await
+                .unwrap();
+        }
+
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path,
+            target_table: "verify_idem".to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            // The flag under test: --if-not-exists path must NOT cause
+            // a bogus ExtraTarget verdict when the table is pre-populated.
+            create_table_if_missing: true,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            verify: VerifyMode::Count,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: Some(true),
+            test_pool: Some(pool.clone()),
+        };
+        let result = run_load(args).await.unwrap();
+        let v = result
+            .verify
+            .as_ref()
+            .expect("verify=Count must produce a VerifyOutcome");
+        // L2 must be skipped under --if-not-exists.
+        assert_eq!(v.target_pre_count, None);
+        assert_eq!(v.target_post_count, None);
+        // CSV has no exact source row count, so L1 also yields the
+        // skipped verdict (proves we routed through classify and didn't
+        // synthesise a bogus Match).
+        assert_eq!(
+            v.verdict,
+            crate::verify::VerifyVerdict::SkippedNoExactSourceCount,
+            "csv + --if-not-exists must yield SkippedNoExactSourceCount, not ExtraTarget"
+        );
+    }
+
+    /// Companion to the CSV test: pgdump under `--if-not-exists` +
+    /// `--verify=count` must reach L1 Match (source_rows is exact for
+    /// pgdump) and skip L2 (target_pre/post None) — never ExtraTarget.
+    /// Note: `validate_load_args` rejects `--if-not-exists` with pgdump
+    /// today, so the run won't even reach the verify path; this test
+    /// exists as a tripwire — if a future change relaxes the validation
+    /// (e.g. pgdump schema inference lands), the verify behavior under
+    /// `--if-not-exists` must still be correct.
+    #[tokio::test]
+    async fn pgdump_with_if_not_exists_is_rejected_at_validation() -> anyhow::Result<()> {
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.things (id, name) FROM stdin;")?;
+        writeln!(f, "1\twidget")?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let pool = setup_sqlite_table("things", "id INTEGER, name TEXT").await;
+        let mut args = pgdump_load_args(f.path().to_string_lossy().into_owned(), "things", pool);
+        args.create_table_if_missing = true;
+        args.verify = VerifyMode::Count;
+        let err = run_load(args).await.unwrap_err().to_string();
+        assert!(
+            err.contains("create_table_if_missing"),
+            "pgdump + --if-not-exists must be rejected at validation; got: {err}"
+        );
+        Ok(())
+    }
 }

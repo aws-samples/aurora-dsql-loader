@@ -115,6 +115,11 @@ struct LoadParams {
     /// ExtraTarget / RowsConflictedAtTarget / SkippedNoExactSourceCount).
     /// Off by default on `load` to avoid the `count(*)` cost on a
     /// pre-existing target; on by default on `migrate` (fresh-cluster).
+    /// `count` assumes the loader is the sole writer of the target table
+    /// during the run — concurrent writers between pre-count and
+    /// post-count will skew the verdict. With `--if-not-exists` only the
+    /// L1 (source-vs-loader) cross-check is reported; L2 is skipped
+    /// because the table doesn't exist at pre-count time.
     #[arg(long, default_value = "off")]
     verify: String,
 
@@ -246,6 +251,9 @@ enum Command {
         /// and reports an L1+L2 verdict per table. Pre-counts on a fresh
         /// cluster are sub-ms; the `count(*)` cost on the loaded data is
         /// well within "no meaningful cost" for a migration window.
+        /// Assumes the loader is the sole writer of each target table
+        /// during the run — fresh-cluster `migrate` satisfies this by
+        /// construction.
         #[arg(long, default_value = "count")]
         verify: String,
 
@@ -501,6 +509,26 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
             }
             if let Some(v) = &t.verify {
                 println!("    Verify: {}", format_verdict(&v.verdict));
+                // Print the underlying counts on a non-Match verdict so an
+                // operator can see the magnitudes in the summary without
+                // re-running with --debug or grepping the manifest.
+                if !matches!(
+                    v.verdict,
+                    VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
+                ) {
+                    println!(
+                        "      counts: source={src}, loaded={loaded}, failed={failed}, target_pre={pre}, target_post={post}",
+                        src = v.source_rows.map_or("n/a".to_string(), |n| n.to_string()),
+                        loaded = v.records_loaded,
+                        failed = v.records_failed,
+                        pre = v
+                            .target_pre_count
+                            .map_or("n/a".to_string(), |n| n.to_string()),
+                        post = v
+                            .target_post_count
+                            .map_or("n/a".to_string(), |n| n.to_string()),
+                    );
+                }
             }
         }
         // The orchestrator halts on the first failed table. If the last
@@ -725,6 +753,23 @@ async fn run_loader(
     }
     if let Some(v) = &result.verify {
         println!("Verify: {}", format_verdict(&v.verdict));
+        if !matches!(
+            v.verdict,
+            VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
+        ) {
+            println!(
+                "  counts: source={src}, loaded={loaded}, failed={failed}, target_pre={pre}, target_post={post}",
+                src = v.source_rows.map_or("n/a".to_string(), |n| n.to_string()),
+                loaded = v.records_loaded,
+                failed = v.records_failed,
+                pre = v
+                    .target_pre_count
+                    .map_or("n/a".to_string(), |n| n.to_string()),
+                post = v
+                    .target_post_count
+                    .map_or("n/a".to_string(), |n| n.to_string()),
+            );
+        }
     }
 
     // Warn if significantly fewer records were loaded than estimated
