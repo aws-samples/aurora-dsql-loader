@@ -274,6 +274,11 @@ pub struct LoadResult {
     /// Sum of per-chunk row estimates obtained by sampling the source bytes;
     /// used to flag a large delta vs records actually loaded.
     pub estimated_rows: Option<u64>,
+    /// Exact source-row count summed across all chunks. `Some` only when every
+    /// chunk reported a count (pgdump and parquet do; csv/tsv leave `None`),
+    /// so a single missing chunk count collapses the total to `None`. Drives
+    /// the L1 verification cross-check.
+    pub source_rows: Option<u64>,
     pub duration: Duration,
     /// Detailed results for each chunk (accessed in integration tests)
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1069,6 +1074,16 @@ impl Coordinator {
 
         let total_records_loaded: u64 = chunk_results.iter().map(|r| r.records_loaded).sum();
         let total_records_failed: u64 = chunk_results.iter().map(|r| r.records_failed).sum();
+        // Sum source-row counts only when every chunk reported one; a single
+        // missing count (e.g. csv/tsv reader, or a chunk-result file from a
+        // pre-verify run that had no field) collapses the whole total to
+        // `None` so the L1 verdict path skips cleanly with
+        // `SkippedNoExactSourceCount` instead of comparing against a
+        // partial sum.
+        let total_source_rows: Option<u64> = chunk_results
+            .iter()
+            .map(|r| r.source_rows_in_chunk)
+            .try_fold(0u64, |acc, n| n.map(|x| acc + x));
         let duration = start_time.elapsed();
 
         // Warn if significantly fewer records were processed than estimated
@@ -1097,6 +1112,7 @@ impl Coordinator {
             records_loaded: total_records_loaded,
             records_failed: total_records_failed,
             estimated_rows: Some(total_estimated).filter(|&e| e > 0),
+            source_rows: total_source_rows,
             duration,
             chunk_results,
         })

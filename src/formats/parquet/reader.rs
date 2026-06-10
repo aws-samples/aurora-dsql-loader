@@ -92,10 +92,18 @@ impl<R: ByteReader + Clone + 'static> GenericParquetReader<R> {
             all_records.extend(records);
         }
 
+        // Sum the parser-independent row count from the footer metadata
+        // captured at file open. Drives the L1 verification cross-check.
+        let source_rows: u64 = row_group_indices
+            .iter()
+            .filter_map(|&idx| self.row_groups.get(idx).map(|rg| rg.num_rows))
+            .sum();
+
         Ok(ChunkData {
             records: all_records,
             bytes_read,
             parse_errors: 0,
+            source_rows_in_chunk: Some(source_rows),
         })
     }
 }

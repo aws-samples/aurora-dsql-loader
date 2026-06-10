@@ -64,6 +64,15 @@ pub struct ChunkData {
     pub bytes_read: u64,
     /// Number of records that failed to parse
     pub parse_errors: u64,
+    /// Exact number of source rows present in this chunk's byte range, computed
+    /// by the reader before parsing. `Some` only for formats that can tally
+    /// rows independently of the parser (pgdump: `\n` byte count tee'd off the
+    /// raw read; parquet: footer row-group total). `None` for csv/tsv where
+    /// quote-aware exact counting would require a second parse — these formats
+    /// continue to surface the existing `estimated_rows` for operator
+    /// visibility instead. Drives the L1 verification cross-check against
+    /// `records_loaded + records_failed`.
+    pub source_rows_in_chunk: Option<u64>,
 }
 
 /// Build newline-aligned `Chunk`s over the byte range `[start, end)` from

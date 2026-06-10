@@ -74,6 +74,16 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
             .await
             .context("Failed to read chunk data")?;
 
+        // Tee an exact source-row count off the raw bytes BEFORE parsing.
+        // pg_dump escapes embedded `\n` as the two literal bytes `\` `n`, so
+        // every byte-newline inside `[data_start, data_end)` corresponds to
+        // exactly one record. The `\.` terminator line is excluded by chunk
+        // construction (`data_end` stops at the start of `\.` — see
+        // scan.rs CopyBlock docs), so no end-of-block adjustment is needed.
+        // Drives the L1 verification cross-check against
+        // `records_loaded + records_failed`.
+        let source_rows = buffer.iter().filter(|&&b| b == b'\n').count() as u64;
+
         let expected_columns = self.block.columns.len();
         let mut records = Vec::new();
         let mut parse_errors = 0u64;
@@ -102,6 +112,7 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
             records,
             bytes_read: chunk.end_offset - chunk.start_offset,
             parse_errors,
+            source_rows_in_chunk: Some(source_rows),
         })
     }
 }
@@ -113,4 +124,74 @@ fn split_lines(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
     let buf = buf.strip_suffix(b"\n").unwrap_or(buf);
     buf.split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::pgdump::scan::find_copy_block;
+    use crate::io::LocalFileByteReader;
+    use std::io::Write;
+
+    /// Pin the L1 invariant: source_rows_in_chunk equals the exact source-row
+    /// count for the COPY block. Each `\n` in `[data_start, data_end)` is one
+    /// record, the `\.` terminator is excluded by chunk construction.
+    #[tokio::test]
+    async fn pgdump_read_chunk_source_rows_matches_record_count() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "-- preamble").unwrap();
+        writeln!(f, "COPY public.t (id, name) FROM stdin;").unwrap();
+        for i in 0..10 {
+            writeln!(f, "{i}\tname{i}").unwrap();
+        }
+        writeln!(f, "\\.").unwrap();
+        f.flush().unwrap();
+
+        let reader = LocalFileByteReader::new(f.path());
+        let block = find_copy_block(&reader, "public", "t").await.unwrap();
+        let pgdump = PgDumpReader::from_block(reader, block);
+        let chunks = pgdump.create_chunks(1024 * 1024).await.unwrap();
+        let chunk_data = pgdump.read_chunk(&chunks[0]).await.unwrap();
+        assert_eq!(
+            chunk_data.source_rows_in_chunk,
+            Some(10),
+            "source_rows must equal the 10 data rows in the COPY block"
+        );
+        assert_eq!(chunk_data.records.len(), 10);
+        assert_eq!(chunk_data.parse_errors, 0);
+    }
+
+    /// Pin the empty-line invariant called out in the design doc: every
+    /// byte-newline in a pgdump COPY block corresponds to a record OR a
+    /// `parse_error`. A future change that drops empty lines silently would
+    /// break L1's source-vs-loader cross-check.
+    #[tokio::test]
+    async fn pgdump_empty_line_counts_as_parse_error_so_l1_holds() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "COPY public.t (id, name) FROM stdin;").unwrap();
+        writeln!(f, "1\talpha").unwrap();
+        // Empty line in the middle of the COPY block — pg_dump never emits
+        // these, but a hand-edited or corrupted dump might. Must surface
+        // as a parse_error, not a silent drop.
+        writeln!(f).unwrap();
+        writeln!(f, "2\tbeta").unwrap();
+        writeln!(f, "\\.").unwrap();
+        f.flush().unwrap();
+
+        let reader = LocalFileByteReader::new(f.path());
+        let block = find_copy_block(&reader, "public", "t").await.unwrap();
+        let pgdump = PgDumpReader::from_block(reader, block);
+        let chunks = pgdump.create_chunks(1024 * 1024).await.unwrap();
+        let chunk_data = pgdump.read_chunk(&chunks[0]).await.unwrap();
+        assert_eq!(
+            chunk_data.source_rows_in_chunk,
+            Some(3),
+            "source_rows counts every \\n: 2 valid rows + 1 empty line"
+        );
+        assert_eq!(chunk_data.records.len(), 2);
+        assert_eq!(
+            chunk_data.parse_errors, 1,
+            "the empty line must surface as a parse_error so L1 cross-check stays in sync"
+        );
+    }
 }

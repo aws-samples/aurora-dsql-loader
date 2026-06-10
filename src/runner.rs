@@ -16,6 +16,11 @@ pub use crate::migrate::{
     TableLoadSummary, run_migrate,
 };
 
+// Re-export the verification surface — `VerifyMode` is set by the CLI on
+// `LoadArgs`, and `VerifyOutcome` / `VerifyVerdict` ship as fields of
+// `LoadResult` and `TableLoadSummary`.
+pub use crate::verify::{VerifyMode, VerifyOutcome, VerifyVerdict};
+
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;
@@ -111,6 +116,14 @@ pub struct LoadArgs {
     // Conflict resolution strategy
     pub on_conflict: OnConflict,
 
+    /// Post-load verification mode (L2 target `count(*)`). L1 source-row
+    /// cross-check always runs when the format provides exact source rows
+    /// (pgdump, parquet); `Off` only suppresses L2.
+    /// Default per-entry-point: `migrate` runs `Count`; plain `load` runs
+    /// `Off` (the operator opts in via `--verify=count` to absorb the
+    /// `count(*)` cost on a pre-existing target).
+    pub verify: VerifyMode,
+
     // Columns to exclude from INSERT statements (DB applies DEFAULT values)
     pub exclude_columns: Vec<String>,
 
@@ -138,6 +151,16 @@ pub struct LoadResult {
     pub records_failed: u64,
     /// Estimated row count from file size (for mismatch detection)
     pub estimated_rows: Option<u64>,
+    /// Exact source-row count summed across chunks. `Some` for pgdump and
+    /// parquet (parser-independent counts); `None` for csv/tsv (no exact
+    /// count in v1 — the v2 sample-hash work covers the gap).
+    pub source_rows: Option<u64>,
+    /// Verdict from the count-level verification layer. `None` when verify
+    /// mode is `Off` AND the load wasn't routed through an entry point that
+    /// always builds a verdict (today: only the migrate orchestrator runs
+    /// verify automatically). When present, `verdict` holds the most
+    /// actionable signal — see [`VerifyVerdict`].
+    pub verify: Option<VerifyOutcome>,
     pub duration: Duration,
     /// Path to persisted manifest directory (if errors occurred and temp dir was used)
     pub persisted_manifest_dir: Option<PathBuf>,
@@ -155,7 +178,7 @@ pub struct LoadResult {
 /// # Example
 ///
 /// ```no_run
-/// use aurora_dsql_loader::runner::{LoadArgs, Format, OnConflict, run_load};
+/// use aurora_dsql_loader::runner::{LoadArgs, Format, OnConflict, VerifyMode, run_load};
 /// use std::collections::HashMap;
 ///
 /// # async fn example() -> anyhow::Result<()> {
@@ -178,6 +201,7 @@ pub struct LoadResult {
 ///     debug: false,
 ///     resume_job_id: None,
 ///     on_conflict: OnConflict::DoNothing,
+///     verify: VerifyMode::Off,
 ///     delimiter: None,
 ///     quote: None,
 ///     escape: None,
@@ -200,7 +224,62 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     // who skip `run_load` still get the same checks.
     validate_load_args(&args)?;
     let pool = build_pool(&args).await?;
-    run_load_with_pool(pool, args).await
+
+    // Capture the target pre-count BEFORE the load when L2 verify is on.
+    // With `--if-not-exists`, the table might not be created yet — in
+    // that case the run_load path will create it inside
+    // `run_load_with_pool` and the pre-count is 0 by construction.
+    // Without `--if-not-exists`, the table must already exist and we
+    // propagate any count failure.
+    let target_pre_count = if args.verify == VerifyMode::Count {
+        if args.create_table_if_missing {
+            Some(0)
+        } else {
+            Some(
+                crate::verify::count_table_rows(&pool, &args.schema, &args.target_table)
+                    .await
+                    .context("verify=count: failed to read target pre-count")?,
+            )
+        }
+    } else {
+        None
+    };
+
+    let schema = args.schema.clone();
+    let target_table = args.target_table.clone();
+    let on_conflict = args.on_conflict;
+    let verify_mode = args.verify;
+
+    let mut result = run_load_with_pool(pool.clone(), args).await?;
+
+    if verify_mode == VerifyMode::Count {
+        let target_post_count = Some(
+            crate::verify::count_table_rows(&pool, &schema, &target_table)
+                .await
+                .context("verify=count: failed to read target post-count")?,
+        );
+        let verdict = crate::verify::classify(crate::verify::VerifyInputs {
+            mode: verify_mode,
+            on_conflict,
+            source_rows: result.source_rows,
+            records_loaded: result.records_loaded,
+            records_failed: result.records_failed,
+            target_pre_count,
+            target_post_count,
+        });
+        result.verify = Some(VerifyOutcome {
+            schema,
+            table: target_table,
+            source_rows: result.source_rows,
+            records_loaded: result.records_loaded,
+            records_failed: result.records_failed,
+            target_pre_count,
+            target_post_count,
+            verdict,
+        });
+    }
+
+    Ok(result)
 }
 
 /// Build the connection pool from `args`, with the `#[cfg(test)] test_pool`
@@ -375,12 +454,20 @@ async fn run_load_with_pool_and_reader(
         None
     };
 
+    // L2 verify (target pre/post counts) is the orchestrator's job — it
+    // runs the `count(*)` queries because it owns the per-table loop and
+    // can choose which tables to verify. `run_load_with_pool_and_reader`
+    // ships only the L1 inputs (`source_rows`); the orchestrator builds
+    // the `VerifyOutcome` later when it has the full picture, or skips
+    // verification entirely on the plain-load path with `--verify=off`.
     Ok(LoadResult {
         job_id: result.job_id,
         chunks_processed: result.chunks_processed,
         records_loaded: result.records_loaded,
         records_failed: result.records_failed,
         estimated_rows: result.estimated_rows,
+        source_rows: result.source_rows,
+        verify: None,
         duration: result.duration,
         persisted_manifest_dir,
     })
@@ -679,6 +766,7 @@ mod tests {
             column_mappings: Default::default(),
             resume_job_id: None,
             on_conflict: OnConflict::DoNothing,
+            verify: VerifyMode::Off,
             exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,

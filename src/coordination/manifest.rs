@@ -194,6 +194,14 @@ pub struct ChunkResultFile {
     pub completed_at: String, // ISO 8601
     pub duration_secs: u64,
     pub errors: Vec<ErrorRecord>,
+    /// Exact source-row count for this chunk's byte range, computed by the
+    /// reader (parser-independent). `Some` for pgdump and parquet; `None` for
+    /// csv/tsv. Aggregated across chunks into `LoadResult.source_rows` and
+    /// drives the L1 verification cross-check. `skip_serializing_if` keeps
+    /// pre-verify manifests deserializable without rewriting their result
+    /// files (the field defaults to `None` on read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rows_in_chunk: Option<u64>,
 }
 
 /// Record of an error that occurred during processing.

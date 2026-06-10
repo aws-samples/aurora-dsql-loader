@@ -23,7 +23,7 @@ mod tests {
             parquet::GenericParquetReader,
         },
         io::LocalFileByteReader,
-        runner::{Format, LoadArgs, MigrateArgs, run_load, run_migrate},
+        runner::{Format, LoadArgs, MigrateArgs, VerifyMode, run_load, run_migrate},
     };
     use arrow::array::*;
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -508,6 +508,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: Some(true),
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
 
@@ -596,6 +597,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: None,
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
 
@@ -737,6 +739,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: Some(true),
+            verify: VerifyMode::Off,
             test_pool: Some(pool),
         };
 
@@ -1007,6 +1010,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: Some(true),
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
 
@@ -1109,6 +1113,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: Some(true),
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
 
@@ -1199,6 +1204,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: Some(true),
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
 
@@ -1321,6 +1327,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: Some(true),
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
 
@@ -1417,6 +1424,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: Some(true),
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
 
@@ -1918,6 +1926,7 @@ mod tests {
             quote: Some("'".to_string()),
             escape: Some("\\".to_string()),
             has_header: Some(false),
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
 
@@ -2091,6 +2100,7 @@ mod tests {
             quote,
             escape,
             has_header,
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
         run_load(args).await.unwrap()
@@ -2216,6 +2226,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: None,
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
         let result = run_load(args).await.unwrap();
@@ -2265,6 +2276,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: Some(true),
+            verify: VerifyMode::Off,
             test_pool: Some(pool.clone()),
         };
         let result = run_load(args).await.unwrap();
@@ -2339,6 +2351,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: Some(true),
+            verify: VerifyMode::Off,
             test_pool: Some(pool),
         };
         let err = run_load(args).await.expect_err("must reject");
@@ -3994,6 +4007,7 @@ mod tests {
             column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: OnConflict::DoNothing,
+            verify: VerifyMode::Off,
             exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
@@ -4301,6 +4315,7 @@ mod tests {
             quote: None,
             escape: None,
             has_header: None,
+            verify: VerifyMode::Off,
             test_pool: Some(pool),
         };
 
@@ -4520,6 +4535,10 @@ mod tests {
             batch_concurrency: 1,
             chunk_size_bytes: 1024 * 1024,
             on_conflict: OnConflict::Error,
+            // Exercise the migrate default end-to-end: every loaded table
+            // gets a VerifyOutcome and the assertions below pin the verdict
+            // shape we promise (`Match` for both tables on a fresh cluster).
+            verify: VerifyMode::Count,
             quiet: true,
             debug: false,
             test_pool: None,
@@ -4570,6 +4589,39 @@ mod tests {
                 .build()?,
         )
         .await?;
+
+        // ── Stage 1.5: per-table verification verdict ───────────────────
+        // The migrate orchestrator runs verify=Count by default; assert
+        // every loaded table came back with Match. Catches a real-cluster
+        // regression where rows go missing between the loader and DSQL —
+        // which is exactly what L1+L2 was added to surface.
+        for t in &report.tables {
+            let v = t.verify.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "verify must be Some on {}.{} under default migrate verify=Count",
+                    t.schema, t.table
+                )
+            });
+            assert_eq!(
+                v.verdict,
+                crate::runner::VerifyVerdict::Match,
+                "{}.{} expected Match, got {:?} (source_rows={:?}, loaded={}, failed={}, target_pre={:?}, target_post={:?})",
+                t.schema,
+                t.table,
+                v.verdict,
+                v.source_rows,
+                v.records_loaded,
+                v.records_failed,
+                v.target_pre_count,
+                v.target_post_count,
+            );
+            assert!(
+                v.source_rows.is_some(),
+                "pgdump must produce exact source_rows; got None for {}.{}",
+                t.schema,
+                t.table,
+            );
+        }
 
         // ── Stage 2: schema shape on the destination ───────────────────
         // SERIAL → identity on both PK columns.
@@ -4800,6 +4852,171 @@ mod tests {
             0,
             "column-set guard must reject before any rows are inserted"
         );
+        Ok(())
+    }
+
+    // ============ Verification (source_rows + LoadResult.verify) ============
+
+    /// `LoadResult.source_rows` reflects the exact pgdump source-row count
+    /// (one `\n` per record). Pin the pgdump leg of L1's input.
+    #[tokio::test]
+    async fn pgdump_load_populates_source_rows_exact_count() -> anyhow::Result<()> {
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.things (id, name) FROM stdin;")?;
+        for i in 0..10 {
+            writeln!(f, "{i}\titem{i}")?;
+        }
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let pool = setup_sqlite_table("things", "id INTEGER, name TEXT").await;
+        let args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            "things",
+            pool.clone(),
+        );
+        let result = run_load(args).await?;
+
+        assert_eq!(result.source_rows, Some(10));
+        assert_eq!(result.records_loaded, 10);
+        assert_eq!(result.records_failed, 0);
+        // verify=Off (the load default) → no VerifyOutcome.
+        assert!(result.verify.is_none());
+        Ok(())
+    }
+
+    /// `LoadResult.source_rows` for parquet equals the sum of the chunk's
+    /// row-group `num_rows`. Pin the parquet leg of L1's input.
+    #[tokio::test]
+    async fn parquet_load_populates_source_rows_exact_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("verify.parquet");
+        let schema = ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let file = std::fs::File::create(&parquet_path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(20)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props)).unwrap();
+        let id_array = Int32Array::from_iter_values(0..50);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(id_array)]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let pool = setup_sqlite_table("verify_pq", "id INTEGER").await;
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: parquet_path.to_str().unwrap().to_string(),
+            target_table: "verify_pq".to_string(),
+            schema: "public".to_string(),
+            format: Format::Parquet,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            verify: VerifyMode::Off,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: None,
+            test_pool: Some(pool.clone()),
+        };
+        let result = run_load(args).await.unwrap();
+        assert_eq!(result.source_rows, Some(50));
+        assert_eq!(result.records_loaded, 50);
+    }
+
+    /// CSV/TSV: `source_rows` is `None` (quote-aware exact counting is v2).
+    /// Pin the SkippedNoExactSourceCount path: with verify=Count and source
+    /// counts None, the verdict short-circuits.
+    #[tokio::test]
+    async fn csv_load_with_verify_count_yields_skipped_verdict() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "verify.csv", 10).await;
+        let pool =
+            setup_sqlite_table("verify_csv", "id TEXT, name TEXT, value TEXT, amount TEXT").await;
+        let args = LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path,
+            target_table: "verify_csv".to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            chunk_size_bytes: 10_000_000,
+            batch_size: 100,
+            batch_concurrency: 1,
+            create_table_if_missing: false,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            verify: VerifyMode::Count,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: Some(true),
+            test_pool: Some(pool.clone()),
+        };
+        let result = run_load(args).await.unwrap();
+        assert_eq!(
+            result.source_rows, None,
+            "csv must leave source_rows None in v1"
+        );
+        let v = result
+            .verify
+            .as_ref()
+            .expect("verify=Count must produce a VerifyOutcome");
+        assert_eq!(
+            v.verdict,
+            crate::verify::VerifyVerdict::SkippedNoExactSourceCount,
+            "csv with verify=Count must yield SkippedNoExactSourceCount"
+        );
+    }
+
+    /// run_load with verify=Count on a pgdump fixture produces
+    /// VerifyVerdict::Match. Pre-count is captured against the existing
+    /// (empty) target, post-count reflects the loaded rows.
+    #[tokio::test]
+    async fn pgdump_run_load_verify_count_matches() -> anyhow::Result<()> {
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.things (id, name) FROM stdin;")?;
+        for i in 0..5 {
+            writeln!(f, "{i}\tname{i}")?;
+        }
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let pool = setup_sqlite_table("things", "id INTEGER, name TEXT").await;
+        let mut args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            "things",
+            pool.clone(),
+        );
+        args.verify = VerifyMode::Count;
+        let result = run_load(args).await?;
+        let v = result
+            .verify
+            .as_ref()
+            .expect("verify=Count must produce a VerifyOutcome");
+        assert_eq!(v.verdict, crate::verify::VerifyVerdict::Match);
+        assert_eq!(v.source_rows, Some(5));
+        assert_eq!(v.target_pre_count, Some(0));
+        assert_eq!(v.target_post_count, Some(5));
         Ok(())
     }
 }
