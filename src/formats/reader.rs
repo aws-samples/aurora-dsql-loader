@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::delimited::reader::GenericDelimitedReader;
 use super::parquet::GenericParquetReader;
+use super::pgdump::PgDumpReader;
 use crate::io::{
     ByteReader, LocalFileByteReader, S3ByteReader, SourceUri, estimate_rows_in_range,
     find_next_record_boundary,
@@ -27,10 +28,33 @@ pub struct Chunk {
     pub estimated_rows: Option<u64>,
 }
 
-/// A single record (row) from the file
+/// A single record (row) from the file.
+///
+/// Each reader populates `fields[i]` according to its format's NULL convention:
+/// - **pg_dump:** `\N` → `None`, genuine empty string → `Some("")`. Preserves
+///   the `\N` vs `""` distinction pg_dump emits at the byte level.
+/// - **CSV / TSV / parquet:** any field whose trimmed text is empty → `None`.
+///   Mirrors the legacy worker-side inference these formats relied on.
+///
+/// The worker uses the discriminator verbatim — no further inference — so
+/// each format owns its NULL semantics end-to-end.
 #[derive(Debug, Clone)]
 pub struct Record {
-    pub fields: Vec<String>,
+    pub fields: Vec<Option<String>>,
+}
+
+impl Record {
+    /// Construct a record from raw text fields under the trim-empty
+    /// convention: any field whose trimmed text is empty becomes `None`.
+    /// Used by CSV/TSV/parquet; pg_dump constructs `Record { fields: ... }`
+    /// directly from its byte-level NULL discriminator.
+    pub fn from_text_fields(fields: Vec<String>) -> Self {
+        let fields = fields
+            .into_iter()
+            .map(|f| if f.trim().is_empty() { None } else { Some(f) })
+            .collect();
+        Self { fields }
+    }
 }
 
 /// Data from a chunk read
@@ -232,7 +256,6 @@ impl ReaderFactory {
         schema: &str,
         table: &str,
     ) -> Result<(Arc<dyn FileReader>, Vec<String>)> {
-        use crate::formats::pgdump::PgDumpReader;
         match source_uri {
             SourceUri::Local(path) => {
                 let byte_reader = LocalFileByteReader::new(path);
@@ -326,7 +349,33 @@ mod tests {
 
         assert_eq!(data.records.len(), 3);
         assert_eq!(data.records[0].fields.len(), 3);
-        assert_eq!(data.records[0].fields[0], "1");
-        assert_eq!(data.records[0].fields[1], "Alice");
+        assert_eq!(data.records[0].fields[0].as_deref(), Some("1"));
+        assert_eq!(data.records[0].fields[1].as_deref(), Some("Alice"));
+    }
+
+    /// Pin the trim-empty rule used by CSV/TSV/parquet readers and by
+    /// `mk_record` in worker tests. A regression here would silently
+    /// flip empty/whitespace handling for those formats.
+    #[test]
+    fn record_from_text_fields_trim_empty_rule() {
+        let r = Record::from_text_fields(vec![
+            "value".into(), // non-empty → Some
+            "".into(),      // empty → None
+            "   ".into(),   // whitespace-only → None (trim-empty)
+            "\t\n".into(),  // mixed whitespace → None
+            " v ".into(),   // surrounded by whitespace, non-empty → Some
+            "0".into(),     // literal "0" is non-empty → Some
+        ]);
+        assert_eq!(
+            r.fields,
+            vec![
+                Some("value".into()),
+                None,
+                None,
+                None,
+                Some(" v ".into()),
+                Some("0".into()),
+            ]
+        );
     }
 }

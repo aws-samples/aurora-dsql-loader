@@ -130,6 +130,86 @@ COPY clause. Order does not matter — the loader reorders columns by name to
 match the dump. A column-set mismatch (extra or missing columns) is rejected
 with a clear error before any rows are loaded.
 
+**Migrate a full pg_dump (DDL + data) into DSQL with one command:**
+
+```bash
+# 1. Generate a FULL dump (no --data-only) so the DDL is included.
+pg_dump -Fp mydb > mydb.sql
+
+# 2. Migrate. Schema and data land in DSQL automatically.
+aurora-dsql-loader migrate \
+  --endpoint your-cluster.dsql.us-east-1.on.aws \
+  --source-uri mydb.sql
+```
+
+`migrate` is a four-stage pipeline that runs end-to-end on a single
+connection pool:
+
+1. **Extract** the embedded DDL out of the dump (everything between the
+   `COPY ... FROM stdin;` blocks).
+2. **Transform** via [`dsql-lint`](https://crates.io/crates/dsql-lint),
+   which rewrites pg_dump output into DSQL-compatible DDL (e.g.
+   `CREATE INDEX` → `CREATE INDEX ASYNC`). See the dsql-lint docs for
+   the full rule set.
+3. **Apply** the transformed DDL to the cluster, one statement per
+   transaction (DSQL accepts only one DDL per txn). On re-run,
+   already-created tables / indexes / constraints / columns are skipped
+   by name so you can resume past a partial failure — schema-drift
+   detection is on you, the skip matches identity, not definition.
+4. **Load** each `COPY` block's data using the same connection pool —
+   no IAM round-trips between stages.
+
+Use `--dry-run` to preview the diagnostics + proposed DDL before
+committing:
+
+```bash
+aurora-dsql-loader migrate \
+  --endpoint your-cluster.dsql.us-east-1.on.aws \
+  --source-uri mydb.sql \
+  --dry-run
+```
+
+The dry run is offline for `file://` sources; for `s3://`, AWS config
+still loads to fetch the dump but DSQL itself is not contacted. Either
+way you can review a dump from a workstation that doesn't have DSQL
+access yet.
+
+**Known limits:**
+
+- Plain (`-Fp`) format only; `-Fc` / `-Fd` archives are rejected up
+  front. `--inserts` (INSERT-format dumps) is not supported either —
+  use the default `COPY FROM stdin` shape.
+- After loading explicit PK values into an `IDENTITY` column, the
+  identity counter is NOT auto-advanced. The migrate report includes a
+  warning per converted column; reset it after the load if the table is
+  pre-populated, e.g.:
+  ```sql
+  -- Look up the next value:
+  SELECT max(id) + 1 FROM t;
+  -- Then run, with <next> set to the value above:
+  ALTER TABLE t ALTER COLUMN id RESTART WITH <next>;
+  ```
+- Statements `dsql-lint` cannot auto-fix surface as `Unfixable`
+  diagnostics. The migrate flow refuses to apply DDL while any
+  unfixable diagnostic exists (the operator has to edit the dump and
+  re-run). The CLI prints each finding with a suggestion.
+- A `SET DEFAULT nextval(...)` whose matching `CREATE SEQUENCE` lives
+  in a different file (cross-file sequence reference) cannot be
+  collapsed and will surface as `Unfixable` — drop it from the dump or
+  inline the sequence.
+
+**Destructive-statement caveat:** `migrate` is intended for fresh /
+empty DSQL clusters. `dsql-lint` does not flag `DROP TABLE`,
+`DROP SCHEMA`, `DROP INDEX`, `DELETE`, or `UPDATE` statements; if your
+dump contains them (typical with `pg_dump --clean`, which prepends
+`DROP TABLE IF EXISTS …` to every CREATE), the migrate flow will
+execute them against the target without confirmation. The
+already-exists skip path makes a re-run safe for `CREATE` collisions
+only — it does not prevent a `DROP` from destroying data on the
+target. If you need to refresh into a populated cluster, drop the
+`--clean` flag from `pg_dump` and either truncate the target tables
+manually or migrate into a fresh cluster.
+
 ### CSV/TSV header behavior
 
 By default, the loader treats every row of a CSV or TSV file as data — it does

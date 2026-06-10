@@ -13,15 +13,11 @@ use crate::io::{ByteReader, estimate_rows_in_range};
 /// targeted COPY block are ignored (running pg_dump with `--data-only` is
 /// recommended, not required).
 ///
-/// **NULL handling:** PG's `\N` is decoded by `escape::decode_field` to an
-/// empty string, since the loader's `Record { fields: Vec<String> }` shape
-/// carries strings only. The downstream worker (`coordination/worker.rs`)
-/// then maps empty strings to SQL NULL when generating the INSERT row text,
-/// so functionally `\N → NULL` survives end-to-end. The trade-off is that real empty strings
-/// AND whitespace-only strings (the worker `trim()`s before the empty check)
-/// become indistinguishable from NULL; if your dataset depends on either
-/// distinction, do not use `--format pgdump` until proper `Option<String>`
-/// fidelity lands.
+/// **NULL handling:** the literal `\N` is the only NULL marker pg_dump emits
+/// in COPY text format. `escape::decode_field` returns `Option<String>` —
+/// `None` for `\N`, `Some("")` for a genuine empty field — which flows
+/// directly into `Record.fields`, so the worker emits SQL NULL only for
+/// `\N` and never collapses an empty string into NULL.
 pub struct PgDumpReader<R: ByteReader> {
     reader: R,
     block: CopyBlock,
@@ -33,6 +29,13 @@ impl<R: ByteReader> PgDumpReader<R> {
             .await
             .with_context(|| format!("locating COPY block for {schema}.{table}"))?;
         Ok(Self { reader, block })
+    }
+
+    /// Build from a pre-resolved [`CopyBlock`]. Lets the migrate path reuse a
+    /// single dump scan across N tables instead of re-walking the file
+    /// once per table inside `find_copy_block`.
+    pub fn from_block(reader: R, block: CopyBlock) -> Self {
+        Self { reader, block }
     }
 
     /// Column names declared in the COPY statement, in order.
@@ -84,9 +87,9 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
                 continue;
             }
 
-            // decode_field returns "" for `\N`; see PgDumpReader rustdoc for
-            // the trade-off (the worker also maps "" → SQL NULL on binding).
-            let fields: Vec<String> = line.split(|&b| b == b'\t').map(decode_field).collect();
+            // `\N` decodes to `None`; genuine empty string decodes to `Some("")`.
+            let fields: Vec<Option<String>> =
+                line.split(|&b| b == b'\t').map(decode_field).collect();
 
             if fields.len() != expected_columns {
                 parse_errors += 1;

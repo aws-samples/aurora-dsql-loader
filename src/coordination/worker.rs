@@ -33,14 +33,14 @@ fn apply_field_exclusion(
     let mut first_mismatch: Option<(usize, usize)> = None;
     for (idx, record) in records.into_iter().enumerate() {
         if record.fields.len() == full_len {
-            let kept: Vec<String> = record
+            let fields: Vec<Option<String>> = record
                 .fields
                 .into_iter()
                 .enumerate()
                 .filter(|(i, _)| !excluded_set.contains(i))
                 .map(|(_, f)| f)
                 .collect();
-            filtered.push(Record { fields: kept });
+            filtered.push(Record { fields });
         } else {
             first_mismatch.get_or_insert((idx, record.fields.len()));
             mismatch += 1;
@@ -533,19 +533,19 @@ impl Worker {
                 .iter()
                 .enumerate()
                 .map(|(col_idx, field)| {
-                    let trimmed = field.trim();
-
-                    // Handle NULL values (empty strings become NULL)
-                    if trimmed.is_empty() {
+                    // `field` is the reader's NULL discriminator: `None` →
+                    // SQL NULL, `Some(s)` → emit `s`. Each format owns its
+                    // NULL convention (see Record rustdoc).
+                    let Some(field) = field else {
                         return "NULL".to_string();
-                    }
+                    };
 
-                    // Escape the field value for SQL
                     let escaped = Self::escape_sql_string(field);
-
-                    // Add CAST() for types that need it
-                    // Only for PostgreSQL - SQLite doesn't handle CAST() well for DATE/TIME types
                     let value_expr = format!("'{}'", escaped);
+
+                    // PostgreSQL only: wrap in CAST() for non-text columns
+                    // so the server is the single source of truth for type
+                    // coercion. SQLite handles literals natively.
                     schema
                         .as_ref()
                         .and_then(|s| s.columns.get(col_idx))
@@ -607,12 +607,10 @@ impl Worker {
                             .fields
                             .iter()
                             .take(3)
-                            .map(|f| {
-                                if f.len() > 20 {
-                                    format!("{}...", &f[..20])
-                                } else {
-                                    f.clone()
-                                }
+                            .map(|f| match f {
+                                None => "NULL".to_string(),
+                                Some(s) if s.len() > 20 => format!("{}...", &s[..20]),
+                                Some(s) => s.clone(),
                             })
                             .collect();
                         format!(
@@ -932,9 +930,7 @@ mod field_exclusion_tests {
     use super::*;
 
     fn mk_record(fields: &[&str]) -> Record {
-        Record {
-            fields: fields.iter().map(|s| s.to_string()).collect(),
-        }
+        Record::from_text_fields(fields.iter().map(|s| s.to_string()).collect())
     }
 
     #[test]
@@ -948,7 +944,10 @@ mod field_exclusion_tests {
         let (filtered, mismatch, _first) = apply_field_exclusion(records, &[0, 3], 4);
         assert_eq!(mismatch, 0);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].fields, vec!["Alice", "alice@ex.com"]);
+        assert_eq!(
+            filtered[0].fields,
+            vec![Some("Alice".into()), Some("alice@ex.com".into())]
+        );
     }
 
     #[test]
@@ -961,7 +960,10 @@ mod field_exclusion_tests {
         let (filtered, mismatch, first) = apply_field_exclusion(records, &[0, 3], 4);
         assert_eq!(mismatch, 2);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].fields, vec!["Alice", "alice@ex.com"]);
+        assert_eq!(
+            filtered[0].fields,
+            vec![Some("Alice".into()), Some("alice@ex.com".into())]
+        );
         // First mismatch is the 2-field record at chunk index 1.
         assert_eq!(first, Some((1, 2)));
     }
@@ -972,7 +974,7 @@ mod field_exclusion_tests {
         let (filtered, mismatch, _first) = apply_field_exclusion(records, &[], 2);
         assert_eq!(mismatch, 0);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].fields, vec!["a", "b"]);
+        assert_eq!(filtered[0].fields, vec![Some("a".into()), Some("b".into())]);
     }
 
     // Feature: loader-column-exclusion, Property 3: field mapping correctly skips excluded positions
@@ -1000,7 +1002,9 @@ mod field_exclusion_tests {
 
             let records: Vec<Record> = (0..record_count)
                 .map(|r| Record {
-                    fields: (0..full_len).map(|i| format!("r{}_c{}", r, i)).collect(),
+                    fields: (0..full_len)
+                        .map(|i| Some(format!("r{}_c{}", r, i)))
+                        .collect(),
                 })
                 .collect();
 
@@ -1012,9 +1016,9 @@ mod field_exclusion_tests {
             let expected_len = full_len - excluded_positions.len();
             for (r_idx, record) in filtered.iter().enumerate() {
                 proptest::prop_assert_eq!(record.fields.len(), expected_len);
-                let expected: Vec<String> = (0..full_len)
+                let expected: Vec<Option<String>> = (0..full_len)
                     .filter(|i| !excluded_positions.contains(i))
-                    .map(|i| format!("r{}_c{}", r_idx, i))
+                    .map(|i| Some(format!("r{}_c{}", r_idx, i)))
                     .collect();
                 proptest::prop_assert_eq!(&record.fields, &expected);
             }
@@ -1031,7 +1035,7 @@ mod field_exclusion_tests {
             let excluded_positions: Vec<usize> = vec![0];
 
             let records = vec![Record {
-                fields: (0..actual_len).map(|i| format!("c{}", i)).collect(),
+                fields: (0..actual_len).map(|i| Some(format!("c{}", i))).collect(),
             }];
             let (filtered, mismatch, first) =
                 apply_field_exclusion(records, &excluded_positions, full_len);

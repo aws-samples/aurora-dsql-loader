@@ -73,16 +73,29 @@ async fn detect_non_plain_format(reader: &dyn ByteReader) -> Result<()> {
 }
 
 /// The byte range and metadata for a located COPY block.
+///
+/// The block spans `[header_start, block_end)` in the source file:
+/// `header_start` ... `data_start` is the `COPY ... FROM stdin;` line;
+/// `data_start` ... `data_end` is the data payload (no terminator);
+/// `data_end` ... `block_end` is the `\.` terminator line.
+/// The DDL between blocks lives in `[prev_block.block_end, next_block.header_start)`.
 #[derive(Debug, Clone)]
 pub struct CopyBlock {
     /// Schema name from the COPY statement (defaults to "public" if unqualified).
     pub schema: String,
     /// Table name from the COPY statement.
     pub table: String,
-    /// First byte of the first data line.
+    /// First byte of the `COPY ... FROM stdin;` header line. Used by
+    /// `extract_ddl` to slice out the DDL prefix that precedes this block.
+    pub header_start: u64,
+    /// First byte of the first data line (one past the header line's newline).
     pub data_start: u64,
     /// One past the last byte of the last data line (i.e. start of the `\.` terminator line).
     pub data_end: u64,
+    /// One past the trailing newline of the `\.` terminator line. Used by
+    /// `extract_ddl` to begin the next DDL slice immediately after the
+    /// terminator without re-scanning.
+    pub block_end: u64,
     /// Column names in the order declared by the COPY statement.
     pub columns: Vec<String>,
 }
@@ -142,6 +155,7 @@ pub async fn list_copy_blocks(reader: &dyn ByteReader) -> Result<Vec<CopyBlock>>
                 table,
                 columns,
             } => {
+                let header_start = pos;
                 let data_start = line_end;
                 let data_end = find_terminator(reader, data_start, size)
                     .await?
@@ -149,14 +163,17 @@ pub async fn list_copy_blocks(reader: &dyn ByteReader) -> Result<Vec<CopyBlock>>
                         schema: schema.clone(),
                         table: table.clone(),
                     })?;
+                let block_end = skip_line(reader, data_end, size).await?;
                 blocks.push(CopyBlock {
                     schema,
                     table,
+                    header_start,
                     data_start,
                     data_end,
+                    block_end,
                     columns,
                 });
-                pos = skip_line(reader, data_end, size).await?;
+                pos = block_end;
             }
         }
     }
@@ -188,6 +205,141 @@ pub async fn find_copy_block(
         .into());
     }
     Ok(first)
+}
+
+/// Extract the non-data (DDL) bytes from a pg_dump file: the prefix before
+/// the first COPY block, the DDL between blocks, and the suffix after the
+/// last block. Designed so the result can be fed directly to `dsql_lint::fix_sql`
+/// to produce DSQL-compatible DDL for the `migrate` subcommand.
+///
+/// Returns the bytes as a UTF-8 string. pg_dump writes the textual section of
+/// its plain-format output as UTF-8 (unrelated to the COPY data encoding);
+/// any non-UTF-8 byte in the DDL slices indicates either format corruption or
+/// a custom-format archive that the scanner should already have rejected.
+///
+/// Strips two classes of pg_dump preamble that DSQL refuses:
+/// `\restrict` / `\unrestrict` psql meta-commands (PG17+ psql client
+/// directives that lock object names within a script), and the
+/// `SET <param> = ...;` session GUCs pg_dump emits at the top of
+/// every dump (`statement_timeout`, `lock_timeout`, `client_encoding`,
+/// etc.) which DSQL rejects with
+/// "setting configuration parameter ... not supported".
+///
+/// `blocks` is the slice returned by [`list_copy_blocks`]; pass `&[]` for a
+/// schema-only dump (no data) and the entire file is returned as DDL.
+pub async fn extract_ddl(reader: &dyn ByteReader, blocks: &[CopyBlock]) -> Result<String> {
+    let size = reader.size().await?;
+    let mut out: Vec<u8> = Vec::new();
+
+    let mut cursor = 0u64;
+    for block in blocks {
+        if block.header_start > cursor {
+            out.extend_from_slice(&reader.read_range(cursor, block.header_start).await?);
+        }
+        cursor = block.block_end;
+    }
+    if cursor < size {
+        out.extend_from_slice(&reader.read_range(cursor, size).await?);
+    }
+
+    let raw = String::from_utf8(out).map_err(|e| {
+        anyhow::anyhow!(
+            "pg_dump DDL section is not valid UTF-8 at byte {}: {e}",
+            e.utf8_error().valid_up_to()
+        )
+    })?;
+    Ok(strip_pgdump_preamble(&raw))
+}
+
+/// pg_dump session GUCs DSQL rejects. Sourced from `pg_dump.c`'s
+/// `setupDumpWorker` / preamble emission — these are the always-on
+/// parameters every plain-format dump prints. Anything outside this
+/// allowlist (e.g. a customer-authored `SET search_path = ...;`) is
+/// preserved so a real apply error surfaces if DSQL doesn't accept it.
+const PGDUMP_REJECTED_SET_PARAMS: &[&str] = &[
+    "statement_timeout",
+    "lock_timeout",
+    "idle_in_transaction_session_timeout",
+    "transaction_timeout",
+    "client_encoding",
+    "standard_conforming_strings",
+    "check_function_bodies",
+    "xmloption",
+    "client_min_messages",
+    "row_security",
+    "default_tablespace",
+    "default_table_access_method",
+    "default_with_oids",
+];
+
+/// Drop pg_dump preamble lines DSQL refuses. Tightly anchored to
+/// start-of-line; the same caveat as the prior `\restrict` strip
+/// applies — a `$body$...$body$` whose interior begins with one of
+/// these tokens at column 0 would be (incorrectly) stripped, but
+/// pg_dump does not produce such bodies.
+fn strip_pgdump_preamble(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for line in input.split_inclusive('\n') {
+        if is_strippable_preamble_line(line) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Whether `line` is one of the pg_dump preamble shapes we drop:
+/// `\restrict ...` / `\unrestrict ...` psql meta-commands, or
+/// `SET <param> = ...;` for a `<param>` in [`PGDUMP_REJECTED_SET_PARAMS`].
+fn is_strippable_preamble_line(line: &str) -> bool {
+    for cmd in ["\\restrict", "\\unrestrict"] {
+        if let Some(rest) = line.strip_prefix(cmd) {
+            let next = rest.chars().next();
+            if matches!(next, None | Some(' ' | '\t' | '\n' | '\r')) {
+                return true;
+            }
+        }
+    }
+    is_pgdump_session_set_line(line)
+}
+
+/// Match `SET <param>` (case-insensitive on `SET`, exact on the param
+/// name) at the very start of the line, with `<param>` in the
+/// allowlist. The remainder of the line is not parsed — the line is
+/// dropped wholesale because pg_dump always emits these as a single
+/// `SET ident = value;` per line.
+fn is_pgdump_session_set_line(line: &str) -> bool {
+    let trimmed_eol = line.trim_end_matches(['\n', '\r']);
+    let after_set = match trimmed_eol.as_bytes().get(..3) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(b"SET") => &trimmed_eol[3..],
+        _ => return false,
+    };
+    let rest = after_set.trim_start_matches([' ', '\t']);
+    if rest.len() == after_set.len() {
+        // No whitespace after `SET` → not a SET statement.
+        return false;
+    }
+    // Read the next identifier (alpha + alpha/digit/underscore).
+    let mut end = 0;
+    for (i, c) in rest.char_indices() {
+        let ok = if i == 0 {
+            c.is_ascii_alphabetic() || c == '_'
+        } else {
+            c.is_ascii_alphanumeric() || c == '_'
+        };
+        if !ok {
+            end = i;
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    let ident = &rest[..end];
+    if ident.is_empty() {
+        return false;
+    }
+    PGDUMP_REJECTED_SET_PARAMS
+        .iter()
+        .any(|p| ident.eq_ignore_ascii_case(p))
 }
 
 /// Parse a single line as `COPY <schema>.<table> (col1, col2) FROM stdin;`

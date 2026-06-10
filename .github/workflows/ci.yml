@@ -5,6 +5,15 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+
+# Serialize runs on the same ref so two rapid pushes to the same branch
+# don't provision two parallel real-DSQL clusters. `cancel-in-progress: false`
+# is deliberate: cancelling mid-run can interrupt the e2e-dsql -> delete-cluster
+# chain and leak the provisioned cluster, so we queue instead.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -18,26 +27,6 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
 
-    # Postgres source instance for the pg_dump E2E test. Same major version
-    # ubuntu-latest ships pg_dump for, so the dump-and-load round-trip uses
-    # matched binary + server.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-    env:
-      PGDUMP_E2E_SOURCE_URL: postgres://postgres:postgres@localhost:5432/postgres
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -46,11 +35,6 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
-
-    - name: Install postgresql-client (provides pg_dump)
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y postgresql-client
 
     - name: Cache cargo registry
       uses: actions/cache@v4
@@ -85,5 +69,151 @@ jobs:
     - name: Build
       run: cargo build --verbose
 
-    - name: Run tests
+    - name: Run tests (offline)
       run: cargo test --verbose
+
+  # Skip e2e-dsql on doc-only diffs and forked PRs (no secret access).
+  e2e-changes:
+    name: Detect e2e-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.decide.outputs.should-run }}
+    steps:
+      - name: Decide whether to run e2e-dsql
+        id: decide
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const event = context.eventName;
+            // workflow_dispatch and push-to-main always run e2e
+            if (event === 'workflow_dispatch' || event === 'push') {
+              core.setOutput('should-run', 'true');
+              return;
+            }
+            // Forked PR: can't read secrets, skip
+            const pr = context.payload.pull_request;
+            if (!pr) { core.setOutput('should-run', 'false'); return; }
+            if (pr.head.repo.full_name !== context.repo.owner + '/' + context.repo.repo) {
+              core.info(`Forked PR (head: ${pr.head.repo.full_name}); skipping e2e-dsql`);
+              core.setOutput('should-run', 'false');
+              return;
+            }
+            // Same-repo PR: skip if diff only touches doc-ish paths
+            const skipPatterns = [
+              /^README\.md$/,
+              /^CHANGELOG\.md$/,
+              /^docs\//,
+              /^LICENSE$/,
+              /^\.gitignore$/,
+              /^\.editorconfig$/,
+              /^[^/]+\.md$/,  // any top-level *.md
+            ];
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+            // If the listing was truncated, run e2e to be safe.
+            if (files.length < pr.changed_files) {
+              core.info(`File listing truncated (${files.length}/${pr.changed_files}); running e2e to be safe`);
+              core.setOutput('should-run', 'true');
+              return;
+            }
+            const codeChanges = files.some(f =>
+              !skipPatterns.some(p => p.test(f.filename))
+            );
+            core.info(`PR touches ${files.length} files; code changes detected: ${codeChanges}`);
+            core.setOutput('should-run', String(codeChanges));
+
+  create-cluster:
+    name: Create DSQL cluster
+    needs: e2e-changes
+    if: needs.e2e-changes.outputs.should-run == 'true'
+    uses: ./.github/workflows/dsql-cluster-create.yml
+    with:
+      workflow_name: aurora-dsql-loader-pgdump-e2e
+    secrets: inherit
+    permissions:
+      id-token: write
+
+  e2e-dsql:
+    name: E2E (real DSQL cluster)
+    needs: [e2e-changes, create-cluster]
+    # Skip cleanly if create-cluster failed; otherwise this job runs with
+    # an empty endpoint env var and surfaces a misleading test failure.
+    if: needs.e2e-changes.outputs.should-run == 'true' && needs.create-cluster.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+
+    # Source PG (customer's existing DB); destination is the per-run cluster.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGDUMP_E2E_SOURCE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      LOADER_DSQL_E2E_ENDPOINT: ${{ needs.create-cluster.outputs.cluster-endpoint }}
+      LOADER_DSQL_E2E_REGION: ${{ needs.create-cluster.outputs.region }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install postgresql-client (provides pg_dump + psql)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6
+        with:
+          role-to-assume: ${{ secrets.IAM_ROLE }}
+          aws-region: ${{ needs.create-cluster.outputs.region }}
+
+      - name: Run pgdump E2E against real DSQL cluster
+        run: |
+          cargo test --lib --verbose pgdump_migrate_real_full_dump -- --ignored --nocapture
+
+  delete-cluster:
+    name: Delete DSQL cluster
+    needs: [create-cluster, e2e-dsql]
+    if: always() && needs.create-cluster.result == 'success'
+    uses: ./.github/workflows/dsql-cluster-delete.yml
+    with:
+      cluster-id: ${{ needs.create-cluster.outputs.cluster-id }}
+      region: ${{ needs.create-cluster.outputs.region }}
+    secrets: inherit
+    permissions:
+      id-token: write

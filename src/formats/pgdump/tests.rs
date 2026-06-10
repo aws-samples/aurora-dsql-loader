@@ -1,6 +1,6 @@
 use super::escape::decode_field;
 use super::reader::PgDumpReader;
-use super::scan::{ScanError, find_copy_block, list_copy_blocks};
+use super::scan::{ScanError, extract_ddl, find_copy_block, list_copy_blocks};
 use crate::formats::FileReader;
 use crate::io::byte_reader::MockByteReader;
 use crate::io::{ByteReader, LocalFileByteReader};
@@ -9,51 +9,51 @@ use tempfile::NamedTempFile;
 
 #[test]
 fn decode_plain_text() {
-    assert_eq!(decode_field(b"hello"), "hello");
+    assert_eq!(decode_field(b"hello"), Some("hello".into()));
 }
 
 #[test]
-fn decode_empty() {
-    assert_eq!(decode_field(b""), "");
+fn decode_empty_is_not_null() {
+    // Genuine empty string is distinct from `\N`; only the latter is NULL.
+    assert_eq!(decode_field(b""), Some(String::new()));
 }
 
 #[test]
-fn decode_null_sentinel_is_empty_string() {
-    // \N is the COPY-format NULL sentinel; the reader decodes it to "" and
-    // the worker then maps "" → SQL NULL during binding.
-    assert_eq!(decode_field(b"\\N"), "");
+fn decode_null_sentinel() {
+    // `\N` is the COPY-format NULL sentinel; decoder returns None.
+    assert_eq!(decode_field(b"\\N"), None);
 }
 
 #[test]
 fn decode_escape_t_n_r_etc() {
-    assert_eq!(decode_field(b"a\\tb"), "a\tb");
-    assert_eq!(decode_field(b"a\\nb"), "a\nb");
-    assert_eq!(decode_field(b"a\\rb"), "a\rb");
-    assert_eq!(decode_field(b"a\\\\b"), "a\\b");
+    assert_eq!(decode_field(b"a\\tb"), Some("a\tb".into()));
+    assert_eq!(decode_field(b"a\\nb"), Some("a\nb".into()));
+    assert_eq!(decode_field(b"a\\rb"), Some("a\rb".into()));
+    assert_eq!(decode_field(b"a\\\\b"), Some("a\\b".into()));
 }
 
 #[test]
 fn decode_hex_escape() {
     // \x41 → 'A'
-    assert_eq!(decode_field(b"\\x41"), "A");
+    assert_eq!(decode_field(b"\\x41"), Some("A".into()));
     // \x4 (single hex digit) → byte 0x04
-    assert_eq!(decode_field(b"\\x4"), "\u{4}");
+    assert_eq!(decode_field(b"\\x4"), Some("\u{4}".into()));
     // \x with no digits → literal \x
-    assert_eq!(decode_field(b"\\xZ"), "\\xZ");
+    assert_eq!(decode_field(b"\\xZ"), Some("\\xZ".into()));
 }
 
 #[test]
 fn decode_octal_escape() {
     // \101 → 'A'
-    assert_eq!(decode_field(b"\\101"), "A");
+    assert_eq!(decode_field(b"\\101"), Some("A".into()));
     // \1 → byte 0x01
-    assert_eq!(decode_field(b"\\1"), "\u{1}");
+    assert_eq!(decode_field(b"\\1"), Some("\u{1}".into()));
 }
 
 #[test]
 fn decode_unknown_escape_drops_backslash() {
     // PG behavior: \q → q
-    assert_eq!(decode_field(b"\\q"), "q");
+    assert_eq!(decode_field(b"\\q"), Some("q".into()));
 }
 
 #[test]
@@ -61,18 +61,18 @@ fn decode_backslash_n_inside_value_is_not_null() {
     // \N is only NULL when it is the entire field. As a per-character escape
     // it falls into the unknown-escape arm, where the backslash is dropped
     // and the `N` passes through, so b"x\\N" decodes to "xN".
-    assert_eq!(decode_field(b"x\\N"), "xN");
+    assert_eq!(decode_field(b"x\\N"), Some("xN".into()));
 }
 
 #[test]
 fn decode_trailing_backslash_passes_through() {
-    assert_eq!(decode_field(b"abc\\"), "abc\\");
+    assert_eq!(decode_field(b"abc\\"), Some("abc\\".into()));
 }
 
 #[test]
 fn decode_multi_byte_utf8() {
     let bytes = "café".as_bytes();
-    assert_eq!(decode_field(bytes), "café");
+    assert_eq!(decode_field(bytes), Some("café".into()));
 }
 
 const SAMPLE: &[u8] = b"\
@@ -279,6 +279,35 @@ async fn pgdump_reader_columns_are_exposed() {
 }
 
 #[tokio::test]
+async fn read_chunk_distinguishes_null_from_empty_string() {
+    // Pins the fix for the empty-string-collapses-to-NULL bug: a row
+    // with `\N` decodes to `None` and a row with a genuine empty string
+    // between two tabs decodes to `Some("")`, so a column with
+    // `NOT NULL DEFAULT ''` round-trips through migrate.
+    let mut f = NamedTempFile::new().unwrap();
+    writeln!(f, "COPY public.t (a, b) FROM stdin;").unwrap();
+    // empty string in column b
+    writeln!(f, "1\t").unwrap();
+    // \N (real NULL) in column b
+    writeln!(f, "2\t\\N").unwrap();
+    writeln!(f, "\\.").unwrap();
+    f.flush().unwrap();
+
+    let byte_reader = LocalFileByteReader::new(f.path());
+    let reader = PgDumpReader::new(byte_reader, "public", "t").await.unwrap();
+    let meta = reader.metadata().await.unwrap();
+    let chunks = reader.create_chunks(meta.file_size_bytes).await.unwrap();
+    let data = reader.read_chunk(&chunks[0]).await.unwrap();
+
+    assert_eq!(data.records.len(), 2);
+    assert_eq!(
+        data.records[0].fields,
+        vec![Some("1".into()), Some("".into())]
+    );
+    assert_eq!(data.records[1].fields, vec![Some("2".into()), None]);
+}
+
+#[tokio::test]
 async fn read_chunk_decodes_rows_and_escapes() {
     let mut f = NamedTempFile::new().unwrap();
     writeln!(f, "COPY public.t (a, b, c) FROM stdin;").unwrap();
@@ -297,9 +326,19 @@ async fn read_chunk_decodes_rows_and_escapes() {
     assert_eq!(data.records.len(), 3);
     assert_eq!(data.parse_errors, 0);
 
-    assert_eq!(data.records[0].fields, vec!["1", "hello", "world"]);
-    assert_eq!(data.records[1].fields, vec!["2", "", "line\nbreak"]);
-    assert_eq!(data.records[2].fields, vec!["3", "a\tb", "\\esc"]);
+    assert_eq!(
+        data.records[0].fields,
+        vec![Some("1".into()), Some("hello".into()), Some("world".into())]
+    );
+    // Row 2: column b was `\N` → None; column c is "line\nbreak".
+    assert_eq!(
+        data.records[1].fields,
+        vec![Some("2".into()), None, Some("line\nbreak".into())]
+    );
+    assert_eq!(
+        data.records[2].fields,
+        vec![Some("3".into()), Some("a\tb".into()), Some("\\esc".into())]
+    );
 }
 
 #[tokio::test]
@@ -471,7 +510,6 @@ async fn read_line_rejects_pathological_unbounded_header() {
     // A "line" in the SQL preamble with no newline byte must not buffer
     // unboundedly. The header path uses MAX_HEADER_LINE_BYTES (1 MiB), so
     // a 2 MiB no-newline input exercises the cap without taking forever.
-    use crate::io::ByteReader;
     struct GiantNoNewline(u64);
     #[async_trait::async_trait]
     impl ByteReader for GiantNoNewline {
@@ -499,7 +537,6 @@ async fn find_terminator_errors_on_truncated_body_without_newlines() {
     // a MissingTerminator error rather than spin or grow memory unbounded.
     // 2 MiB body keeps the test fast; the production 1 GiB cap is the same
     // code path with a larger fixture.
-    use crate::io::ByteReader;
     struct HeaderThenJunk;
     #[async_trait::async_trait]
     impl ByteReader for HeaderThenJunk {
@@ -656,6 +693,211 @@ async fn empty_or_tiny_files_do_not_trigger_format_detection() {
 }
 
 #[tokio::test]
+async fn copy_block_records_header_start_and_block_end() {
+    // header_start points at the leading byte of the `COPY ...` line.
+    // block_end points one past the closing `\.` terminator line, so
+    // [block_end, next_block.header_start) is exactly the bytes between
+    // two data blocks (where pg_dump would interleave more DDL).
+    let reader = MockByteReader::new(SAMPLE.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert_eq!(blocks.len(), 2);
+
+    // First block: header starts where `COPY public.users` does.
+    let users = &blocks[0];
+    assert_eq!(
+        &SAMPLE[users.header_start as usize..users.header_start as usize + 4],
+        b"COPY"
+    );
+    // block_end is past the `\.\n`, so it must be > data_end and the byte
+    // before block_end is the trailing newline of the terminator line.
+    assert!(users.block_end > users.data_end);
+    assert_eq!(SAMPLE[(users.block_end - 1) as usize], b'\n');
+
+    // Sandwich invariant: between users.block_end and orders.header_start
+    // there is only DDL/whitespace (no `COPY` keyword).
+    let between = &SAMPLE[users.block_end as usize..blocks[1].header_start as usize];
+    let between_str = std::str::from_utf8(between).unwrap();
+    assert!(
+        !between_str.to_ascii_uppercase().contains("COPY"),
+        "between-blocks slice must not contain another COPY: {between_str:?}"
+    );
+}
+
+#[tokio::test]
+async fn extract_ddl_pulls_preamble_and_drops_data_blocks() {
+    // pg_dump output has DDL before the COPY blocks. extract_ddl returns
+    // exactly that DDL (and any trailing post-COPY DDL), with the data
+    // payload sliced out so the result can be fed straight into fix_sql.
+    let reader = MockByteReader::new(SAMPLE.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    // Comment preamble survives (SET preambles get stripped — covered by
+    // extract_ddl_strips_pg_dump_session_set_preamble).
+    assert!(ddl.contains("PostgreSQL database dump"));
+    // ...but the data rows do NOT (no `1\tAlice` / `1\t1`).
+    assert!(!ddl.contains("Alice"));
+    assert!(!ddl.contains("Bob"));
+    // ...and neither do the COPY headers themselves.
+    assert!(
+        !ddl.to_ascii_uppercase().contains("COPY "),
+        "DDL must not contain COPY headers, got: {ddl:?}"
+    );
+    // ...and the `\.` terminators are gone.
+    assert!(!ddl.contains("\\."));
+}
+
+#[tokio::test]
+async fn extract_ddl_with_no_copy_blocks_returns_full_input() {
+    // Schema-only dump (no data) -> all bytes are DDL.
+    let raw = b"-- preamble\nCREATE TABLE t (id integer);\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert!(blocks.is_empty());
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+    assert_eq!(ddl, std::str::from_utf8(raw).unwrap());
+}
+
+#[tokio::test]
+async fn extract_ddl_preserves_inter_block_ddl() {
+    // pg_dump emits ALTER TABLE / SET DEFAULT statements BETWEEN data blocks
+    // when SERIAL columns are involved. extract_ddl must preserve those —
+    // they are exactly the statements fix_sql collapses.
+    let raw = b"\
+-- pre\n\
+CREATE TABLE public.t (id integer);\n\
+COPY public.t (id) FROM stdin;\n\
+1\n\
+\\.\n\
+ALTER TABLE ONLY public.t ALTER COLUMN id SET DEFAULT nextval('public.t_seq'::regclass);\n\
+COPY public.u (id) FROM stdin;\n\
+2\n\
+\\.\n\
+-- post\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert_eq!(blocks.len(), 2);
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    assert!(ddl.contains("CREATE TABLE public.t"));
+    assert!(
+        ddl.contains("ALTER TABLE ONLY public.t"),
+        "inter-block DDL must be preserved, got: {ddl:?}"
+    );
+    assert!(ddl.contains("-- post"));
+    // Data rows and COPY lines are gone.
+    assert!(!ddl.to_ascii_uppercase().contains("COPY "));
+    assert!(!ddl.contains("\\."));
+}
+
+#[tokio::test]
+async fn extract_ddl_strips_psql_restrict_meta_commands() {
+    // PostgreSQL 16+ pg_dump emits `\restrict <token>` at the top and
+    // `\unrestrict <token>` at the bottom of every dump. They are psql
+    // meta-commands, not SQL — any downstream SQL tool (a parser, our
+    // dsql-lint) chokes on the leading backslash. extract_ddl strips
+    // them so the migrate flow's transform stage sees clean SQL.
+    let raw = b"\
+\\restrict aB1xYz\n\
+\n\
+SET statement_timeout = 0;\n\
+CREATE TABLE public.t (id integer NOT NULL);\n\
+COPY public.t (id) FROM stdin;\n\
+1\n\
+\\.\n\
+\n\
+\\unrestrict aB1xYz\n\
+\n\
+-- complete\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    assert_eq!(blocks.len(), 1);
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    assert!(
+        !ddl.contains("\\restrict"),
+        "\\restrict meta-command should be stripped, got: {ddl:?}"
+    );
+    assert!(
+        !ddl.contains("\\unrestrict"),
+        "\\unrestrict meta-command should be stripped, got: {ddl:?}"
+    );
+    // Real DDL survives.
+    assert!(ddl.contains("CREATE TABLE"));
+    assert!(ddl.contains("-- complete"));
+}
+
+#[tokio::test]
+async fn extract_ddl_strips_pg_dump_session_set_preamble() {
+    // pg_dump emits a block of `SET <param> = ...;` lines at the top of
+    // every plain-format dump (statement_timeout, lock_timeout, etc.).
+    // DSQL rejects these as "setting configuration parameter ... not
+    // supported", so extract_ddl drops them. Customer-authored SETs
+    // outside the allowlist (e.g. `SET search_path`) are preserved.
+    let raw = b"\
+SET statement_timeout = 0;\n\
+SET lock_timeout = 0;\n\
+SET client_encoding = 'UTF8';\n\
+SET standard_conforming_strings = on;\n\
+SET row_security = off;\n\
+SET search_path = public;\n\
+SET default_tablespace = '';\n\
+SET default_table_access_method = heap;\n\
+\n\
+CREATE TABLE public.t (id integer NOT NULL);\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    for stripped in [
+        "SET statement_timeout",
+        "SET lock_timeout",
+        "SET client_encoding",
+        "SET standard_conforming_strings",
+        "SET row_security",
+        "SET default_tablespace",
+        "SET default_table_access_method",
+    ] {
+        assert!(
+            !ddl.contains(stripped),
+            "{stripped} should be stripped, got: {ddl:?}"
+        );
+    }
+    assert!(
+        ddl.contains("SET search_path"),
+        "non-allowlisted SET must survive (apply layer surfaces real errors), got: {ddl:?}"
+    );
+    assert!(ddl.contains("CREATE TABLE"));
+}
+
+#[tokio::test]
+async fn extract_ddl_does_not_strip_lines_inside_unrelated_dollar_quotes() {
+    // A function body that happens to contain a `\restrict`-looking
+    // line as a string MUST NOT be touched. The filter is anchored on
+    // the line start and the exact known commands, not on a generic
+    // backslash regex; this test pins that.
+    let raw = b"\
+SET search_path = public;\n\
+CREATE FUNCTION f() RETURNS text AS $$\n\
+SELECT '\\restrict not a meta command'::text\n\
+$$ LANGUAGE sql;\n\
+COPY public.t (a) FROM stdin;\n\
+1\n\
+\\.\n";
+    let reader = MockByteReader::new(raw.to_vec());
+    let blocks = list_copy_blocks(&reader).await.unwrap();
+    let ddl = extract_ddl(&reader, &blocks).await.unwrap();
+
+    // The string literal stays put because the filter only matches
+    // a meta-command at the VERY START of a line, with the known
+    // command word, surrounded by whitespace.
+    assert!(
+        ddl.contains("'\\restrict not a meta command'"),
+        "string-literal `\\restrict` must NOT be stripped, got: {ddl:?}"
+    );
+}
+
+#[tokio::test]
 async fn read_chunk_handles_crlf_line_endings() {
     // pg_dump on Windows-flavored paths can produce CRLF; split_lines strips
     // the trailing \r per line. Assert decoded fields don't carry stray \r.
@@ -667,6 +909,12 @@ async fn read_chunk_handles_crlf_line_endings() {
     let chunk_data = pg_reader.read_chunk(&chunks[0]).await.unwrap();
     assert_eq!(chunk_data.records.len(), 2);
     assert_eq!(chunk_data.parse_errors, 0);
-    assert_eq!(chunk_data.records[0].fields, vec!["1", "widget"]);
-    assert_eq!(chunk_data.records[1].fields, vec!["2", "gizmo"]);
+    assert_eq!(
+        chunk_data.records[0].fields,
+        vec![Some("1".into()), Some("widget".into())]
+    );
+    assert_eq!(
+        chunk_data.records[1].fields,
+        vec![Some("2".into()), Some("gizmo".into())]
+    );
 }

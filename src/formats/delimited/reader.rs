@@ -94,9 +94,8 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
                         parse_errors += 1;
                         continue;
                     }
-                    records.push(Record {
-                        fields: record.iter().map(|s| s.to_string()).collect(),
-                    });
+                    let fields: Vec<String> = record.iter().map(|s| s.to_string()).collect();
+                    records.push(Record::from_text_fields(fields));
                 }
                 Err(e) => {
                     if e.is_io_error() {

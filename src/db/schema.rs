@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::coordination::manifest::{ColumnJson, SchemaJson};
 
-/// Field values from a record (as strings from CSV/TSV)
-/// Used for schema inference - just the raw field values without metadata
-pub type FieldValues = Vec<String>;
+/// One row's worth of field values for schema inference. `None` is the
+/// reader's NULL discriminator (see `Record.fields`); inference treats it
+/// as a null directly instead of re-deriving it from trim-empty.
+pub type FieldValues = Vec<Option<String>>;
 
 /// SQL data type
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,12 +295,14 @@ pub struct SchemaInferrer {
 }
 
 impl SchemaInferrer {
-    /// Infer the type of a single value
-    fn infer_value_type(value: &str) -> Option<SqlType> {
-        let trimmed = value.trim();
+    /// Infer the type of a single value. `None` is SQL NULL; for `Some`,
+    /// a trimmed-empty string is also treated as NULL so column header
+    /// rows and stray whitespace don't poison type inference.
+    fn infer_value_type(value: Option<&str>) -> Option<SqlType> {
+        let trimmed = value?.trim();
 
         if trimmed.is_empty() {
-            return None; // Null value
+            return None;
         }
 
         // Boolean
@@ -413,12 +416,12 @@ impl SchemaInferrer {
     }
 
     /// Infer column types from multiple values
-    fn infer_column_type(values: &[&str]) -> (SqlType, bool) {
+    fn infer_column_type(values: &[Option<&str>]) -> (SqlType, bool) {
         let mut inferred_type: Option<SqlType> = None;
         let mut has_nulls = false;
 
         for value in values {
-            match Self::infer_value_type(value) {
+            match Self::infer_value_type(*value) {
                 Some(val_type) => {
                     inferred_type = Some(match inferred_type {
                         None => val_type,
@@ -442,10 +445,15 @@ impl SchemaInferrer {
             anyhow::bail!("Cannot infer schema from empty dataset");
         }
 
-        let (header_names, data_start_idx) = if self.has_header {
-            (records[0].clone(), 1)
+        let (header_names, data_start_idx): (Vec<String>, usize) = if self.has_header {
+            // Header row: a NULL header (None) flattens to an empty string so
+            // it's treated like any other unnamed column at the DDL stage.
+            let names = records[0]
+                .iter()
+                .map(|f| f.clone().unwrap_or_default())
+                .collect();
+            (names, 1)
         } else {
-            // Generate default column names
             let num_cols = records[0].len();
             let names = (0..num_cols).map(|i| format!("column_{}", i + 1)).collect();
             (names, 0)
@@ -459,12 +467,10 @@ impl SchemaInferrer {
         let num_columns = header_names.len();
         let mut columns = Vec::with_capacity(num_columns);
 
-        // Infer type for each column
         for (col_idx, name) in header_names.iter().enumerate() {
-            // Collect values from this column across all rows
-            let column_values: Vec<&str> = data_rows
+            let column_values: Vec<Option<&str>> = data_rows
                 .iter()
-                .filter_map(|row| row.get(col_idx).map(|s| s.as_str()))
+                .filter_map(|row| row.get(col_idx).map(Option::as_deref))
                 .collect();
 
             let (sql_type, nullable) = Self::infer_column_type(&column_values);
@@ -512,34 +518,35 @@ mod tests {
     #[test]
     fn test_infer_value_types() {
         assert_eq!(
-            SchemaInferrer::infer_value_type("42"),
+            SchemaInferrer::infer_value_type(Some("42")),
             Some(SqlType::SmallInt)
         );
         assert_eq!(
-            SchemaInferrer::infer_value_type("100000"),
+            SchemaInferrer::infer_value_type(Some("100000")),
             Some(SqlType::Integer)
         );
         assert_eq!(
-            SchemaInferrer::infer_value_type("9999999999"),
+            SchemaInferrer::infer_value_type(Some("9999999999")),
             Some(SqlType::BigInt)
         );
         assert_eq!(
-            SchemaInferrer::infer_value_type("3.14"),
+            SchemaInferrer::infer_value_type(Some("3.14")),
             Some(SqlType::Real)
         );
         assert_eq!(
-            SchemaInferrer::infer_value_type("true"),
+            SchemaInferrer::infer_value_type(Some("true")),
             Some(SqlType::Boolean)
         );
         assert_eq!(
-            SchemaInferrer::infer_value_type("hello"),
+            SchemaInferrer::infer_value_type(Some("hello")),
             Some(SqlType::Text)
         );
         assert_eq!(
-            SchemaInferrer::infer_value_type("2025-12-03"),
+            SchemaInferrer::infer_value_type(Some("2025-12-03")),
             Some(SqlType::Date)
         );
-        assert_eq!(SchemaInferrer::infer_value_type(""), None);
+        assert_eq!(SchemaInferrer::infer_value_type(Some("")), None);
+        assert_eq!(SchemaInferrer::infer_value_type(None), None);
     }
 
     #[test]
@@ -564,13 +571,19 @@ mod tests {
         assert_eq!(SqlType::Integer.common_type(&SqlType::Text), SqlType::Text);
     }
 
+    fn rows(rows: &[&[&str]]) -> Vec<FieldValues> {
+        rows.iter()
+            .map(|r| r.iter().map(|s| Some((*s).to_string())).collect())
+            .collect()
+    }
+
     #[test]
     fn test_infer_schema_with_header() {
-        let records = vec![
-            vec!["id".to_string(), "name".to_string(), "age".to_string()],
-            vec!["1".to_string(), "Alice".to_string(), "30".to_string()],
-            vec!["2".to_string(), "Bob".to_string(), "25".to_string()],
-        ];
+        let records = rows(&[
+            &["id", "name", "age"],
+            &["1", "Alice", "30"],
+            &["2", "Bob", "25"],
+        ]);
 
         let inferrer = SchemaInferrer { has_header: true };
         let schema = inferrer.infer_from_data(&records).unwrap();
@@ -586,10 +599,7 @@ mod tests {
 
     #[test]
     fn test_infer_schema_without_header() {
-        let records = vec![
-            vec!["1".to_string(), "Alice".to_string(), "30".to_string()],
-            vec!["2".to_string(), "Bob".to_string(), "25".to_string()],
-        ];
+        let records = rows(&[&["1", "Alice", "30"], &["2", "Bob", "25"]]);
 
         let inferrer = SchemaInferrer { has_header: false };
         let schema = inferrer.infer_from_data(&records).unwrap();
@@ -602,18 +612,20 @@ mod tests {
 
     #[test]
     fn test_nullable_detection() {
-        let records = vec![
-            vec!["id".to_string(), "value".to_string()],
-            vec!["1".to_string(), "100".to_string()],
-            vec!["2".to_string(), "".to_string()], // Null value
-            vec!["3".to_string(), "300".to_string()],
+        // Row 2 column b is `None` — the reader's NULL discriminator;
+        // row 3 column b is `Some("100")` to keep the column numeric.
+        let records: Vec<FieldValues> = vec![
+            vec![Some("id".into()), Some("value".into())],
+            vec![Some("1".into()), Some("100".into())],
+            vec![Some("2".into()), None],
+            vec![Some("3".into()), Some("300".into())],
         ];
 
         let inferrer = SchemaInferrer { has_header: true };
         let schema = inferrer.infer_from_data(&records).unwrap();
 
-        assert!(!schema.columns[0].nullable); // id has no nulls
-        assert!(schema.columns[1].nullable); // value has null
+        assert!(!schema.columns[0].nullable);
+        assert!(schema.columns[1].nullable);
     }
 
     #[test]
@@ -651,12 +663,7 @@ mod tests {
 
     #[test]
     fn test_mixed_types_promote_to_text() {
-        let records = vec![
-            vec!["value".to_string()],
-            vec!["123".to_string()],
-            vec!["hello".to_string()],
-            vec!["456".to_string()],
-        ];
+        let records = rows(&[&["value"], &["123"], &["hello"], &["456"]]);
 
         let inferrer = SchemaInferrer { has_header: true };
         let schema = inferrer.infer_from_data(&records).unwrap();
@@ -667,12 +674,12 @@ mod tests {
 
     #[test]
     fn test_numeric_promotion() {
-        let records = vec![
-            vec!["value".to_string()],
-            vec!["1".to_string()],      // SmallInt
-            vec!["100000".to_string()], // Integer
-            vec!["3.14".to_string()],   // Real
-        ];
+        let records = rows(&[
+            &["value"],
+            &["1"],      // SmallInt
+            &["100000"], // Integer
+            &["3.14"],   // Real
+        ]);
 
         let inferrer = SchemaInferrer { has_header: true };
         let schema = inferrer.infer_from_data(&records).unwrap();
@@ -740,7 +747,7 @@ mod tests {
 
         for (input, expected, description) in test_cases {
             assert_eq!(
-                SchemaInferrer::infer_value_type(input),
+                SchemaInferrer::infer_value_type(Some(input)),
                 Some(expected.clone()),
                 "Failed: {} - input '{}'",
                 description,
@@ -782,7 +789,7 @@ mod tests {
 
         for (input, expected, description) in test_cases {
             assert_eq!(
-                SchemaInferrer::infer_value_type(input),
+                SchemaInferrer::infer_value_type(Some(input)),
                 Some(expected.clone()),
                 "Failed: {} - input '{}'",
                 description,
@@ -803,7 +810,7 @@ mod tests {
         ];
 
         for timestamp in &aurora_timestamps {
-            let result = SchemaInferrer::infer_value_type(timestamp);
+            let result = SchemaInferrer::infer_value_type(Some(timestamp));
             assert_eq!(
                 result,
                 Some(SqlType::Timestamp),

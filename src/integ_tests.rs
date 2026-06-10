@@ -11,14 +11,28 @@ mod tests {
             coordinator::LoadResult,
             manifest::{
                 ChunkResultFile, ChunkStatus, LocalManifestStorage, ManifestStorage, OnConflict,
+                ParquetConfig,
             },
         },
-        db::{Pool, SchemaInferrer, pool::PoolConnection},
-        formats::{DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader},
+        db::{
+            Pool, SchemaInferrer,
+            pool::{PoolArgsBuilder, PoolConnection, pool as build_dsql_pool},
+        },
+        formats::{
+            DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader,
+            parquet::GenericParquetReader,
+        },
         io::LocalFileByteReader,
-        runner::{Format, LoadArgs, run_load},
+        runner::{Format, LoadArgs, MigrateArgs, run_load, run_migrate},
     };
+    use arrow::array::*;
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
     use std::collections::{HashMap, HashSet};
+    use std::io::Write;
+    use std::process::Command;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::fs::{self, File};
@@ -245,20 +259,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_parquet_load() {
-        use crate::coordination::manifest::ParquetConfig;
-        use crate::formats::FileReader;
-        use crate::formats::parquet::GenericParquetReader;
-        use arrow::array::*;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
-
         let temp_dir = TempDir::new().unwrap();
 
         // Create a test Parquet file
         let parquet_path = temp_dir.path().join("test.parquet");
-        let schema = Schema::new(vec![
+        let schema = ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("value", DataType::Float64, false),
@@ -516,17 +521,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_parquet_load() {
-        use arrow::array::*;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
-
         let temp_dir = TempDir::new().unwrap();
 
         // Create a test Parquet file
         let parquet_path = temp_dir.path().join("runner_test.parquet");
-        let schema = Schema::new(vec![
+        let schema = ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("value", DataType::Float64, false),
@@ -2922,14 +2921,6 @@ mod tests {
     /// reader is a Parquet reader (not just CSV).
     #[tokio::test]
     async fn test_exclude_columns_parquet() {
-        use crate::coordination::manifest::ParquetConfig;
-        use crate::formats::parquet::GenericParquetReader;
-        use arrow::array::*;
-        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        use arrow::record_batch::RecordBatch;
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
-
         let temp_dir = TempDir::new().unwrap();
         let parquet_path = temp_dir.path().join("exclude.parquet");
         let arrow_schema = ArrowSchema::new(vec![
@@ -4014,8 +4005,6 @@ mod tests {
 
     #[tokio::test]
     async fn pgdump_loads_via_run_load() -> anyhow::Result<()> {
-        use std::io::Write;
-
         // pg_dump-shaped fixture: real tab bytes between fields, COPY header
         // followed by data lines, terminated by a literal `\.` line.
         let mut f = tempfile::NamedTempFile::new()?;
@@ -4041,10 +4030,9 @@ mod tests {
         assert_eq!(result.records_loaded, 3);
         assert_eq!(result.records_failed, 0);
 
-        // `note` for row 1 was `\N` → loaded as SQL NULL by the worker (empty
-        // strings are coerced to NULL). Bind it as `Option<String>` so the
-        // sqlx decode path doesn't error on UnexpectedNullError before our
-        // assertions run.
+        // `note` for row 1 was `\N` → loaded as SQL NULL. Bind as
+        // `Option<String>` so the sqlx decode path doesn't error on
+        // UnexpectedNullError before assertions run.
         #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
         struct ThingRow {
             id: i64,
@@ -4088,8 +4076,6 @@ mod tests {
 
     #[tokio::test]
     async fn pgdump_errors_when_table_not_in_dump() -> anyhow::Result<()> {
-        use std::io::Write;
-
         let mut f = tempfile::NamedTempFile::new()?;
         writeln!(f, "COPY public.other (a) FROM stdin;")?;
         writeln!(f, "1")?;
@@ -4126,8 +4112,6 @@ mod tests {
 
     #[tokio::test]
     async fn pgdump_reorders_columns_when_target_order_differs() -> anyhow::Result<()> {
-        use std::io::Write;
-
         // pg_dump emits (id, name, note); target table column order is shuffled.
         // The loader must reorder by name so values land in the right columns.
         let mut f = tempfile::NamedTempFile::new()?;
@@ -4196,8 +4180,6 @@ mod tests {
     /// CI sets it via the `postgres` service container.
     #[tokio::test]
     async fn pgdump_real_binary_round_trip_pg_to_pg() -> anyhow::Result<()> {
-        use std::process::Command;
-
         let Some(source_pg_url) = std::env::var("PGDUMP_E2E_SOURCE_URL")
             .ok()
             .filter(|v| !v.is_empty())
@@ -4251,10 +4233,12 @@ mod tests {
         .await?;
 
         // NOTE: empty TEXT (`note = ''`) and empty BYTEA (`'\x'`) are
-        // intentionally omitted. The loader collapses empty strings to SQL
-        // NULL during INSERT generation, so a `''` in the source would
-        // round-trip as NULL — a documented trade-off (see PgDumpReader
-        // rustdoc), not a regression for this test.
+        // intentionally omitted from this round-trip seed. The pg_dump
+        // reader preserves the `\N` vs empty-string distinction (see
+        // `PgDumpReader` rustdoc and `read_chunk_distinguishes_null_from_empty_string`),
+        // but this test pre-dates that fix and seeds only NULL for `note`;
+        // adding an empty-string row here would broaden the round-trip
+        // assertion shape and is tracked separately.
         sqlx::query(&format!(
             "INSERT INTO {src} (id, name, note, blob, payload, ts) VALUES
                 (1, 'plain',         E'tab\\there',  E'\\\\xDEADBEEF', '{{\"a\":1}}'::jsonb,  '2024-01-15 12:34:56+00'),
@@ -4397,10 +4381,398 @@ mod tests {
         Ok(())
     }
 
+    /// Customer-shape E2E: seed PG with one construct per dsql-lint rule
+    /// the migrate flow rewrites, plus every data-fidelity case the COPY
+    /// decoder must preserve, then `pg_dump` → `run_migrate` → real DSQL
+    /// cluster and assert the destination matches the source byte-for-byte.
+    /// `#[ignore]` — needs PG + DSQL cluster + IAM. CI's `e2e-dsql` job
+    /// opts in via `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn pgdump_migrate_real_full_dump_collapses_serial_strips_fk() -> anyhow::Result<()> {
+        let source_pg_url = std::env::var("PGDUMP_E2E_SOURCE_URL")
+            .map_err(|_| anyhow::anyhow!("PGDUMP_E2E_SOURCE_URL must be set"))?;
+        let dsql_endpoint = std::env::var("LOADER_DSQL_E2E_ENDPOINT").map_err(|_| {
+            anyhow::anyhow!(
+                "LOADER_DSQL_E2E_ENDPOINT must be set (e.g. <cluster>.dsql.us-east-1.on.aws)"
+            )
+        })?;
+        let dsql_region =
+            std::env::var("LOADER_DSQL_E2E_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        anyhow::ensure!(!source_pg_url.is_empty(), "PGDUMP_E2E_SOURCE_URL is empty");
+        anyhow::ensure!(
+            !dsql_endpoint.is_empty(),
+            "LOADER_DSQL_E2E_ENDPOINT is empty"
+        );
+
+        let pg_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&source_pg_url)
+            .await?;
+
+        // UUID suffix so parallel runs on a shared cluster don't collide.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let users_src = format!("e2e_users_{suffix}");
+        let events_src = format!("e2e_events_{suffix}");
+
+        // SCHEMA — one construct per rewrite rule:
+        //   users.id        SERIAL PRIMARY KEY    → serial_sequence_idiom
+        //   users.email     UNIQUE inline         → alter_add_unique_collapse
+        //   events.id       SERIAL PRIMARY KEY    → serial_sequence_idiom
+        //                                           + alter_add_primary_key_collapse
+        //   events.user_id  REFERENCES            → foreign_key (removed)
+        //   events.payload  JSONB                 → json_type
+        //   events_label_idx CREATE INDEX … USING btree
+        //                                         → index_async + index_using
+        //   events.note     NOT NULL DEFAULT ''   (preserved as-is)
+        sqlx::query(&format!(
+            "CREATE TABLE {users_src} (
+                id SERIAL PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE
+            )"
+        ))
+        .execute(&pg_pool)
+        .await?;
+        sqlx::query(&format!(
+            "CREATE TABLE {events_src} (
+                id SERIAL PRIMARY KEY,
+                label TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                user_id INTEGER REFERENCES {users_src}(id),
+                payload JSONB,
+                created_at TIMESTAMPTZ NOT NULL
+            )"
+        ))
+        .execute(&pg_pool)
+        .await?;
+        sqlx::query(&format!(
+            "CREATE INDEX {events_src}_label_idx ON {events_src}(label)"
+        ))
+        .execute(&pg_pool)
+        .await?;
+
+        sqlx::query(&format!(
+            "INSERT INTO {users_src} (email) VALUES ('a@example.com'), ('b@example.com')"
+        ))
+        .execute(&pg_pool)
+        .await?;
+
+        // DATA — every row exercises a distinct decode/encode boundary the
+        // pgdump reader+worker chain must preserve. The destination assertions
+        // below check each `note` value byte-for-byte, so a regression in any
+        // single decode arm fails this test loudly.
+        //
+        // Row 1: plain text + JSON object + microsecond TS.
+        // Row 2: empty `note` in NOT NULL DEFAULT '' col — pins the
+        //        commit-07c0196 fix that `\N` ≠ `""` end-to-end.
+        // Row 3: tab inside `note` — encoded as `\t` in COPY.
+        // Row 4: newline inside `note` — encoded as `\n` in COPY; must NOT
+        //        split rows. JSON null literal (distinct from SQL NULL).
+        // Row 5: multi-byte UTF-8 in `note`.
+        // Row 6: literal backslash in `note` (encoded `\\` in COPY).
+        // Row 7: literal `\N` text inside `note` — encoded `\\N` in COPY,
+        //        MUST NOT be misread as the NULL sentinel.
+        // Row 8: NULL `note` is impossible (NOT NULL); NULL `user_id`,
+        //        `payload`, AND a microsecond TS at year boundary.
+        sqlx::query(&format!(
+            "INSERT INTO {events_src} (label, note, user_id, payload, created_at) VALUES
+                ('alpha',   'first',                  1,    '{{\"k\":\"v\"}}'::jsonb,                  '2024-01-15 12:34:56.789012+00'),
+                ('beta',    '',                       2,    '[1,2,3,null]'::jsonb,                     '2024-06-30 23:59:59.123456+00'),
+                ('gamma',   E'tab\\there',            1,    '{{\"nested\":{{\"a\":[true,false]}}}}'::jsonb, '2024-03-15 09:30:00.000001+00'),
+                ('delta',   E'two\\nlines',           2,    'null'::jsonb,                              '2025-02-28 12:00:00+00'),
+                ('epsilon', 'unicode-naïve-café',     1,    '\"plain string\"'::jsonb,                  '2025-07-04 18:00:00+00'),
+                ('zeta',    E'back\\\\slash',         2,    '42'::jsonb,                                '2024-12-31 23:59:59.999999+00'),
+                ('eta',     E'null-\\\\N-marker',     1,    '[]'::jsonb,                                '2025-01-01 00:00:00+00'),
+                ('theta',   'no-fk',                  NULL, NULL,                                       '2025-12-31 00:00:00+00')"
+        ))
+        .execute(&pg_pool)
+        .await?;
+
+        // Full dump (no --data-only) — embeds DDL.
+        let dump_dir = tempfile::tempdir()?;
+        let dump_path = dump_dir.path().join("dump.sql");
+        let status = Command::new("pg_dump")
+            .args([
+                "-Fp",
+                "--table",
+                &users_src,
+                "--table",
+                &events_src,
+                "--no-owner",
+                "--no-privileges",
+                &source_pg_url,
+            ])
+            .stdout(std::fs::File::create(&dump_path)?)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to spawn pg_dump (is it on PATH?): {e}"))?;
+        assert!(status.success(), "pg_dump exited with {status}");
+
+        // `test_pool: None` → production DSQL IAM-auth path.
+        let args = MigrateArgs {
+            endpoint: dsql_endpoint.clone(),
+            region: dsql_region.clone(),
+            username: "admin".to_string(),
+            source_uri: format!("file://{}", dump_path.display()),
+            schema: "public".to_string(),
+            dry_run: false,
+            worker_count: 1,
+            batch_size: 100,
+            batch_concurrency: 1,
+            chunk_size_bytes: 1024 * 1024,
+            on_conflict: OnConflict::Error,
+            quiet: true,
+            debug: false,
+            test_pool: None,
+        };
+
+        let report = run_migrate(args).await?;
+
+        // ── Stage 1: dsql-lint diagnostic shape ────────────────────────
+        assert!(
+            report.ddl_unfixable.is_empty(),
+            "no unfixable diagnostics expected on this fixture, got: {:?}",
+            report.ddl_unfixable
+        );
+        let rule_count = |r: &str| report.ddl_changes.iter().filter(|d| d.rule == r).count();
+        assert_eq!(
+            rule_count("serial_sequence_idiom"),
+            2,
+            "expected 2 serial_sequence_idiom (users.id + events.id), got: {:?}",
+            report.ddl_changes
+        );
+        assert!(
+            rule_count("foreign_key") >= 1,
+            "FK should be reported as auto-removed, got: {:?}",
+            report.ddl_changes
+        );
+        assert!(
+            rule_count("alter_add_unique_collapse") >= 1,
+            "UNIQUE should fold via alter_add_unique_collapse, got: {:?}",
+            report.ddl_changes
+        );
+        assert!(
+            rule_count("json_type") >= 1,
+            "JSONB → JSON rewrite should fire for events.payload, got: {:?}",
+            report.ddl_changes
+        );
+        assert!(
+            rule_count("index_async") >= 1,
+            "CREATE INDEX → CREATE INDEX ASYNC should fire, got: {:?}",
+            report.ddl_changes
+        );
+
+        // Separate pool for assertions (run_migrate owns its pool).
+        let dsql_pool = build_dsql_pool(
+            PoolArgsBuilder::default()
+                .endpoint(&dsql_endpoint)
+                .region(&dsql_region)
+                .username("admin")
+                .build()?,
+        )
+        .await?;
+
+        // ── Stage 2: schema shape on the destination ───────────────────
+        // SERIAL → identity on both PK columns.
+        for (table, col) in [(&users_src, "id"), (&events_src, "id")] {
+            let (is_identity,): (String,) = sqlx::query_as(&format!(
+                "SELECT is_identity FROM information_schema.columns \
+                 WHERE table_schema='public' AND table_name='{table}' AND column_name='{col}'"
+            ))
+            .fetch_one(&dsql_pool)
+            .await?;
+            assert_eq!(
+                is_identity, "YES",
+                "{table}.{col} must be is_identity=YES post-migrate"
+            );
+        }
+
+        // FK auto-removed: zero FOREIGN KEY constraints on events.
+        let (fk_count,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM information_schema.table_constraints \
+             WHERE table_schema='public' AND table_name='{events_src}' \
+             AND constraint_type='FOREIGN KEY'"
+        ))
+        .fetch_one(&dsql_pool)
+        .await?;
+        assert_eq!(fk_count, 0, "{events_src} must have 0 FK constraints");
+
+        // Inline UNIQUE survives the pg_dump → ALTER → collapse round-trip.
+        let (users_unique_count,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM information_schema.table_constraints \
+             WHERE table_schema='public' AND table_name='{users_src}' \
+             AND constraint_type='UNIQUE'"
+        ))
+        .fetch_one(&dsql_pool)
+        .await?;
+        assert_eq!(
+            users_unique_count, 1,
+            "{users_src} must have exactly 1 UNIQUE constraint"
+        );
+
+        // JSONB → JSON: post-migrate column data_type is `json`, not `jsonb`.
+        let (payload_type,): (String,) = sqlx::query_as(&format!(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema='public' AND table_name='{events_src}' AND column_name='payload'"
+        ))
+        .fetch_one(&dsql_pool)
+        .await?;
+        assert_eq!(
+            payload_type, "json",
+            "{events_src}.payload must be data_type='json' (not 'jsonb')"
+        );
+
+        // NOT NULL DEFAULT '' preserved on events.note.
+        let (note_nullable, note_default): (String, Option<String>) = sqlx::query_as(&format!(
+            "SELECT is_nullable, column_default FROM information_schema.columns \
+             WHERE table_schema='public' AND table_name='{events_src}' AND column_name='note'"
+        ))
+        .fetch_one(&dsql_pool)
+        .await?;
+        assert_eq!(note_nullable, "NO", "events.note must remain NOT NULL");
+        assert!(
+            note_default.as_deref().is_some_and(|d| d.contains("''")),
+            "events.note default must contain '', got {:?}",
+            note_default
+        );
+
+        // ── Stage 3: data fidelity, byte-for-byte ──────────────────────
+        // Decode each row at the destination and assert exact-equal against
+        // what we seeded. A regression in any single COPY-decode arm
+        // (escape, multi-byte, `\N` ambiguity, JSONB→JSON cast) shows up here.
+        #[derive(Debug, sqlx::FromRow)]
+        struct EventRow {
+            label: String,
+            note: String,
+            user_id: Option<i32>,
+            payload: Option<serde_json::Value>,
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let rows: Vec<EventRow> = sqlx::query_as(&format!(
+            "SELECT label, note, user_id, payload, created_at \
+             FROM {events_src} ORDER BY label"
+        ))
+        .fetch_all(&dsql_pool)
+        .await?;
+        assert_eq!(rows.len(), 8, "all 8 events rows must round-trip");
+
+        // Helper to find a row by label so the assertion list reads top-to-bottom.
+        let find = |label: &str| {
+            rows.iter()
+                .find(|r| r.label == label)
+                .unwrap_or_else(|| panic!("missing label={label}"))
+        };
+
+        // Row 1: plain.
+        let r = find("alpha");
+        assert_eq!(r.note, "first");
+        assert_eq!(r.user_id, Some(1));
+        assert_eq!(r.payload, Some(serde_json::json!({"k": "v"})));
+
+        // Row 2: empty `note` in NOT NULL DEFAULT '' must stay empty (NOT NULL).
+        // This is the iter-1 commit-07c0196 regression pin.
+        let r = find("beta");
+        assert_eq!(r.note, "", "empty `note` collapsed to NULL or got mangled");
+        assert_eq!(r.payload, Some(serde_json::json!([1, 2, 3, null])));
+
+        // Row 3: real tab byte inside `note`.
+        let r = find("gamma");
+        assert_eq!(r.note, "tab\there");
+        assert_eq!(
+            r.payload,
+            Some(serde_json::json!({"nested": {"a": [true, false]}}))
+        );
+
+        // Row 4: real newline byte inside `note` — MUST NOT split rows.
+        // JSON null literal preserved as Some(Value::Null).
+        let r = find("delta");
+        assert_eq!(r.note, "two\nlines");
+        assert_eq!(r.payload, Some(serde_json::Value::Null));
+
+        // Row 5: multi-byte UTF-8 in `note`.
+        let r = find("epsilon");
+        assert_eq!(r.note, "unicode-naïve-café");
+        assert_eq!(
+            r.payload,
+            Some(serde_json::Value::String("plain string".to_string()))
+        );
+
+        // Row 6: single backslash in `note` (encoded `\\` in COPY).
+        let r = find("zeta");
+        assert_eq!(r.note, "back\\slash");
+        assert_eq!(r.payload, Some(serde_json::json!(42)));
+
+        // Row 7: literal text `null-\N-marker` — the `\N` here is data, not the
+        // NULL sentinel. pg_dump emits this as `null-\\N-marker`; the loader's
+        // `decode_field` must NOT collapse the embedded `\N` to NULL.
+        let r = find("eta");
+        assert_eq!(
+            r.note, "null-\\N-marker",
+            "literal `\\N` inside data was misread as NULL sentinel"
+        );
+        assert_eq!(r.payload, Some(serde_json::json!([])));
+
+        // Row 8: NULL on user_id and payload preserved as SQL NULL.
+        let r = find("theta");
+        assert_eq!(r.note, "no-fk");
+        assert!(
+            r.user_id.is_none(),
+            "user_id should be SQL NULL, got {:?}",
+            r.user_id
+        );
+        assert!(
+            r.payload.is_none(),
+            "payload should be SQL NULL, got {:?}",
+            r.payload
+        );
+
+        // TIMESTAMPTZ microsecond fidelity: pin two extreme cases.
+        // alpha = 2024-01-15 12:34:56.789012 UTC (six-digit fractional).
+        let alpha_ts = find("alpha").created_at;
+        let expected_alpha = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:34:56.789012Z")?
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            alpha_ts, expected_alpha,
+            "TIMESTAMPTZ microsecond precision lost on alpha"
+        );
+        // zeta = end-of-year 2024 with .999999 microseconds.
+        let zeta_ts = find("zeta").created_at;
+        let expected_zeta = chrono::DateTime::parse_from_rfc3339("2024-12-31T23:59:59.999999Z")?
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            zeta_ts, expected_zeta,
+            "TIMESTAMPTZ microsecond lost on zeta"
+        );
+
+        // Users data sanity (UNIQUE round-trip + identity column).
+        #[derive(Debug, sqlx::FromRow)]
+        struct UserRow {
+            email: String,
+        }
+        let user_rows: Vec<UserRow> =
+            sqlx::query_as(&format!("SELECT email FROM {users_src} ORDER BY email"))
+                .fetch_all(&dsql_pool)
+                .await?;
+        let emails: Vec<&str> = user_rows.iter().map(|u| u.email.as_str()).collect();
+        assert_eq!(emails, vec!["a@example.com", "b@example.com"]);
+
+        // ── Cleanup: best-effort (per-run CI cluster is torn down anyway).
+        let _ = sqlx::query(&format!(
+            "DROP TABLE IF EXISTS {events_src}, {users_src} CASCADE"
+        ))
+        .execute(&pg_pool)
+        .await;
+        let _ = dsql_pool
+            .execute_query(&format!("DROP TABLE IF EXISTS {events_src}"))
+            .await;
+        let _ = dsql_pool
+            .execute_query(&format!("DROP TABLE IF EXISTS {users_src}"))
+            .await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn pgdump_errors_on_column_set_mismatch() -> anyhow::Result<()> {
-        use std::io::Write;
-
         // Target table has an extra column not present in the dump's COPY clause.
         // Reordering cannot rescue this — the sets diverge.
         let mut f = tempfile::NamedTempFile::new()?;

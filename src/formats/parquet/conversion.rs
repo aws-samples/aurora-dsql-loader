@@ -1,9 +1,10 @@
 //! Conversion from Arrow RecordBatch to row-based Records.
 //!
 //! This module converts Arrow's columnar format to the string-based Record format
-//! used throughout the loader. All values are converted to strings, with nulls
-//! represented as empty strings. The worker will later parse these strings back
-//! to typed values based on the target schema.
+//! used throughout the loader. Each Arrow cell is stringified by `array_to_strings`
+//! (Arrow null → `""`); rows are then folded through `Record::from_text_fields`,
+//! which maps any trimmed-empty field to `None` — preserving the legacy
+//! parquet "trim-empty → NULL" inference end-to-end.
 
 use anyhow::{Context, Result};
 use arrow::array::*;
@@ -17,10 +18,11 @@ use arrow::record_batch::RecordBatch;
 
 use crate::formats::reader::Record;
 
-/// Convert an Arrow RecordBatch to a vector of Records
+/// Convert an Arrow RecordBatch to a vector of Records.
 ///
-/// This bridges Arrow's columnar format to the row-based Record format expected by workers.
-/// All values are converted to strings, with nulls represented as empty strings.
+/// Each Arrow cell is stringified (Arrow null → `""`); rows are then folded
+/// through `Record::from_text_fields`, so trimmed-empty fields (including
+/// Arrow nulls) become `None` in the resulting `Record.fields`.
 pub fn record_batch_to_records(batch: &RecordBatch) -> Result<Vec<Record>> {
     let num_rows = batch.num_rows();
     let num_columns = batch.num_columns();
@@ -46,12 +48,11 @@ pub fn record_batch_to_records(batch: &RecordBatch) -> Result<Vec<Record>> {
     // Transpose to rows
     let mut records = Vec::with_capacity(num_rows);
     for row_idx in 0..num_rows {
-        let fields = column_strings
+        let fields: Vec<String> = column_strings
             .iter()
             .map(|col| col[row_idx].clone())
             .collect();
-
-        records.push(Record { fields });
+        records.push(Record::from_text_fields(fields));
     }
 
     Ok(records)
@@ -307,9 +308,18 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].fields, vec!["1", "100"]);
-        assert_eq!(records[1].fields, vec!["2", "200"]);
-        assert_eq!(records[2].fields, vec!["3", "300"]);
+        assert_eq!(
+            records[0].fields,
+            vec![Some("1".into()), Some("100".into())]
+        );
+        assert_eq!(
+            records[1].fields,
+            vec![Some("2".into()), Some("200".into())]
+        );
+        assert_eq!(
+            records[2].fields,
+            vec![Some("3".into()), Some("300".into())]
+        );
     }
 
     #[test]
@@ -323,9 +333,10 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].fields, vec!["Alice"]);
-        assert_eq!(records[1].fields, vec![""]); // Null becomes empty string
-        assert_eq!(records[2].fields, vec!["Bob"]);
+        assert_eq!(records[0].fields, vec![Some("Alice".into())]);
+        // Arrow null → array_to_strings emits "" → from_text_fields → None.
+        assert_eq!(records[1].fields, vec![None]);
+        assert_eq!(records[2].fields, vec![Some("Bob".into())]);
     }
 
     #[test]
@@ -339,9 +350,9 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].fields, vec!["1.5"]);
-        assert_eq!(records[1].fields, vec!["2.7"]);
-        assert_eq!(records[2].fields, vec![f64::consts::PI.to_string()]);
+        assert_eq!(records[0].fields, vec![Some("1.5".into())]);
+        assert_eq!(records[1].fields, vec![Some("2.7".into())]);
+        assert_eq!(records[2].fields, vec![Some(f64::consts::PI.to_string())]);
     }
 
     #[test]
@@ -355,9 +366,9 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].fields, vec!["true"]);
-        assert_eq!(records[1].fields, vec!["false"]);
-        assert_eq!(records[2].fields, vec!["true"]);
+        assert_eq!(records[0].fields, vec![Some("true".into())]);
+        assert_eq!(records[1].fields, vec![Some("false".into())]);
+        assert_eq!(records[2].fields, vec![Some("true".into())]);
     }
 
     #[test]
@@ -374,8 +385,8 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].fields, vec!["1970-01-01"]);
-        assert_eq!(records[1].fields, vec!["2022-01-01"]);
+        assert_eq!(records[0].fields, vec![Some("1970-01-01".into())]);
+        assert_eq!(records[1].fields, vec![Some("2022-01-01".into())]);
     }
 
     #[test]
@@ -406,8 +417,25 @@ mod tests {
         let records = record_batch_to_records(&batch).unwrap();
 
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].fields, vec!["1", "Alice", "100.5", "true"]);
-        assert_eq!(records[1].fields, vec!["2", "Bob", "", "false"]);
+        assert_eq!(
+            records[0].fields,
+            vec![
+                Some("1".into()),
+                Some("Alice".into()),
+                Some("100.5".into()),
+                Some("true".into()),
+            ]
+        );
+        // balance is Arrow-null for row 2 → "" → from_text_fields → None.
+        assert_eq!(
+            records[1].fields,
+            vec![
+                Some("2".into()),
+                Some("Bob".into()),
+                None,
+                Some("false".into()),
+            ]
+        );
     }
 
     #[test]
