@@ -214,11 +214,13 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     validate_load_args(&args)?;
     let pool = build_pool(&args).await?;
 
-    // L2 needs a stable pre/post pair. `--if-not-exists` may create the
-    // table mid-load, so a pre-count would either error (table missing)
-    // or mis-classify a re-run against a populated target as
-    // `ExtraTarget`. Skip L2 in that case; L1 still runs via classify().
-    let l2_runs = args.verify == VerifyMode::Count && !args.create_table_if_missing;
+    // L2 needs a stable pre/post pair AND an exact source count to be
+    // meaningful. Skip on `--if-not-exists` (table may not exist yet, and a
+    // re-run would mis-classify as ExtraTarget) and on csv/tsv (classify()
+    // short-circuits to SkippedNoExactSourceCount, wasting two count(*)).
+    let l2_runs = args.verify == VerifyMode::Count
+        && !args.create_table_if_missing
+        && matches!(args.format, Format::PgDump | Format::Parquet);
     let target_pre_count = if l2_runs {
         Some(
             crate::verify::count_table_rows(&pool, &args.schema, &args.target_table)
@@ -270,11 +272,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     Ok(result)
 }
 
-/// Build the connection pool from `args`, with the `#[cfg(test)] test_pool`
-/// shortcut applied first so SQLite-backed tests skip the IAM path. Pulled
-/// out of [`run_load`] so the body of `run_load` becomes "build pool, hand
-/// off to `run_load_with_pool`" — the migrate orchestrator drives
-/// `run_load_with_pool` directly with its own already-built pool.
+/// Build the connection pool. Honors `args.test_pool` in `#[cfg(test)]`.
 async fn build_pool(args: &LoadArgs) -> Result<crate::db::Pool> {
     #[cfg(test)]
     if let Some(test_pool) = args.test_pool.clone() {
@@ -313,9 +311,14 @@ pub(crate) async fn run_load_with_pool(
     let reader_factory = ReaderFactory::new(&aws_config);
     let (file_reader, pgdump_columns) = match args.format {
         Format::PgDump => {
-            reader_factory
+            let (reader, columns) = reader_factory
                 .create_pgdump_reader(&parsed_uri, &args.schema, &args.target_table)
-                .await?
+                .await?;
+            // Symmetric to migrate's per-block validation — guards INSERT SQL.
+            for col in &columns {
+                validate_pgdump_identifier("column", col)?;
+            }
+            (reader, columns)
         }
         _ => {
             let reader = reader_factory

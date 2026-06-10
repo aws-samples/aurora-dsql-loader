@@ -77,8 +77,10 @@ pub enum VerifyVerdict {
     /// L2 excess: target grew more than `records_loaded`. Concurrent
     /// writer or duplicate accounting.
     ExtraTarget(u64),
-    /// L2 shortfall under `Skip`/`DoUpdate` — exactly N rows lost to
-    /// conflict resolution. Informational, not a bug.
+    /// L2 shortfall under `Skip`/`DoUpdate` — N rows resolved by ON CONFLICT.
+    /// Expected under conflict-tolerant modes; CLI still exits 1 so a chained
+    /// `migrate && deploy.sh` does not ship a partially-loaded cluster without
+    /// operator review.
     RowsConflictedAtTarget(u64),
     /// csv/tsv: no exact source count, so L1 can't run.
     SkippedNoExactSourceCount,

@@ -1068,11 +1068,16 @@ impl Coordinator {
 
         let total_records_loaded: u64 = chunk_results.iter().map(|r| r.records_loaded).sum();
         let total_records_failed: u64 = chunk_results.iter().map(|r| r.records_failed).sum();
-        // All-or-nothing fold: any missing chunk count → None.
-        let total_source_rows: Option<u64> = chunk_results
-            .iter()
-            .map(|r| r.source_rows_in_chunk)
-            .try_fold(0u64, |acc, n| n.map(|x| acc + x));
+        // A missing chunk-result file (worker crashed) shrinks records_loaded
+        // and source_rows together, so a naive fold would silently report Match.
+        let total_source_rows: Option<u64> = if chunk_results.len() < chunks.len() {
+            None
+        } else {
+            chunk_results
+                .iter()
+                .map(|r| r.source_rows_in_chunk)
+                .try_fold(0u64, |acc, n| n.map(|x| acc + x))
+        };
         let duration = start_time.elapsed();
 
         // Warn if significantly fewer records were processed than estimated

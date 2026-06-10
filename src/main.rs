@@ -704,7 +704,7 @@ async fn run_loader(
         delimiter: source.delimiter.clone(),
         quote: source.quote.clone(),
         escape: source.escape.clone(),
-        // `header_mode` ArgGroup makes --header/--no-header mutually exclusive at parse time.
+        // --header / --no-header are mutually exclusive (clap `conflicts_with`).
         has_header: if source.header {
             Some(true)
         } else if source.no_header {

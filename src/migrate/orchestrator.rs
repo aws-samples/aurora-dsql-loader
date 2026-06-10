@@ -123,8 +123,8 @@ pub struct TableLoadSummary {
 /// 5. if any `unfixable` diagnostic surfaced — short-circuit and return
 ///    the report so the operator can edit the dump and re-run,
 /// 6. otherwise apply the fixed DDL one statement at a time, and
-/// 7. load each table's data via `run_load_with_pool` reusing the same
-///    `Pool` the apply stage used.
+/// 7. load each table's data via `run_load_with_pool_for_pgdump_block`,
+///    reusing the same `Pool`, the pre-resolved `CopyBlock`, and `aws_config`.
 ///
 /// When `args.dry_run` is set the function stops after step 4 (transform)
 /// — the operator gets the proposed DDL and the diagnostic split, no
