@@ -116,12 +116,8 @@ pub struct LoadArgs {
     // Conflict resolution strategy
     pub on_conflict: OnConflict,
 
-    /// Post-load verification mode (L2 target `count(*)`). L1 source-row
-    /// cross-check always runs when the format provides exact source rows
-    /// (pgdump, parquet); `Off` only suppresses L2.
-    /// Default per-entry-point: `migrate` runs `Count`; plain `load` runs
-    /// `Off` (the operator opts in via `--verify=count` to absorb the
-    /// `count(*)` cost on a pre-existing target).
+    /// L2 toggle. L1 always runs when the format gives an exact source
+    /// count. CLI default: `load`=Off, `migrate`=Count.
     pub verify: VerifyMode,
 
     // Columns to exclude from INSERT statements (DB applies DEFAULT values)
@@ -151,16 +147,12 @@ pub struct LoadResult {
     pub records_failed: u64,
     /// Estimated row count from file size (for mismatch detection)
     pub estimated_rows: Option<u64>,
-    /// Exact source-row count summed across chunks. `Some` for pgdump and
-    /// parquet (parser-independent counts); `None` for csv/tsv
-    /// (quote-aware exact counting not yet implemented).
+    /// Exact source-row count summed across chunks. `Some` for pgdump
+    /// and parquet; `None` for csv/tsv.
     pub source_rows: Option<u64>,
-    /// Verdict from the count-level verification layer for the
-    /// [`run_load`] entry point — `Some` when `--verify=count`, `None`
-    /// when `--verify=off`. The migrate orchestrator builds its own
-    /// per-table [`VerifyOutcome`] on `TableLoadSummary.verify` and
-    /// leaves this field `None` on the per-block `LoadResult` it
-    /// consumes internally.
+    /// `Some` under `--verify=count` on the `run_load` path. Migrate
+    /// builds its own outcome on `TableLoadSummary.verify` and leaves
+    /// this `None`.
     pub verify: Option<VerifyOutcome>,
     pub duration: Duration,
     /// Path to persisted manifest directory (if errors occurred and temp dir was used)
@@ -206,10 +198,6 @@ pub struct LoadResult {
 ///     delimiter: None,
 ///     quote: None,
 ///     escape: None,
-///     // The CSV in this example has a header row that names the destination
-///     // columns. With `create_table_if_missing: true`, leaving this as `None`
-///     // would name columns from row 1's data values (the new 3.0 default
-///     // treats every row as data). Set explicitly when loading a header-bearing file.
 ///     has_header: Some(true),
 ///     exclude_columns: Vec::new(),
 /// };
@@ -226,15 +214,10 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     validate_load_args(&args)?;
     let pool = build_pool(&args).await?;
 
-    // Capture the target pre-count BEFORE the load when L2 verify is on.
-    // L2 needs a stable pre/post comparison, but `--if-not-exists` lets
-    // the loader create the table mid-load; counting before creation
-    // would error, and assuming the table is fresh would mis-classify a
-    // re-run against an already-populated table as `ExtraTarget`. So
-    // when `--if-not-exists` is set we skip L2 entirely (`None` pre/post)
-    // and fall through to L1-only verdict via classify(). The operator
-    // still gets `LoaderDropped`/`Match` but loses target-side coverage —
-    // documented on the `--verify` flag in main.rs.
+    // L2 needs a stable pre/post pair. `--if-not-exists` may create the
+    // table mid-load, so a pre-count would either error (table missing)
+    // or mis-classify a re-run against a populated target as
+    // `ExtraTarget`. Skip L2 in that case; L1 still runs via classify().
     let l2_runs = args.verify == VerifyMode::Count && !args.create_table_if_missing;
     let target_pre_count = if l2_runs {
         Some(
@@ -459,12 +442,8 @@ async fn run_load_with_pool_and_reader(
         None
     };
 
-    // L2 verify (target pre/post counts) is the orchestrator's job — it
-    // runs the `count(*)` queries because it owns the per-table loop and
-    // can choose which tables to verify. `run_load_with_pool_and_reader`
-    // ships only the L1 inputs (`source_rows`); the orchestrator builds
-    // the `VerifyOutcome` later when it has the full picture, or skips
-    // verification entirely on the plain-load path with `--verify=off`.
+    // L1 inputs only — callers (run_load / migrate orchestrator) own
+    // L2 and the final VerifyOutcome.
     Ok(LoadResult {
         job_id: result.job_id,
         chunks_processed: result.chunks_processed,
@@ -523,12 +502,10 @@ fn validate_load_args(args: &LoadArgs) -> Result<()> {
     Ok(())
 }
 
-/// Reject SQL-identifier inputs (`--schema`, `--table`) that would break
-/// downstream identifier quoting. `Pool::qualified_table_name` interpolates
-/// the value into `format!("\"{}\"", …)` without escape-doubling embedded
-/// quotes, and the worker's INSERT generation does the same with column
-/// names. Rejecting embedded `"` and control bytes here closes the otherwise
-/// open path from CLI args into raw SQL.
+/// Reject CLI identifiers that would break SQL identifier quoting.
+/// `Pool::qualified_table_name` wraps the value in `"…"` without
+/// escape-doubling, so embedded `"` / control bytes / bidi-format
+/// codepoints are blocked here.
 fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("--{field} must not be empty");
@@ -544,13 +521,9 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Reject SQL identifiers parsed out of an untrusted pg_dump file — the
-/// dump is a second untrusted input alongside CLI args. `block.schema` /
-/// `block.table` / `block.columns` from `list_copy_blocks` flow into the
-/// `count(*)` query, worker INSERTs, and operator stdout via the migrate
-/// summary; without this guard a crafted COPY header could smuggle SQL
-/// fragments, control bytes, or bidi codepoints. Reuses the same
-/// allowlist as the CLI surface; only the error wording differs.
+/// Same allowlist as `validate_identifier` but applied to identifiers
+/// parsed out of the dump (block.schema/table/columns). Distinct error
+/// wording so the operator knows the dump is at fault, not their CLI.
 pub(crate) fn validate_pgdump_identifier(field: &'static str, value: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("pg_dump {field} identifier must not be empty");
@@ -567,14 +540,9 @@ pub(crate) fn validate_pgdump_identifier(field: &'static str, value: &str) -> Re
     Ok(())
 }
 
-/// Unicode bidi-control and zero-width / format codepoints that visually
-/// reorder or hide surrounding text in a terminal — RLM, LRM, RTL/LTR
-/// overrides, ZWSP/ZWNJ/ZWJ, BOM/ZWNBSP, line/paragraph separators, bidi
-/// isolates. A deceptive identifier carrying any of these would confuse an
-/// operator reading load logs even though it cannot escape SQL quoting.
-///
-/// Shared between `validate_identifier` (CLI `--schema` / `--table` inputs)
-/// and `main::is_unsafe_for_listing` (the `list-tables` TSV output guard).
+/// Unicode bidi/zero-width/format codepoints that visually reorder or
+/// hide surrounding text in a terminal. Shared between identifier
+/// validation and the `list-tables` TSV output guard.
 pub fn is_bidi_or_format_char(c: char) -> bool {
     matches!(
         c,

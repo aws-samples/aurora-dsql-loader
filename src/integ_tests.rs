@@ -4007,7 +4007,7 @@ mod tests {
             column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: OnConflict::DoNothing,
-            verify: VerifyMode::Off,
+            verify: VerifyMode::Count,
             exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
@@ -4853,10 +4853,9 @@ mod tests {
         Ok(())
     }
 
-    // ============ Verification (source_rows + LoadResult.verify) ============
+    // ============ Verify (source_rows + LoadResult.verify) ============
 
-    /// `LoadResult.source_rows` reflects the exact pgdump source-row count
-    /// (one `\n` per record). Pin the pgdump leg of L1's input.
+    /// pgdump: source_rows == record count.
     #[tokio::test]
     async fn pgdump_load_populates_source_rows_exact_count() -> anyhow::Result<()> {
         let mut f = tempfile::NamedTempFile::new()?;
@@ -4878,13 +4877,14 @@ mod tests {
         assert_eq!(result.source_rows, Some(10));
         assert_eq!(result.records_loaded, 10);
         assert_eq!(result.records_failed, 0);
-        // verify=Off (the load default) → no VerifyOutcome.
-        assert!(result.verify.is_none());
+        let v = result.verify.as_ref().unwrap();
+        assert_eq!(v.verdict, crate::verify::VerifyVerdict::Match);
+        assert_eq!(v.target_pre_count, Some(0));
+        assert_eq!(v.target_post_count, Some(10));
         Ok(())
     }
 
-    /// `LoadResult.source_rows` for parquet equals the sum of the chunk's
-    /// row-group `num_rows`. Pin the parquet leg of L1's input.
+    /// parquet: source_rows == sum of row-group `num_rows`.
     #[tokio::test]
     async fn parquet_load_populates_source_rows_exact_count() {
         let temp_dir = TempDir::new().unwrap();
@@ -4921,7 +4921,7 @@ mod tests {
             column_mappings: HashMap::new(),
             resume_job_id: None,
             on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
-            verify: VerifyMode::Off,
+            verify: VerifyMode::Count,
             exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,
@@ -4932,11 +4932,13 @@ mod tests {
         let result = run_load(args).await.unwrap();
         assert_eq!(result.source_rows, Some(50));
         assert_eq!(result.records_loaded, 50);
+        let v = result.verify.as_ref().unwrap();
+        assert_eq!(v.verdict, crate::verify::VerifyVerdict::Match);
+        assert_eq!(v.target_pre_count, Some(0));
+        assert_eq!(v.target_post_count, Some(50));
     }
 
-    /// CSV/TSV: `source_rows` is `None` (quote-aware exact counting is v2).
-    /// Pin the SkippedNoExactSourceCount path: with verify=Count and source
-    /// counts None, the verdict short-circuits.
+    /// csv + verify=Count → SkippedNoExactSourceCount (no exact source count).
     #[tokio::test]
     async fn csv_load_with_verify_count_yields_skipped_verdict() {
         let temp_dir = TempDir::new().unwrap();
@@ -4986,45 +4988,9 @@ mod tests {
         );
     }
 
-    /// run_load with verify=Count on a pgdump fixture produces
-    /// VerifyVerdict::Match. Pre-count is captured against the existing
-    /// (empty) target, post-count reflects the loaded rows.
-    #[tokio::test]
-    async fn pgdump_run_load_verify_count_matches() -> anyhow::Result<()> {
-        let mut f = tempfile::NamedTempFile::new()?;
-        writeln!(f, "COPY public.things (id, name) FROM stdin;")?;
-        for i in 0..5 {
-            writeln!(f, "{i}\tname{i}")?;
-        }
-        writeln!(f, "\\.")?;
-        f.flush()?;
-
-        let pool = setup_sqlite_table("things", "id INTEGER, name TEXT").await;
-        let mut args = pgdump_load_args(
-            f.path().to_string_lossy().into_owned(),
-            "things",
-            pool.clone(),
-        );
-        args.verify = VerifyMode::Count;
-        let result = run_load(args).await?;
-        let v = result
-            .verify
-            .as_ref()
-            .expect("verify=Count must produce a VerifyOutcome");
-        assert_eq!(v.verdict, crate::verify::VerifyVerdict::Match);
-        assert_eq!(v.source_rows, Some(5));
-        assert_eq!(v.target_pre_count, Some(0));
-        assert_eq!(v.target_post_count, Some(5));
-        Ok(())
-    }
-
-    /// Regression: `--if-not-exists` + `--verify=count` against a table
-    /// that already exists with rows must NOT report `ExtraTarget`. The
-    /// flag is idempotent; an operator who runs the same load twice is
-    /// the canonical case. Earlier impl recorded `target_pre_count = 0`
-    /// unconditionally when create_table_if_missing was true, producing
-    /// a false `ExtraTarget(N)` on every re-run. Fix: skip L2 entirely
-    /// in this mode; report L1-only Match.
+    /// `--if-not-exists` + verify=Count against a populated target
+    /// must skip L2 (else a re-run would report ExtraTarget). L1-only
+    /// path → SkippedNoExactSourceCount for csv.
     #[tokio::test]
     async fn csv_load_with_if_not_exists_and_verify_count_skips_l2() {
         let temp_dir = TempDir::new().unwrap();
@@ -5032,7 +4998,7 @@ mod tests {
 
         // Pre-create the target with rows already present — simulates a
         // prior run that loaded data, plus the operator re-running with
-        // --if-not-exists for idempotency.
+        // re-run with --if-not-exists for idempotency.
         let pool =
             setup_sqlite_table("verify_idem", "id TEXT, name TEXT, value TEXT, amount TEXT").await;
         if let Ok(mut conn) = pool.acquire().await
@@ -5056,8 +5022,6 @@ mod tests {
             chunk_size_bytes: 10_000_000,
             batch_size: 100,
             batch_concurrency: 1,
-            // The flag under test: --if-not-exists path must NOT cause
-            // a bogus ExtraTarget verdict when the table is pre-populated.
             create_table_if_missing: true,
             manifest_dir: None,
             quiet: true,
@@ -5078,12 +5042,10 @@ mod tests {
             .verify
             .as_ref()
             .expect("verify=Count must produce a VerifyOutcome");
-        // L2 must be skipped under --if-not-exists.
+        // L2 skipped under --if-not-exists.
         assert_eq!(v.target_pre_count, None);
         assert_eq!(v.target_post_count, None);
-        // CSV has no exact source row count, so L1 also yields the
-        // skipped verdict (proves we routed through classify and didn't
-        // synthesise a bogus Match).
+        // csv → L1 also skipped → SkippedNoExactSourceCount.
         assert_eq!(
             v.verdict,
             crate::verify::VerifyVerdict::SkippedNoExactSourceCount,
@@ -5091,14 +5053,8 @@ mod tests {
         );
     }
 
-    /// Companion to the CSV test: pgdump under `--if-not-exists` +
-    /// `--verify=count` must reach L1 Match (source_rows is exact for
-    /// pgdump) and skip L2 (target_pre/post None) — never ExtraTarget.
-    /// Note: `validate_load_args` rejects `--if-not-exists` with pgdump
-    /// today, so the run won't even reach the verify path; this test
-    /// exists as a tripwire — if a future change relaxes the validation
-    /// (e.g. pgdump schema inference lands), the verify behavior under
-    /// `--if-not-exists` must still be correct.
+    /// `validate_load_args` rejects `--if-not-exists` with pgdump
+    /// today; this is a tripwire if that ever relaxes.
     #[tokio::test]
     async fn pgdump_with_if_not_exists_is_rejected_at_validation() -> anyhow::Result<()> {
         let mut f = tempfile::NamedTempFile::new()?;

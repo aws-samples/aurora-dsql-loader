@@ -53,12 +53,9 @@ pub struct MigrateArgs {
     /// `OnConflict::Error` — duplicate rows usually indicate a bug. The
     /// default mirrors what `run_load` accepts so this knob is opt-in.
     pub on_conflict: OnConflict,
-    /// Post-load verification mode. Default for migrate is
-    /// [`VerifyMode::Count`]: the orchestrator runs a pre + post `count(*)`
-    /// per loaded table, builds an L1+L2 [`VerifyOutcome`], and attaches it
-    /// to each [`TableLoadSummary`]. Set to [`VerifyMode::Off`] to skip
-    /// (and pay zero verify cost). The fresh-cluster posture makes
-    /// `Count`-on-by-default cheap: pre-count of an empty table is sub-ms.
+    /// L2 verification toggle. Default `Count`: cheap on a fresh
+    /// cluster (pre-count is sub-ms) and the verdict closes the loop
+    /// on the load.
     pub verify: VerifyMode,
     /// Forwarded to `LoadArgs.quiet` for log-level control.
     pub quiet: bool,
@@ -112,11 +109,7 @@ pub struct TableLoadSummary {
     /// it to inspect the failed-row chunks. `None` when the table loaded
     /// cleanly or when `--manifest-dir` was supplied (caller-owned).
     pub persisted_manifest_dir: Option<PathBuf>,
-    /// Verification outcome for this table. `Some` when
-    /// [`MigrateArgs::verify`] is [`VerifyMode::Count`] (the migrate
-    /// default); `None` only when explicitly disabled. Holds the L1
-    /// source-vs-loader cross-check and the L2 target pre/post counts in
-    /// a single verdict — see [`VerifyVerdict`].
+    /// `Some` under verify=Count, `None` otherwise.
     pub verify: Option<VerifyOutcome>,
 }
 
@@ -147,11 +140,7 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         "migrate: scanned pg_dump for COPY blocks"
     );
 
-    // Defense in depth: the dump is untrusted input. Validate every
-    // schema / table / column identifier before they flow into
-    // `count(*)` SQL, worker INSERTs, or operator-facing stdout. CLI
-    // args go through `validate_load_args`; the dump path needs the
-    // same guard.
+    // Validate dump-parsed identifiers before they reach SQL or stdout.
     for block in &blocks {
         crate::runner::validate_pgdump_identifier("schema", &block.schema)?;
         crate::runner::validate_pgdump_identifier("table", &block.table)?;
@@ -210,10 +199,8 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
     // each load skips the dump rescan + credential-chain walk.
     let mut tables = Vec::with_capacity(blocks.len());
     for block in &blocks {
-        // L2 pre-count BEFORE the load. apply_ddl ran above, so the table
-        // exists; counting an empty fresh-cluster table is sub-ms. When
-        // verify=Off we skip the call entirely (zero L2 cost), but L1
-        // still flows because source_rows is computed during the load.
+        // L2 pre-count. Table exists (apply_ddl ran). L1 still runs
+        // when verify=Off because source_rows is parser-side.
         let target_pre_count = if args.verify == VerifyMode::Count {
             Some(
                 count_table_rows(&pool, &block.schema, &block.table)
@@ -377,11 +364,7 @@ fn build_load_args(args: &MigrateArgs, table: &str, schema: &str) -> LoadArgs {
         debug: args.debug,
         resume_job_id: None,
         on_conflict: args.on_conflict,
-        // The orchestrator drives L2 itself (it owns the per-table pre/post
-        // count loop) — so the inner `run_load_with_pool_for_pgdump_block`
-        // call must NOT also run verify. Pin to `Off` here regardless of
-        // `args.verify`; the orchestrator's verify decision lives in
-        // `run_migrate` below.
+        // Orchestrator owns L2; the inner call must not double-verify.
         verify: VerifyMode::Off,
         exclude_columns: Vec::new(),
         delimiter: None,
@@ -435,10 +418,7 @@ mod tests {
             batch_concurrency: 1,
             chunk_size_bytes: 1024 * 1024,
             on_conflict: OnConflict::Error,
-            // Off by default in test-helper because most tests focus on
-            // DDL apply / load shape; verify-specific tests opt in by
-            // overriding this field.
-            verify: VerifyMode::Off,
+            verify: VerifyMode::Count,
             quiet: true,
             debug: false,
             test_pool: Some(pool),
@@ -873,10 +853,8 @@ COPY public.valid_first (id) FROM stdin;
         assert_eq!(row_count, 0);
     }
 
-    /// Migrate happy path with verify=Count: a clean fresh-cluster load
-    /// must produce `Match` for every table, with `source_rows == loaded`,
-    /// `target_pre_count == 0`, and `target_post_count == loaded`. Pins
-    /// the L1+L2 contract end-to-end through the orchestrator.
+    /// verify=Count happy path: every table → Match, source_rows ==
+    /// loaded, pre=0, post=loaded.
     #[tokio::test]
     async fn run_migrate_verify_count_emits_match_per_table() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -918,9 +896,7 @@ COPY public.events (id, label) FROM stdin;
         }
     }
 
-    /// Verify=Off: no `VerifyOutcome` is built and the orchestrator pays
-    /// zero `count(*)` cost. Pins the cost-control contract — operators
-    /// who explicitly opt out must not get hidden L2 traffic.
+    /// verify=Off → TableLoadSummary.verify is None, no count(*) runs.
     #[tokio::test]
     async fn run_migrate_verify_off_leaves_summary_verify_none() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -944,9 +920,8 @@ COPY public.t (id, x) FROM stdin;
         );
     }
 
-    /// On_conflict=DoNothing with pre-existing duplicate rows in the
-    /// target: L2 surfaces the gap as `RowsConflictedAtTarget(N)` rather
-    /// than `MissingTarget(N)`. Pins the per-OnConflict verdict shape.
+    /// DoNothing + pre-existing duplicates → RowsConflictedAtTarget(N),
+    /// not MissingTarget(N).
     #[tokio::test]
     async fn run_migrate_verify_count_classifies_pk_conflicts_under_skip() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -977,9 +952,7 @@ COPY public.t (id, x) FROM stdin;
             .verify
             .as_ref()
             .expect("verify must be Some under verify=Count");
-        // 3 rows submitted; 2 conflicted at target; only 1 new row landed.
-        // records_loaded counts the statement as successful (3) but
-        // target_delta is 1, so shortfall = 2.
+        // 3 submitted, 2 conflicted, 1 landed → shortfall = 2.
         assert_eq!(v.records_loaded, 3);
         assert_eq!(v.target_pre_count, Some(2));
         assert_eq!(v.target_post_count, Some(3));
@@ -991,11 +964,8 @@ COPY public.t (id, x) FROM stdin;
         );
     }
 
-    /// Symmetric to above but under `OnConflict::Error`: a duplicate row
-    /// makes the load FAIL outright (records_failed > 0), not silently
-    /// missing-target. The orchestrator halts on the first failed table,
-    /// so we don't reach the verify path under Error+conflict; this test
-    /// pins that the failure surfaces normally.
+    /// OnConflict::Error + duplicate → records_failed > 0 (not a verify
+    /// shortfall). Orchestrator halts before the next table.
     #[tokio::test]
     async fn run_migrate_verify_count_under_error_with_conflict_halts() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -1025,9 +995,8 @@ COPY public.t (id, x) FROM stdin;
         );
     }
 
-    /// Symmetric to unfixable_does_not_build_pool with verify=Count
-    /// requested: when transform_ddl surfaces unfixable, no tables load
-    /// and no verify outcomes get built.
+    /// verify=Count + unfixable: short-circuit still wins, no tables
+    /// load and no verify outcomes are built.
     #[tokio::test]
     async fn run_migrate_verify_unfixable_short_circuits_no_verify_outcome() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -1048,17 +1017,13 @@ COPY public.events (id) FROM stdin;
         );
     }
 
-    /// A crafted pg_dump COPY header carrying an embedded `"` in the
-    /// table identifier must be rejected before any pool query, DDL
-    /// apply, or per-table println — the dump is a second untrusted
-    /// input alongside CLI args, and `count(*)` SQL plus operator
-    /// stdout are both downstream of `block.table`.
+    /// Embedded `"` in a dump-parsed table identifier is rejected
+    /// before any pool query or DDL apply.
     #[tokio::test]
     async fn run_migrate_rejects_dump_identifiers_with_embedded_quote() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
-        // The embedded `""` decodes via `read_identifier` to a single
-        // `"` inside the identifier. Without validation this lands in
-        // `format!("\"{name}\"")` and corrupts the SQL.
+        // `""` decodes to a single `"` in the identifier — would
+        // corrupt `format!("\"{name}\"")` if validation is skipped.
         let dump = "\
 COPY public.\"evil\"\"name\" (id) FROM stdin;
 1

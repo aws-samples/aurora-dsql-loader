@@ -74,14 +74,9 @@ impl<R: ByteReader + 'static> FileReader for PgDumpReader<R> {
             .await
             .context("Failed to read chunk data")?;
 
-        // Tee an exact source-row count off the raw bytes BEFORE parsing.
-        // pg_dump escapes embedded `\n` as the two literal bytes `\` `n`, so
-        // every byte-newline inside `[data_start, data_end)` corresponds to
-        // exactly one record. The `\.` terminator line is excluded by chunk
-        // construction (`data_end` stops at the start of `\.` — see
-        // scan.rs CopyBlock docs), so no end-of-block adjustment is needed.
-        // Drives the L1 verification cross-check against
-        // `records_loaded + records_failed`.
+        // Exact L1 count: pg_dump escapes embedded `\n` as `\` + `n`,
+        // so every byte-newline in `[data_start, data_end)` is one
+        // record. `\.` is excluded by chunk construction.
         let source_rows = buffer.iter().filter(|&&b| b == b'\n').count() as u64;
 
         let expected_columns = self.block.columns.len();
@@ -133,9 +128,8 @@ mod tests {
     use crate::io::LocalFileByteReader;
     use std::io::Write;
 
-    /// Pin the L1 invariant: source_rows_in_chunk equals the exact source-row
-    /// count for the COPY block. Each `\n` in `[data_start, data_end)` is one
-    /// record, the `\.` terminator is excluded by chunk construction.
+    /// L1 invariant: source_rows_in_chunk == record count for a clean
+    /// single-chunk dump. `\.` is excluded by chunk construction.
     #[tokio::test]
     async fn pgdump_read_chunk_source_rows_matches_record_count() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -161,18 +155,15 @@ mod tests {
         assert_eq!(chunk_data.parse_errors, 0);
     }
 
-    /// Pin the empty-line invariant called out in the design doc: every
-    /// byte-newline in a pgdump COPY block corresponds to a record OR a
-    /// `parse_error`. A future change that drops empty lines silently would
-    /// break L1's source-vs-loader cross-check.
+    /// Empty-line invariant: every `\n` in a COPY block becomes a
+    /// record OR a parse_error. Silent drops would break L1.
     #[tokio::test]
     async fn pgdump_empty_line_counts_as_parse_error_so_l1_holds() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "COPY public.t (id, name) FROM stdin;").unwrap();
         writeln!(f, "1\talpha").unwrap();
-        // Empty line in the middle of the COPY block — pg_dump never emits
-        // these, but a hand-edited or corrupted dump might. Must surface
-        // as a parse_error, not a silent drop.
+        // Hand-edited / corrupted dump: empty line mid-block. Must
+        // surface as parse_error, not a silent drop.
         writeln!(f).unwrap();
         writeln!(f, "2\tbeta").unwrap();
         writeln!(f, "\\.").unwrap();

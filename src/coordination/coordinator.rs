@@ -156,8 +156,7 @@ fn align_pgdump_schema_to_copy_columns(
 
     if copy_set != target_set {
         let target_names: Vec<&str> = resolved.columns.iter().map(|c| c.name.as_str()).collect();
-        // Sort the diff lists so the bail message is deterministic across runs
-        // (HashSet::difference iteration order is not stable).
+        // Sort for deterministic error output (HashSet iteration is unstable).
         let mut missing_in_target: Vec<&str> = copy_set.difference(&target_set).copied().collect();
         let mut missing_in_dump: Vec<&str> = target_set.difference(&copy_set).copied().collect();
         missing_in_target.sort_unstable();
@@ -274,10 +273,8 @@ pub struct LoadResult {
     /// Sum of per-chunk row estimates obtained by sampling the source bytes;
     /// used to flag a large delta vs records actually loaded.
     pub estimated_rows: Option<u64>,
-    /// Exact source-row count summed across all chunks. `Some` only when every
-    /// chunk reported a count (pgdump and parquet do; csv/tsv leave `None`),
-    /// so a single missing chunk count collapses the total to `None`. Drives
-    /// the L1 verification cross-check.
+    /// Exact source-row count summed across chunks. `None` if any
+    /// chunk lacks a count (csv/tsv) — drives L1.
     pub source_rows: Option<u64>,
     pub duration: Duration,
     /// Detailed results for each chunk (accessed in integration tests)
@@ -762,12 +759,9 @@ impl Coordinator {
             }
         }
 
-        // --exclude-columns on resume: the flag may be omitted (the manifest's list
-        // is authoritative), but if supplied it must match the manifest as a set.
-        // Avoids forcing operators to retype the list while still catching accidental
-        // drift. Compare as sets (sorted) because the manifest stores the list in
-        // schema order while the user-passed list is in CLI order — semantically
-        // equivalent lists should not trip the check.
+        // --exclude-columns on resume: optional, but if supplied must
+        // match the manifest as a set (manifest order is schema-order,
+        // CLI order is user-order — both are valid).
         if !config.exclude_columns.is_empty() {
             let mut requested = config.exclude_columns.clone();
             let mut stored = manifest.table.excluded_columns.clone();
@@ -1074,12 +1068,7 @@ impl Coordinator {
 
         let total_records_loaded: u64 = chunk_results.iter().map(|r| r.records_loaded).sum();
         let total_records_failed: u64 = chunk_results.iter().map(|r| r.records_failed).sum();
-        // Sum source-row counts only when every chunk reported one; a single
-        // missing count (e.g. csv/tsv reader, or a chunk-result file from a
-        // pre-verify run that had no field) collapses the whole total to
-        // `None` so the L1 verdict path skips cleanly with
-        // `SkippedNoExactSourceCount` instead of comparing against a
-        // partial sum.
+        // All-or-nothing fold: any missing chunk count → None.
         let total_source_rows: Option<u64> = chunk_results
             .iter()
             .map(|r| r.source_rows_in_chunk)

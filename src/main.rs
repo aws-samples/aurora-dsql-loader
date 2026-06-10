@@ -108,18 +108,10 @@ struct LoadParams {
     #[arg(long, default_value = "do-nothing")]
     on_conflict: String,
 
-    /// Post-load verification mode (`off`, `count`). Default `off`: the loader
-    /// emits per-chunk source-row counts but does not run target `count(*)`.
-    /// `count` adds a pre + post `count(*)` against the target table and
-    /// reports an `L1+L2` verdict (Match / LoaderDropped / MissingTarget /
-    /// ExtraTarget / RowsConflictedAtTarget / SkippedNoExactSourceCount).
-    /// Off by default on `load` to avoid the `count(*)` cost on a
-    /// pre-existing target; on by default on `migrate` (fresh-cluster).
-    /// `count` assumes the loader is the sole writer of the target table
-    /// during the run — concurrent writers between pre-count and
-    /// post-count will skew the verdict. With `--if-not-exists` only the
-    /// L1 (source-vs-loader) cross-check is reported; L2 is skipped
-    /// because the table doesn't exist at pre-count time.
+    /// Post-load verification (`off` | `count`). `count` adds pre/post
+    /// `count(*)` and reports an L1+L2 verdict per table. Assumes the
+    /// loader is the sole writer during the run. Skipped under
+    /// `--if-not-exists` (L2 needs a stable pre-count); L1 still runs.
     #[arg(long, default_value = "off")]
     verify: String,
 
@@ -246,14 +238,10 @@ enum Command {
         #[arg(long, default_value = "error")]
         on_conflict: String,
 
-        /// Post-load verification mode (`off`, `count`). Default `count`:
-        /// the orchestrator runs a pre + post `count(*)` per loaded table
-        /// and reports an L1+L2 verdict per table. Pre-counts on a fresh
-        /// cluster are sub-ms; the `count(*)` cost on the loaded data is
-        /// well within "no meaningful cost" for a migration window.
-        /// Assumes the loader is the sole writer of each target table
-        /// during the run — fresh-cluster `migrate` satisfies this by
-        /// construction.
+        /// Post-load verification (`off` | `count`). Default `count`:
+        /// pre/post `count(*)` per loaded table → L1+L2 verdict.
+        /// Fresh-cluster migrate makes the sole-writer assumption hold
+        /// trivially.
         #[arg(long, default_value = "count")]
         verify: String,
 
@@ -509,9 +497,8 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
             }
             if let Some(v) = &t.verify {
                 println!("    Verify: {}", format_verdict(&v.verdict));
-                // Print the underlying counts on a non-Match verdict so an
-                // operator can see the magnitudes in the summary without
-                // re-running with --debug or grepping the manifest.
+                // On a non-Match verdict, print the raw counts so the
+                // operator can size the gap without re-running.
                 if !matches!(
                     v.verdict,
                     VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
@@ -565,10 +552,7 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One-line summary of a [`VerifyVerdict`] for the CLI's loaded-tables
-/// section. Match collapses to a short marker; the other variants surface
-/// the count payload so an operator can see the exact magnitude of the
-/// drop / shortfall / excess in the summary without grepping for it.
+/// One-line CLI summary per VerifyVerdict.
 fn format_verdict(v: &VerifyVerdict) -> String {
     match v {
         VerifyVerdict::Match => "OK (counts match)".to_string(),
@@ -1298,9 +1282,7 @@ mod tests {
                     OnConflict::Error,
                     "migrate --on-conflict default must parse to OnConflict::Error",
                 );
-                // Same round-trip pin for --verify: the migrate default of
-                // "count" must parse to VerifyMode::Count. A future rename
-                // of the enum variant would surface here.
+                // CLI default "count" must round-trip to VerifyMode::Count.
                 assert_eq!(
                     verify.parse::<VerifyMode>().unwrap(),
                     VerifyMode::Count,

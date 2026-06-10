@@ -92,8 +92,7 @@ impl<R: ByteReader + Clone + 'static> GenericParquetReader<R> {
             all_records.extend(records);
         }
 
-        // Sum the parser-independent row count from the footer metadata
-        // captured at file open. Drives the L1 verification cross-check.
+        // L1 count from footer metadata.
         let source_rows: u64 = row_group_indices
             .iter()
             .filter_map(|&idx| self.row_groups.get(idx).map(|rg| rg.num_rows))

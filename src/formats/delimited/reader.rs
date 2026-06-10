@@ -106,11 +106,9 @@ impl<R: ByteReader + 'static> FileReader for GenericDelimitedReader<R> {
             }
         }
 
-        // CSV/TSV: source_rows is None — quote-aware row counting needs
-        // a second parse, and a cheap `\n` byte count would over-count
-        // any newline inside a quoted field. L1 short-circuits with
-        // `SkippedNoExactSourceCount`; `estimated_rows` from `metadata`
-        // still carries through.
+        // CSV/TSV: no exact source-row count (a `\n` tally would
+        // over-count newlines inside quoted fields). `estimated_rows`
+        // from metadata still carries through.
         Ok(ChunkData {
             records,
             bytes_read: chunk.end_offset - chunk.start_offset,
