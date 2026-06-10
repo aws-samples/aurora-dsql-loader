@@ -271,6 +271,10 @@ aurora-dsql-loader load \
 
 Resume automatically retries failed chunks and skips completed ones. For safety against duplicates on retry, use unique constraints on your table—the loader will use `ON CONFLICT DO NOTHING` to skip duplicates.
 
+## Verification
+
+`--verify=count` cross-checks row counts after a load and reports one verdict per table: `Match`, `LoaderDropped(N)`, `MissingTarget(N)`, `ExtraTarget(N)`, `RowsConflictedAtTarget(N)`, or `SkippedNoExactSourceCount` (csv/tsv). A non-Match verdict exits non-zero. Default: `off` for `load`, `count` for `migrate`. Assumes the loader is the sole writer to the target during the run.
+
 ## Performance Tuning
 
 The loader parallelizes work on two axes. Total in-flight INSERTs ≈ `workers × batch-concurrency`.
