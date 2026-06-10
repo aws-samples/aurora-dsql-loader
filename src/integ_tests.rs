@@ -4996,9 +4996,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let csv_path = create_test_csv(&temp_dir, "verify.csv", 10).await;
 
-        // Pre-create the target with rows already present — simulates a
-        // prior run that loaded data, plus the operator re-running with
-        // re-run with --if-not-exists for idempotency.
+        // Pre-populate: simulates a prior load + operator re-run under --if-not-exists.
         let pool =
             setup_sqlite_table("verify_idem", "id TEXT, name TEXT, value TEXT, amount TEXT").await;
         if let Ok(mut conn) = pool.acquire().await
@@ -5071,6 +5069,28 @@ mod tests {
         assert!(
             err.contains("create_table_if_missing"),
             "pgdump + --if-not-exists must be rejected at validation; got: {err}"
+        );
+        Ok(())
+    }
+
+    /// Symmetric to migrate's `run_migrate_rejects_dump_identifiers_with_embedded_quote`:
+    /// the load path must reject a COPY column name with `"` before INSERT runs.
+    #[tokio::test]
+    async fn pgdump_load_rejects_column_name_with_embedded_quote() -> anyhow::Result<()> {
+        let mut f = tempfile::NamedTempFile::new()?;
+        // `""` decodes to one `"` in the column name — would corrupt INSERT
+        // identifier quoting if validation is skipped.
+        writeln!(f, "COPY public.things (id, \"evil\"\"col\") FROM stdin;")?;
+        writeln!(f, "1\twidget")?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let pool = setup_sqlite_table("things", "id INTEGER, name TEXT").await;
+        let args = pgdump_load_args(f.path().to_string_lossy().into_owned(), "things", pool);
+        let err = run_load(args).await.unwrap_err().to_string();
+        assert!(
+            err.contains("pg_dump column identifier") && err.contains("unsafe character"),
+            "expected validation error naming the column field; got: {err}"
         );
         Ok(())
     }

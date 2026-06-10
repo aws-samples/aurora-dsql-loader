@@ -106,6 +106,19 @@ fn validate_conflict_columns_not_all_excluded(
     Ok(())
 }
 
+/// L1 source-row total across chunks. `None` if any chunk lacks a count
+/// (csv/tsv) or `chunk_results` is short of `expected_chunks` (worker crash) —
+/// forces classify() to SkippedNoExactSourceCount instead of a false Match.
+fn aggregate_source_rows(chunk_results: &[ChunkResultFile], expected_chunks: usize) -> Option<u64> {
+    if chunk_results.len() < expected_chunks {
+        return None;
+    }
+    chunk_results
+        .iter()
+        .map(|r| r.source_rows_in_chunk)
+        .try_fold(0u64, |acc, n| n.map(|x| acc + x))
+}
+
 /// Maximum bytes to read for schema inference
 ///
 /// Caps the amount of data read to prevent loading entire large files just for
@@ -1068,16 +1081,7 @@ impl Coordinator {
 
         let total_records_loaded: u64 = chunk_results.iter().map(|r| r.records_loaded).sum();
         let total_records_failed: u64 = chunk_results.iter().map(|r| r.records_failed).sum();
-        // A missing chunk-result file (worker crashed) shrinks records_loaded
-        // and source_rows together, so a naive fold would silently report Match.
-        let total_source_rows: Option<u64> = if chunk_results.len() < chunks.len() {
-            None
-        } else {
-            chunk_results
-                .iter()
-                .map(|r| r.source_rows_in_chunk)
-                .try_fold(0u64, |acc, n| n.map(|x| acc + x))
-        };
+        let total_source_rows = aggregate_source_rows(&chunk_results, chunks.len());
         let duration = start_time.elapsed();
 
         // Warn if significantly fewer records were processed than estimated
@@ -1110,6 +1114,56 @@ impl Coordinator {
             duration,
             chunk_results,
         })
+    }
+}
+
+#[cfg(test)]
+mod aggregate_tests {
+    use super::*;
+    use crate::coordination::manifest::ChunkStatus;
+
+    fn mk_chunk_result(id: u32, source_rows: Option<u64>) -> ChunkResultFile {
+        ChunkResultFile {
+            chunk_id: id,
+            worker_id: "w".into(),
+            status: ChunkStatus::Success,
+            records_loaded: source_rows.unwrap_or(0),
+            records_failed: 0,
+            bytes_processed: 0,
+            started_at: "1970-01-01T00:00:00Z".into(),
+            completed_at: "1970-01-01T00:00:00Z".into(),
+            duration_secs: 0,
+            errors: Vec::new(),
+            source_rows_in_chunk: source_rows,
+        }
+    }
+
+    #[test]
+    fn aggregate_source_rows_full_set_returns_sum() {
+        let results = vec![
+            mk_chunk_result(0, Some(7)),
+            mk_chunk_result(1, Some(3)),
+            mk_chunk_result(2, Some(10)),
+        ];
+        assert_eq!(aggregate_source_rows(&results, 3), Some(20));
+    }
+
+    #[test]
+    fn aggregate_source_rows_partial_results_returns_none() {
+        // Worker crashed: only 2 of 3 expected chunk results landed.
+        let results = vec![mk_chunk_result(0, Some(7)), mk_chunk_result(1, Some(3))];
+        assert_eq!(aggregate_source_rows(&results, 3), None);
+    }
+
+    #[test]
+    fn aggregate_source_rows_any_none_chunk_returns_none() {
+        // csv/tsv path: at least one chunk has no exact count.
+        let results = vec![
+            mk_chunk_result(0, Some(7)),
+            mk_chunk_result(1, None),
+            mk_chunk_result(2, Some(10)),
+        ];
+        assert_eq!(aggregate_source_rows(&results, 3), None);
     }
 }
 
