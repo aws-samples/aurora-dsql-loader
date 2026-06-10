@@ -16,9 +16,9 @@
 //!   under `Skip`/`Update` it's `RowsConflictedAtTarget` (informational —
 //!   conflict resolution discarded N rows).
 //!
-//! Out of scope for v1: value-level fidelity (column-swap bugs,
-//! `\N`-vs-`""` mistranslation, encoding mishandling, type coercion). A
-//! count match proves completeness, not fidelity.
+//! Out of scope: value-level fidelity (column-swap bugs, `\N`-vs-`""`
+//! mistranslation, encoding mishandling, type coercion). A count match
+//! proves completeness, not fidelity.
 
 use crate::coordination::manifest::OnConflict;
 use crate::db::Pool;
@@ -75,8 +75,8 @@ impl std::fmt::Display for VerifyMode {
 pub struct VerifyOutcome {
     pub schema: String,
     pub table: String,
-    /// Mirrored from `LoadResult.source_rows`. `None` for csv/tsv (no exact
-    /// source-row count in v1) — short-circuits L1 to
+    /// Mirrored from `LoadResult.source_rows`. `None` for csv/tsv (no
+    /// exact source-row count) — short-circuits L1 to
     /// [`VerifyVerdict::SkippedNoExactSourceCount`].
     pub source_rows: Option<u64>,
     pub records_loaded: u64,
@@ -117,11 +117,10 @@ pub enum VerifyVerdict {
     /// number of submitted rows that conflict resolution discarded — not a
     /// bug per se, but the operator should know.
     RowsConflictedAtTarget(u64),
-    /// `LoadResult.source_rows == None` (csv/tsv in v1). L1 cannot run; L2
+    /// `LoadResult.source_rows == None` (csv/tsv). L1 cannot run; L2
     /// may still have run, but its standalone interpretation is weak
-    /// without L1, so we surface this single verdict and leave fine-grained
-    /// L2 verdicts to the count-bearing formats. Quote-aware exact counting
-    /// for csv/tsv is the v2 follow-up.
+    /// without L1, so we surface this single verdict and leave
+    /// fine-grained L2 verdicts to the count-bearing formats.
     SkippedNoExactSourceCount,
 }
 

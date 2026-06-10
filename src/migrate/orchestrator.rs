@@ -147,6 +147,19 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         "migrate: scanned pg_dump for COPY blocks"
     );
 
+    // Defense in depth: the dump is untrusted input. Validate every
+    // schema / table / column identifier before they flow into
+    // `count(*)` SQL, worker INSERTs, or operator-facing stdout. CLI
+    // args go through `validate_load_args`; the dump path needs the
+    // same guard.
+    for block in &blocks {
+        crate::runner::validate_pgdump_identifier("schema", &block.schema)?;
+        crate::runner::validate_pgdump_identifier("table", &block.table)?;
+        for col in &block.columns {
+            crate::runner::validate_pgdump_identifier("column", col)?;
+        }
+    }
+
     let ddl = extract_ddl(&*reader, &blocks)
         .await
         .context("Failed to extract DDL from pg_dump")?;
@@ -403,6 +416,7 @@ fn collect_warnings(changes: &[Diagnostic]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::migrate::apply::ApplyOutcome;
+    use crate::verify::VerifyVerdict;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -865,7 +879,6 @@ COPY public.valid_first (id) FROM stdin;
     /// the L1+L2 contract end-to-end through the orchestrator.
     #[tokio::test]
     async fn run_migrate_verify_count_emits_match_per_table() {
-        use crate::verify::VerifyVerdict;
         let pool = Pool::sqlite_in_memory().await.unwrap();
         let dump = write_dump(
             "\
@@ -933,11 +946,9 @@ COPY public.t (id, x) FROM stdin;
 
     /// On_conflict=DoNothing with pre-existing duplicate rows in the
     /// target: L2 surfaces the gap as `RowsConflictedAtTarget(N)` rather
-    /// than `MissingTarget(N)`. Pins the per-OnConflict verdict shape
-    /// promised in the design doc.
+    /// than `MissingTarget(N)`. Pins the per-OnConflict verdict shape.
     #[tokio::test]
     async fn run_migrate_verify_count_classifies_pk_conflicts_under_skip() {
-        use crate::verify::VerifyVerdict;
         let pool = Pool::sqlite_in_memory().await.unwrap();
         // Pre-create the table with PK and seed two conflicting rows so
         // the dump's INSERTs hit ON CONFLICT DO NOTHING for those.
@@ -1016,10 +1027,7 @@ COPY public.t (id, x) FROM stdin;
 
     /// Symmetric to unfixable_does_not_build_pool with verify=Count
     /// requested: when transform_ddl surfaces unfixable, no tables load
-    /// and no verify outcomes get built. Pins that a future change which
-    /// runs verify before the unfixable short-circuit would surface
-    /// here — the design doc calls this out as a critical safety
-    /// invariant.
+    /// and no verify outcomes get built.
     #[tokio::test]
     async fn run_migrate_verify_unfixable_short_circuits_no_verify_outcome() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -1037,6 +1045,46 @@ COPY public.events (id) FROM stdin;
         assert!(
             report.tables.is_empty(),
             "no per-table verify should be built on the unfixable path"
+        );
+    }
+
+    /// A crafted pg_dump COPY header carrying an embedded `"` in the
+    /// table identifier must be rejected before any pool query, DDL
+    /// apply, or per-table println — the dump is a second untrusted
+    /// input alongside CLI args, and `count(*)` SQL plus operator
+    /// stdout are both downstream of `block.table`.
+    #[tokio::test]
+    async fn run_migrate_rejects_dump_identifiers_with_embedded_quote() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // The embedded `""` decodes via `read_identifier` to a single
+        // `"` inside the identifier. Without validation this lands in
+        // `format!("\"{name}\"")` and corrupts the SQL.
+        let dump = "\
+COPY public.\"evil\"\"name\" (id) FROM stdin;
+1
+\\.
+";
+        let f = write_dump(dump);
+        let args = args_with_pool(&file_uri(f.path()), pool.clone(), false);
+        let err = run_migrate(args)
+            .await
+            .expect_err("dump-parsed identifier with embedded quote must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pg_dump table identifier") && msg.contains("unsafe character"),
+            "error must name the offending identifier and field; got: {msg}"
+        );
+        // Side-effect free: the table must NOT have been created.
+        let rows: Vec<(i64,)> = pool
+            .fetch_all_with_binds::<(i64,)>(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'evil%'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].0, 0,
+            "no DDL should run when identifier is rejected"
         );
     }
 }

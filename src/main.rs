@@ -546,12 +546,9 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Mirror `run_loader`: any per-table failures must surface as a
-    // non-zero exit so a wrapping `migrate && deploy.sh` doesn't ship
-    // an app pointed at a partially-loaded cluster. A non-Match verify
-    // verdict counts as a failure for the same reason — the report
-    // looks healthy without the verdict, and `migrate && deploy.sh`
-    // shouldn't ship against a cluster where rows went missing.
+    // Mirror `run_loader`: per-table failures and non-Match verdicts
+    // both exit non-zero so a wrapping `migrate && deploy.sh` can't
+    // ship against a partially-loaded cluster.
     let any_failed_records = report.tables.iter().any(|t| t.records_failed > 0);
     let any_bad_verdict = report.tables.iter().any(|t| {
         t.verify.as_ref().is_some_and(|v| {
@@ -594,7 +591,7 @@ fn format_verdict(v: &VerifyVerdict) -> String {
             )
         }
         VerifyVerdict::SkippedNoExactSourceCount => {
-            "SKIPPED — no exact source-row count for this format (csv/tsv in v1)".to_string()
+            "SKIPPED — no exact source-row count for this format (csv/tsv)".to_string()
         }
     }
 }

@@ -152,8 +152,8 @@ pub struct LoadResult {
     /// Estimated row count from file size (for mismatch detection)
     pub estimated_rows: Option<u64>,
     /// Exact source-row count summed across chunks. `Some` for pgdump and
-    /// parquet (parser-independent counts); `None` for csv/tsv (no exact
-    /// count in v1 — the v2 sample-hash work covers the gap).
+    /// parquet (parser-independent counts); `None` for csv/tsv
+    /// (quote-aware exact counting not yet implemented).
     pub source_rows: Option<u64>,
     /// Verdict from the count-level verification layer for the
     /// [`run_load`] entry point — `Some` when `--verify=count`, `None`
@@ -539,6 +539,29 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
              backslash, double-quote, or Unicode bidi/format codepoint) that would \
              corrupt SQL identifier quoting or visually deceive an operator reading \
              logs. Rename the table or use a quoted identifier in your DB instead."
+        );
+    }
+    Ok(())
+}
+
+/// Reject SQL identifiers parsed out of an untrusted pg_dump file — the
+/// dump is a second untrusted input alongside CLI args. `block.schema` /
+/// `block.table` / `block.columns` from `list_copy_blocks` flow into the
+/// `count(*)` query, worker INSERTs, and operator stdout via the migrate
+/// summary; without this guard a crafted COPY header could smuggle SQL
+/// fragments, control bytes, or bidi codepoints. Reuses the same
+/// allowlist as the CLI surface; only the error wording differs.
+pub(crate) fn validate_pgdump_identifier(field: &'static str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("pg_dump {field} identifier must not be empty");
+    }
+    if value.chars().any(is_unsafe_identifier_char) {
+        anyhow::bail!(
+            "pg_dump {field} identifier {value:?} contains an unsafe character \
+             (control byte, backslash, double-quote, or Unicode bidi/format \
+             codepoint) that would corrupt SQL identifier quoting or visually \
+             deceive an operator reading logs. Edit the dump to rename the \
+             offending identifier."
         );
     }
     Ok(())

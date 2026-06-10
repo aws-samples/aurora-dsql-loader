@@ -4591,10 +4591,8 @@ mod tests {
         .await?;
 
         // ── Stage 1.5: per-table verification verdict ───────────────────
-        // The migrate orchestrator runs verify=Count by default; assert
-        // every loaded table came back with Match. Catches a real-cluster
-        // regression where rows go missing between the loader and DSQL —
-        // which is exactly what L1+L2 was added to surface.
+        // verify=Count is on by default; every loaded table must come
+        // back as Match.
         for t in &report.tables {
             let v = t.verify.as_ref().unwrap_or_else(|| {
                 panic!(
@@ -4975,7 +4973,7 @@ mod tests {
         let result = run_load(args).await.unwrap();
         assert_eq!(
             result.source_rows, None,
-            "csv must leave source_rows None in v1"
+            "csv has no exact source-row count, so source_rows must be None"
         );
         let v = result
             .verify
