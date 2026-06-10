@@ -538,18 +538,27 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
     // ship against a partially-loaded cluster.
     let any_failed_records = report.tables.iter().any(|t| t.records_failed > 0);
     let any_bad_verdict = report.tables.iter().any(|t| {
-        t.verify.as_ref().is_some_and(|v| {
-            !matches!(
-                v.verdict,
-                VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
-            )
-        })
+        t.verify
+            .as_ref()
+            .is_some_and(|v| is_bad_verdict(&v.verdict))
     });
     if any_failed_records || any_bad_verdict {
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+/// True for verdicts that should make the CLI exit non-zero. Exhaustive
+/// match so a future verdict variant fails compilation here.
+fn is_bad_verdict(v: &VerifyVerdict) -> bool {
+    match v {
+        VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount => false,
+        VerifyVerdict::LoaderDropped(_)
+        | VerifyVerdict::MissingTarget(_)
+        | VerifyVerdict::ExtraTarget(_)
+        | VerifyVerdict::RowsConflictedAtTarget(_) => true,
+    }
 }
 
 /// One-line CLI summary per VerifyVerdict.
@@ -798,12 +807,10 @@ async fn run_loader(
         println!("Manifest was stored in a temporary directory and has been cleaned up.");
     }
 
-    let bad_verdict = result.verify.as_ref().is_some_and(|v| {
-        !matches!(
-            v.verdict,
-            VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
-        )
-    });
+    let bad_verdict = result
+        .verify
+        .as_ref()
+        .is_some_and(|v| is_bad_verdict(&v.verdict));
     if result.records_failed > 0 || row_count_mismatch || bad_verdict {
         std::process::exit(1);
     }
@@ -1006,6 +1013,19 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::collections::HashSet;
+
+    /// Pin the CLI exit-code policy: only `Match` and
+    /// `SkippedNoExactSourceCount` are clean. A future verdict variant
+    /// will fail compilation here (no `_ =>` arm).
+    #[test]
+    fn is_bad_verdict_classifies_every_variant() {
+        assert!(!is_bad_verdict(&VerifyVerdict::Match));
+        assert!(!is_bad_verdict(&VerifyVerdict::SkippedNoExactSourceCount));
+        assert!(is_bad_verdict(&VerifyVerdict::LoaderDropped(1)));
+        assert!(is_bad_verdict(&VerifyVerdict::MissingTarget(1)));
+        assert!(is_bad_verdict(&VerifyVerdict::ExtraTarget(1)));
+        assert!(is_bad_verdict(&VerifyVerdict::RowsConflictedAtTarget(1)));
+    }
 
     #[test]
     fn parse_exclude_columns_basic() {

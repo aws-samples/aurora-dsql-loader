@@ -155,6 +155,42 @@ mod tests {
         assert_eq!(chunk_data.parse_errors, 0);
     }
 
+    /// Multi-chunk invariant: per-chunk source_rows must sum to the
+    /// total record count. Pins the all-or-nothing fold in
+    /// `Coordinator::run_load`.
+    #[tokio::test]
+    async fn pgdump_source_rows_sum_across_chunks_equals_total() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "COPY public.t (id, name) FROM stdin;").unwrap();
+        for i in 0..100 {
+            writeln!(f, "{i}\tname{i}").unwrap();
+        }
+        writeln!(f, "\\.").unwrap();
+        f.flush().unwrap();
+
+        let reader = LocalFileByteReader::new(f.path());
+        let block = find_copy_block(&reader, "public", "t").await.unwrap();
+        let pgdump = PgDumpReader::from_block(reader, block);
+        // Force multiple chunks: ~10 rows per chunk over 100 rows.
+        let chunks = pgdump.create_chunks(80).await.unwrap();
+        assert!(
+            chunks.len() > 1,
+            "test setup: expected multiple chunks, got {}",
+            chunks.len()
+        );
+
+        let mut total_source_rows = 0u64;
+        let mut total_records = 0usize;
+        for chunk in &chunks {
+            let cd = pgdump.read_chunk(chunk).await.unwrap();
+            total_source_rows += cd.source_rows_in_chunk.unwrap();
+            total_records += cd.records.len();
+            assert_eq!(cd.parse_errors, 0);
+        }
+        assert_eq!(total_source_rows, 100);
+        assert_eq!(total_records, 100);
+    }
+
     /// Empty-line invariant: every `\n` in a COPY block becomes a
     /// record OR a parse_error. Silent drops would break L1.
     #[tokio::test]
