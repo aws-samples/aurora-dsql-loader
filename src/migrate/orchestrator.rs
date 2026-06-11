@@ -3,13 +3,13 @@
 //! table — all against a single shared `Pool` so the production path
 //! pays the IAM/connection-establishment cost only once.
 
+use crate::coordination::MigrateProgress;
 use crate::db::Pool;
 use crate::db::pool::{PoolArgsBuilder, pool as build_dsql_pool};
 use crate::formats::pgdump::{extract_ddl, list_copy_blocks};
 use crate::io::{ByteReader, LocalFileByteReader, S3ByteReader, SourceUri};
 use crate::migrate::apply::{AppliedStatement, apply_ddl};
 use crate::migrate::transform::{Diagnostic, TransformResult, transform_ddl};
-use crate::coordination::MigrateProgress;
 use crate::runner::{Format, LoadArgs, OnConflict, run_load_with_pool_for_pgdump_block};
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};

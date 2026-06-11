@@ -229,7 +229,6 @@ impl LoadProgress {
         self.bytes_bar.finish();
         self.stats_bar.finish();
     }
-
 }
 
 /// Add the four per-load bars to `multi` and return them. Shared
@@ -381,5 +380,4 @@ mod tests {
 
         lp.finish_clean().await;
     }
-
 }

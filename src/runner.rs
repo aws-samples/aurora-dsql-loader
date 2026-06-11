@@ -262,8 +262,15 @@ pub(crate) async fn run_load_with_pool(
         }
     };
 
-    run_load_with_pool_and_reader(pool, args, file_reader, pgdump_columns, delimited_config, None)
-        .await
+    run_load_with_pool_and_reader(
+        pool,
+        args,
+        file_reader,
+        pgdump_columns,
+        delimited_config,
+        None,
+    )
+    .await
 }
 
 /// Migrate-only entry point: load one pg_dump COPY block using a
