@@ -497,7 +497,7 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
                 println!("    Failed-row manifest: {}", path.display());
             }
             if let Some(v) = &t.verify {
-                print_verify_detail(v, "    ");
+                print_verify_detail(v, true);
             }
         }
         // The orchestrator halts on the first failed table. If the last
@@ -543,10 +543,11 @@ fn is_bad_verdict(v: &VerifyVerdict) -> bool {
     }
 }
 
-/// Print `Verify: <verdict>` and, on a non-clean verdict, the raw counts so
-/// the operator can size the gap without re-running. `indent` is prepended
-/// to both lines (`""` for single-table summary, `"    "` under `migrate`).
-fn print_verify_detail(v: &VerifyOutcome, indent: &str) {
+/// Print `Verify: <verdict>` and, on a non-clean verdict, the raw counts
+/// so the operator can size the gap without re-running. `nested` indents
+/// under a parent bullet (used for per-table rows in the `migrate` report).
+fn print_verify_detail(v: &VerifyOutcome, nested: bool) {
+    let indent = if nested { "    " } else { "" };
     println!("{indent}Verify: {}", format_verdict(&v.verdict));
     if matches!(
         v.verdict,
@@ -746,7 +747,7 @@ async fn run_loader(
         println!("Source rows: {src}");
     }
     if let Some(v) = &result.verify {
-        print_verify_detail(v, "");
+        print_verify_detail(v, false);
     }
 
     // Warn if significantly fewer records were loaded than estimated

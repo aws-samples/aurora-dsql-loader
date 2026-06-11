@@ -36,6 +36,7 @@ use crate::db::{self as db_pool, SchemaInferrer};
 use crate::formats::pgdump::{CopyBlock, PgDumpReader, list_copy_blocks};
 use crate::formats::{DelimitedConfig, ReaderFactory};
 use crate::io::{LocalFileByteReader, S3ByteReader, SourceUri};
+use crate::verify::{self, VerifyInputs};
 
 /// File format for the source data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +225,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         && matches!(args.format, Format::PgDump | Format::Parquet);
     let target_pre_count = if l2_runs {
         Some(
-            crate::verify::count_table_rows(&pool, &args.schema, &args.target_table)
+            verify::count_table_rows(&pool, &args.schema, &args.target_table)
                 .await
                 .context("verify=count: failed to read target pre-count")?,
         )
@@ -242,7 +243,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     if verify_mode == VerifyMode::Count {
         let target_post_count = if l2_runs {
             Some(
-                crate::verify::count_table_rows(&pool, &schema, &target_table)
+                verify::count_table_rows(&pool, &schema, &target_table)
                     .await
                     .context("verify=count: failed to read target post-count")?,
             )
@@ -252,7 +253,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         result.verify = Some(VerifyOutcome::from_inputs(
             schema,
             target_table,
-            crate::verify::VerifyInputs {
+            VerifyInputs {
                 mode: verify_mode,
                 on_conflict,
                 source_rows: result.source_rows,
