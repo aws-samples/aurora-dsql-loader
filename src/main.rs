@@ -1,6 +1,6 @@
 use aurora_dsql_loader::runner::{
-    ApplyOutcome, Format, LoadArgs, MigrateArgs, OnConflict, VerifyMode, VerifyVerdict, run_load,
-    run_migrate,
+    ApplyOutcome, Format, LoadArgs, MigrateArgs, OnConflict, VerifyMode, VerifyOutcome,
+    VerifyVerdict, run_load, run_migrate,
 };
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand};
 use std::collections::HashMap;
@@ -110,8 +110,9 @@ struct LoadParams {
 
     /// Post-load verification (`off` | `count`). `count` adds pre/post
     /// `count(*)` and reports an L1+L2 verdict per table. Assumes the
-    /// loader is the sole writer during the run. Skipped under
-    /// `--if-not-exists` (L2 needs a stable pre-count); L1 still runs.
+    /// loader is the sole writer during the run. L2 is skipped under
+    /// `--if-not-exists` (no stable pre-count) and on csv/tsv (no exact
+    /// source count); the per-table verdict still surfaces.
     #[arg(long, default_value = "off")]
     verify: String,
 
@@ -496,26 +497,7 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
                 println!("    Failed-row manifest: {}", path.display());
             }
             if let Some(v) = &t.verify {
-                println!("    Verify: {}", format_verdict(&v.verdict));
-                // On a non-Match verdict, print the raw counts so the
-                // operator can size the gap without re-running.
-                if !matches!(
-                    v.verdict,
-                    VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
-                ) {
-                    println!(
-                        "      counts: source={src}, loaded={loaded}, failed={failed}, target_pre={pre}, target_post={post}",
-                        src = v.source_rows.map_or("n/a".to_string(), |n| n.to_string()),
-                        loaded = v.records_loaded,
-                        failed = v.records_failed,
-                        pre = v
-                            .target_pre_count
-                            .map_or("n/a".to_string(), |n| n.to_string()),
-                        post = v
-                            .target_post_count
-                            .map_or("n/a".to_string(), |n| n.to_string()),
-                    );
-                }
+                print_verify_detail(v, "    ");
             }
         }
         // The orchestrator halts on the first failed table. If the last
@@ -561,6 +543,28 @@ fn is_bad_verdict(v: &VerifyVerdict) -> bool {
     }
 }
 
+/// Print `Verify: <verdict>` and, on a non-clean verdict, the raw counts so
+/// the operator can size the gap without re-running. `indent` is prepended
+/// to both lines (`""` for single-table summary, `"    "` under `migrate`).
+fn print_verify_detail(v: &VerifyOutcome, indent: &str) {
+    println!("{indent}Verify: {}", format_verdict(&v.verdict));
+    if matches!(
+        v.verdict,
+        VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
+    ) {
+        return;
+    }
+    let fmt = |n: Option<u64>| n.map_or("n/a".to_string(), |n| n.to_string());
+    println!(
+        "{indent}  counts: source={src}, loaded={loaded}, failed={failed}, target_pre={pre}, target_post={post}",
+        src = fmt(v.source_rows),
+        loaded = v.records_loaded,
+        failed = v.records_failed,
+        pre = fmt(v.target_pre_count),
+        post = fmt(v.target_post_count),
+    );
+}
+
 /// One-line CLI summary per VerifyVerdict.
 fn format_verdict(v: &VerifyVerdict) -> String {
     match v {
@@ -580,7 +584,7 @@ fn format_verdict(v: &VerifyVerdict) -> String {
         }
         VerifyVerdict::RowsConflictedAtTarget(n) => {
             format!(
-                "INFO: {n} row(s) conflict-resolved at target (expected under do-nothing/do-update)"
+                "CONFLICT: {n} row(s) conflict-resolved at target (expected under do-nothing/do-update)"
             )
         }
         VerifyVerdict::SkippedNoExactSourceCount => {
@@ -742,24 +746,7 @@ async fn run_loader(
         println!("Source rows: {src}");
     }
     if let Some(v) = &result.verify {
-        println!("Verify: {}", format_verdict(&v.verdict));
-        if !matches!(
-            v.verdict,
-            VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
-        ) {
-            println!(
-                "  counts: source={src}, loaded={loaded}, failed={failed}, target_pre={pre}, target_post={post}",
-                src = v.source_rows.map_or("n/a".to_string(), |n| n.to_string()),
-                loaded = v.records_loaded,
-                failed = v.records_failed,
-                pre = v
-                    .target_pre_count
-                    .map_or("n/a".to_string(), |n| n.to_string()),
-                post = v
-                    .target_post_count
-                    .map_or("n/a".to_string(), |n| n.to_string()),
-            );
-        }
+        print_verify_detail(v, "");
     }
 
     // Warn if significantly fewer records were loaded than estimated

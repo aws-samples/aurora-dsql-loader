@@ -4,7 +4,7 @@
 //!   between source bytes and the DB layer (parser/chunker bugs).
 //! - **L2**: target `post - pre` vs `loaded`. Catches drops between
 //!   INSERT and table contents. Shortfall is `MissingTarget` under
-//!   `Error`, `RowsConflictedAtTarget` under `Skip`/`Update`.
+//!   `Error`, `RowsConflictedAtTarget` under `DoNothing`/`DoUpdate`.
 //!
 //! Counts only — no value-level fidelity check.
 
@@ -12,8 +12,9 @@ use crate::coordination::manifest::OnConflict;
 use crate::db::Pool;
 use anyhow::{Context, Result};
 
-/// L2 toggle. L1 always runs when `source_rows` is exact (cost: free,
-/// computed during parsing).
+/// L2 toggle. Source-row counting happens parser-side regardless;
+/// `Count` adds pre/post `count(*)` and produces a `VerifyOutcome` per
+/// loaded table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VerifyMode {
     #[default]
@@ -77,7 +78,7 @@ pub enum VerifyVerdict {
     /// L2 excess: target grew more than `records_loaded`. Concurrent
     /// writer or duplicate accounting.
     ExtraTarget(u64),
-    /// L2 shortfall under `Skip`/`DoUpdate` — N rows resolved by ON CONFLICT.
+    /// L2 shortfall under `DoNothing`/`DoUpdate` — N rows resolved by ON CONFLICT.
     /// Expected under conflict-tolerant modes; CLI still exits 1 so a chained
     /// `migrate && deploy.sh` does not ship a partially-loaded cluster without
     /// operator review.
@@ -96,6 +97,23 @@ pub struct VerifyInputs {
     /// Both `Some` when L2 ran, both `None` otherwise.
     pub target_pre_count: Option<u64>,
     pub target_post_count: Option<u64>,
+}
+
+impl VerifyOutcome {
+    /// Classify `inputs` and bind the verdict to `(schema, table)`.
+    pub fn from_inputs(schema: String, table: String, inputs: VerifyInputs) -> Self {
+        let verdict = classify(inputs);
+        VerifyOutcome {
+            schema,
+            table,
+            source_rows: inputs.source_rows,
+            records_loaded: inputs.records_loaded,
+            records_failed: inputs.records_failed,
+            target_pre_count: inputs.target_pre_count,
+            target_post_count: inputs.target_post_count,
+            verdict,
+        }
+    }
 }
 
 /// Pure verdict classifier — no I/O, exhaustively unit-tested.

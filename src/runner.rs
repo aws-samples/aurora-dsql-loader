@@ -116,8 +116,9 @@ pub struct LoadArgs {
     // Conflict resolution strategy
     pub on_conflict: OnConflict,
 
-    /// L2 toggle. L1 always runs when the format gives an exact source
-    /// count. CLI default: `load`=Off, `migrate`=Count.
+    /// L2 toggle. Source-row counting runs parser-side regardless;
+    /// `Count` adds pre/post `count(*)` and a per-table verdict. CLI
+    /// default: `load`=Off, `migrate`=Count.
     pub verify: VerifyMode,
 
     // Columns to exclude from INSERT statements (DB applies DEFAULT values)
@@ -248,25 +249,19 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         } else {
             None
         };
-        let verdict = crate::verify::classify(crate::verify::VerifyInputs {
-            mode: verify_mode,
-            on_conflict,
-            source_rows: result.source_rows,
-            records_loaded: result.records_loaded,
-            records_failed: result.records_failed,
-            target_pre_count,
-            target_post_count,
-        });
-        result.verify = Some(VerifyOutcome {
+        result.verify = Some(VerifyOutcome::from_inputs(
             schema,
-            table: target_table,
-            source_rows: result.source_rows,
-            records_loaded: result.records_loaded,
-            records_failed: result.records_failed,
-            target_pre_count,
-            target_post_count,
-            verdict,
-        });
+            target_table,
+            crate::verify::VerifyInputs {
+                mode: verify_mode,
+                on_conflict,
+                source_rows: result.source_rows,
+                records_loaded: result.records_loaded,
+                records_failed: result.records_failed,
+                target_pre_count,
+                target_post_count,
+            },
+        ));
     }
 
     Ok(result)

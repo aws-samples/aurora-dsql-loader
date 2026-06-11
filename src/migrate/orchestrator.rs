@@ -12,7 +12,7 @@ use crate::migrate::transform::{Diagnostic, TransformResult, transform_ddl};
 use crate::runner::{
     Format, LoadArgs, OnConflict, VerifyMode, run_load_with_pool_for_pgdump_block,
 };
-use crate::verify::{VerifyInputs, VerifyOutcome, classify, count_table_rows};
+use crate::verify::{VerifyInputs, VerifyOutcome, count_table_rows};
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;
@@ -199,8 +199,9 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
     // each load skips the dump rescan + credential-chain walk.
     let mut tables = Vec::with_capacity(blocks.len());
     for block in &blocks {
-        // L2 pre-count. Table exists (apply_ddl ran). L1 still runs
-        // when verify=Off because source_rows is parser-side.
+        // L2 pre-count. Table exists (apply_ddl ran). Source-row
+        // counting is parser-side and always free; classification only
+        // runs under verify=Count below.
         let target_pre_count = if args.verify == VerifyMode::Count {
             Some(
                 count_table_rows(&pool, &block.schema, &block.table)
@@ -246,25 +247,19 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
                         )
                     })?,
             );
-            let verdict = classify(VerifyInputs {
-                mode: args.verify,
-                on_conflict: args.on_conflict,
-                source_rows: r.source_rows,
-                records_loaded: r.records_loaded,
-                records_failed,
-                target_pre_count,
-                target_post_count,
-            });
-            Some(VerifyOutcome {
-                schema: block.schema.clone(),
-                table: block.table.clone(),
-                source_rows: r.source_rows,
-                records_loaded: r.records_loaded,
-                records_failed,
-                target_pre_count,
-                target_post_count,
-                verdict,
-            })
+            Some(VerifyOutcome::from_inputs(
+                block.schema.clone(),
+                block.table.clone(),
+                VerifyInputs {
+                    mode: args.verify,
+                    on_conflict: args.on_conflict,
+                    source_rows: r.source_rows,
+                    records_loaded: r.records_loaded,
+                    records_failed,
+                    target_pre_count,
+                    target_post_count,
+                },
+            ))
         } else {
             None
         };
