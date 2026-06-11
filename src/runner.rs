@@ -262,7 +262,8 @@ pub(crate) async fn run_load_with_pool(
         }
     };
 
-    run_load_with_pool_and_reader(pool, args, file_reader, pgdump_columns, delimited_config).await
+    run_load_with_pool_and_reader(pool, args, file_reader, pgdump_columns, delimited_config, None)
+        .await
 }
 
 /// Migrate-only entry point: load one pg_dump COPY block using a
@@ -280,6 +281,7 @@ pub(crate) async fn run_load_with_pool_for_pgdump_block(
     args: LoadArgs,
     block: CopyBlock,
     aws_config: Option<&aws_config::SdkConfig>,
+    parent_multi: Option<std::sync::Arc<indicatif::MultiProgress>>,
 ) -> Result<LoadResult> {
     validate_load_args(&args)?;
 
@@ -302,7 +304,15 @@ pub(crate) async fn run_load_with_pool_for_pgdump_block(
         }
     };
 
-    run_load_with_pool_and_reader(pool, args, file_reader, pgdump_columns, delimited_config).await
+    run_load_with_pool_and_reader(
+        pool,
+        args,
+        file_reader,
+        pgdump_columns,
+        delimited_config,
+        parent_multi,
+    )
+    .await
 }
 
 async fn run_load_with_pool_and_reader(
@@ -311,6 +321,7 @@ async fn run_load_with_pool_and_reader(
     file_reader: Arc<dyn crate::formats::reader::FileReader>,
     pgdump_columns: Vec<String>,
     delimited_config: Option<DelimitedConfig>,
+    parent_multi: Option<std::sync::Arc<indicatif::MultiProgress>>,
 ) -> Result<LoadResult> {
     // Set up manifest directory (use temp dir if not provided)
     let (mut temp_dir, manifest_dir_path) = if let Some(dir) = args.manifest_dir {
@@ -364,6 +375,7 @@ async fn run_load_with_pool_and_reader(
         .resume_job_id(args.resume_job_id)
         .on_conflict(args.on_conflict)
         .exclude_columns(args.exclude_columns)
+        .parent_multi(parent_multi)
         .build()?;
 
     let result = coordinator.run_load(&load_config).await?;

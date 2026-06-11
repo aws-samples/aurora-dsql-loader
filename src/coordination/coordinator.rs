@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use derive_builder::Builder;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::MultiProgress;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,12 +12,13 @@ use uuid::Uuid;
 use super::manifest::{
     ChunkInfo, ChunkResultFile, DsqlConfig, FileFormat, ManifestFile, ManifestStorage, OnConflict,
 };
+use super::progress::LoadProgress;
 use super::worker::Worker;
 use crate::db::schema::{Schema, query_table_schema, validate_schema_exists};
 use crate::db::{Pool, SchemaInferrer};
 use crate::formats::FileReader;
 use crate::formats::reader::{Chunk, FileMetadata};
-use crate::telemetry::{ProgressStats, TelemetryEvent};
+use crate::telemetry::TelemetryEvent;
 
 /// Validate that every excluded name exists in the schema and that at least
 /// one column would remain after exclusion.
@@ -262,6 +263,12 @@ pub struct LoadConfig {
     on_conflict: OnConflict,
     #[builder(default)]
     exclude_columns: Vec<String>,
+    /// When `Some`, the load attaches its 4 progress bars to the
+    /// caller's `MultiProgress` (migrate path). When `None`, it
+    /// builds its own (standalone-load path). `quiet=true` suppresses
+    /// bars in either case.
+    #[builder(default)]
+    parent_multi: Option<Arc<MultiProgress>>,
 }
 
 /// Result of a completed data load operation
@@ -323,15 +330,39 @@ impl Coordinator {
         // Drop the coordinator's copy of the sender so the channel closes when workers finish
         drop(telemetry_tx);
 
-        // Setup progress tracking
-        let prog_jh = Self::setup_progress_tracking(config, &file_metadata, &chunks, telemetry_rx);
+        // Setup progress tracking. Three cases by (quiet, parent_multi):
+        //   quiet=true             → no bars at all (skip LoadProgress).
+        //   quiet=false, parent=Some → migrate path: add bars under the
+        //                              caller's persistent dump bars,
+        //                              clear them when this table finishes.
+        //   quiet=false, parent=None → standalone path: own MultiProgress,
+        //                              leave bars visible at the end.
+        let load_progress = if config.quiet {
+            None
+        } else {
+            let total_chunks = chunks.len() as u64;
+            Some(match &config.parent_multi {
+                Some(parent) => {
+                    LoadProgress::within(parent, &file_metadata, total_chunks, telemetry_rx)
+                }
+                None => LoadProgress::new(&file_metadata, total_chunks, telemetry_rx),
+            })
+        };
 
         // Wait for all workers to complete
         let worker_results = futures::future::join_all(worker_handles).await;
 
-        // Wait for the progress bar to finish so we don't collide output
-        if let Some(jh) = prog_jh {
-            let _ = jh.await;
+        // Drain and finalize bars. Per-iteration ordering invariant:
+        // workers finished → channel closed → pump drains → bars finalize.
+        // `finish_clean` clears per-table bars (migrate); `finish_standalone`
+        // leaves them visible (load command). The clear path is selected by
+        // parent_multi presence — same matrix as construction above.
+        if let Some(lp) = load_progress {
+            if config.parent_multi.is_some() {
+                lp.finish_clean().await;
+            } else {
+                lp.finish_standalone().await;
+            }
         }
 
         // Check for any worker errors
@@ -963,95 +994,6 @@ impl Coordinator {
         }
 
         worker_handles
-    }
-
-    /// Setup progress tracking with progress bars
-    fn setup_progress_tracking(
-        config: &LoadConfig,
-        file_metadata: &FileMetadata,
-        chunks: &[Chunk],
-        mut telemetry_rx: mpsc::UnboundedReceiver<TelemetryEvent>,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        if config.quiet {
-            return None;
-        }
-
-        // Create progress bars with MultiProgress
-        let multi_progress = MultiProgress::new();
-        let total_chunks = chunks.len() as u64;
-        let estimated_total_rows = file_metadata.estimated_rows.unwrap_or(0);
-
-        let chunk_bar = multi_progress.add(ProgressBar::new(total_chunks));
-        chunk_bar.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "[{elapsed_precise}] Chunks: [{bar:30.cyan/blue}] {pos}/{len} ({percent}%)",
-                )
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-
-        let rows_bar = if estimated_total_rows > 0 {
-            let bar = multi_progress.add(ProgressBar::new(estimated_total_rows));
-            bar.set_style(
-                ProgressStyle::default_bar()
-                    .template("[{elapsed_precise}] Rows:       [{bar:30.green/blue}] {human_pos}/{human_len} ({percent}%) | {per_sec}")
-                    .unwrap()
-                    .progress_chars("=>-")
-            );
-            Some(bar)
-        } else {
-            None
-        };
-
-        let bytes_bar = multi_progress.add(ProgressBar::new(file_metadata.file_size_bytes));
-        bytes_bar.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] Bytes:      [{bar:30.yellow/blue}] {bytes}/{total_bytes} ({percent}%) | {bytes_per_sec}")
-                .unwrap()
-                .progress_chars("=>-")
-        );
-
-        let stats_bar = multi_progress.add(ProgressBar::new(0));
-        stats_bar.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] Batch Time: {msg}")
-                .unwrap(),
-        );
-
-        Some(tokio::spawn(async move {
-            let mut stats = ProgressStats::new();
-
-            while let Some(event) = telemetry_rx.recv().await {
-                stats.update(&event);
-
-                chunk_bar.set_position(stats.chunks_completed as u64);
-                if let Some(ref bar) = rows_bar {
-                    bar.set_position(stats.records_loaded);
-                }
-                bytes_bar.set_position(stats.bytes_processed);
-
-                let (p50, p90, p99) = stats.get_percentiles();
-                if let (Some(p50), Some(p90), Some(p99)) = (p50, p90, p99) {
-                    stats_bar
-                        .set_message(format!("p50: {}ms, p90: {}ms, p99: {}ms", p50, p90, p99));
-                }
-            }
-
-            chunk_bar.finish_with_message("All chunks completed");
-            if let Some(bar) = rows_bar {
-                bar.finish();
-            }
-            bytes_bar.finish();
-
-            let (p50, p90, p99) = stats.get_percentiles();
-            if let (Some(p50), Some(p90), Some(p99)) = (p50, p90, p99) {
-                stats_bar
-                    .finish_with_message(format!("p50: {}ms, p90: {}ms, p99: {}ms", p50, p90, p99));
-            } else {
-                stats_bar.finish();
-            }
-        }))
     }
 
     /// Aggregate the final results from all chunk result files

@@ -9,6 +9,7 @@ use crate::formats::pgdump::{extract_ddl, list_copy_blocks};
 use crate::io::{ByteReader, LocalFileByteReader, S3ByteReader, SourceUri};
 use crate::migrate::apply::{AppliedStatement, apply_ddl};
 use crate::migrate::transform::{Diagnostic, TransformResult, transform_ddl};
+use crate::coordination::MigrateProgress;
 use crate::runner::{Format, LoadArgs, OnConflict, run_load_with_pool_for_pgdump_block};
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
@@ -174,12 +175,23 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         .await
         .context("Failed to apply DDL to cluster")?;
 
+    // Whole-dump progress view: 2 persistent bars (Tables, Bytes) plus
+    // the shared MultiProgress that per-table LoadProgress instances
+    // attach to. None when --quiet so the inner per-table loads also
+    // stay silent (parent_multi=None propagates that intent).
+    let migrate_progress = if args.quiet {
+        None
+    } else {
+        Some(MigrateProgress::new(&blocks))
+    };
+
     // Halt on the first table with `records_failed > 0`. DSQL doesn't
     // enforce FKs, so continuing would silently load child rows against
     // a partially-loaded parent and the final report would look healthy.
     // The pre-resolved `blocks` and `aws_config` are threaded through so
     // each load skips the dump rescan + credential-chain walk.
     let mut tables = Vec::with_capacity(blocks.len());
+    let mut halted = false;
     for block in &blocks {
         let load_args = build_load_args(&args, &block.table, &block.schema);
         let r = run_load_with_pool_for_pgdump_block(
@@ -187,6 +199,7 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
             load_args,
             block.clone(),
             aws_config.as_ref(),
+            migrate_progress.as_ref().map(MigrateProgress::multi),
         )
         .await
         .with_context(|| {
@@ -197,6 +210,7 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
             )
         })?;
         let records_failed = r.records_failed;
+        let block_bytes = block.data_end - block.data_start;
         tables.push(TableLoadSummary {
             schema: block.schema.clone(),
             table: block.table.clone(),
@@ -205,8 +219,24 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
             persisted_manifest_dir: r.persisted_manifest_dir,
         });
         if records_failed > 0 {
+            if let Some(mp) = &migrate_progress {
+                mp.finish_halted(&format!(
+                    "{schema}.{table}: {n} rows failed",
+                    schema = block.schema,
+                    table = block.table,
+                    n = records_failed,
+                ));
+            }
+            halted = true;
             break;
         }
+        if let Some(mp) = &migrate_progress {
+            mp.record_table_loaded(block_bytes);
+        }
+    }
+
+    if !halted && let Some(mp) = &migrate_progress {
+        mp.finish_clean();
     }
 
     Ok(MigrateReport {
@@ -771,5 +801,80 @@ COPY public.valid_first (id) FROM stdin;
             .unwrap()[0]
             .0;
         assert_eq!(row_count, 0);
+    }
+
+    /// Pin: `quiet=false` migrate exercises the bar-construction path
+    /// (LoadProgress::within + MigrateProgress) without panicking and
+    /// returns the same report shape as the quiet path. This is the
+    /// regression guard for the "no bars at all → bars under a parent
+    /// MultiProgress" lifecycle: insert → pump → drop tx → join pump
+    /// → finish_clean → record_table_loaded → dump-wide finish_clean.
+    /// `cargo test`'s captured stderr swallows the actual render so we
+    /// can't assert on output, but exercising the path catches panics
+    /// from bar misuse (e.g. finish-before-pump-join, double-finish).
+    #[tokio::test]
+    async fn run_migrate_quiet_false_drives_progress_lifecycle_without_panicking() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        let dump = write_dump(
+            "\
+CREATE TABLE a (id INTEGER, x TEXT);
+CREATE TABLE b (id INTEGER, x TEXT);
+COPY public.a (id, x) FROM stdin;
+1\tone
+2\ttwo
+\\.
+COPY public.b (id, x) FROM stdin;
+1\talpha
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.quiet = false;
+
+        let report = run_migrate(args).await.unwrap();
+        assert_eq!(report.tables.len(), 2);
+        assert_eq!(report.tables[0].records_loaded, 2);
+        assert_eq!(report.tables[1].records_loaded, 1);
+        for t in &report.tables {
+            assert_eq!(t.records_failed, 0);
+        }
+    }
+
+    /// Halt path under `quiet=false`: dump-wide bars get
+    /// finish_halted, the per-table bar for the failing iteration is
+    /// already finalized inside run_load (LoadProgress::finish_clean
+    /// runs before records_failed is observed). Pin so a future
+    /// refactor that finalizes the migrate progress before the halt
+    /// branch surfaces here.
+    #[tokio::test]
+    async fn run_migrate_quiet_false_halts_on_records_failed_without_panicking() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // Pre-create with PK, seed a row that the dump will conflict with.
+        pool.execute_query("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)")
+            .await
+            .unwrap();
+        pool.execute_query("INSERT INTO t VALUES (1, 'pre1')")
+            .await
+            .unwrap();
+
+        let dump = write_dump(
+            "\
+COPY public.t (id, x) FROM stdin;
+1\ta
+\\.
+COPY public.t (id, x) FROM stdin;
+2\tb
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.quiet = false;
+        args.on_conflict = OnConflict::Error;
+
+        let report = run_migrate(args).await.unwrap();
+        // First COPY block hits the duplicate → records_failed > 0 → halt
+        // before the second COPY block runs.
+        assert_eq!(report.tables.len(), 1, "halt must skip the second block");
+        assert!(report.tables[0].records_failed > 0);
     }
 }
