@@ -263,10 +263,8 @@ pub struct LoadConfig {
     on_conflict: OnConflict,
     #[builder(default)]
     exclude_columns: Vec<String>,
-    /// When `Some`, the load attaches its 4 progress bars to the
-    /// caller's `MultiProgress` (migrate path). When `None`, it
-    /// builds its own (standalone-load path). `quiet=true` suppresses
-    /// bars in either case.
+    /// `Some` attaches bars to the caller's `MultiProgress`; `None`
+    /// builds an own one. `quiet` overrides both to no bars.
     #[builder(default)]
     parent_multi: Option<Arc<MultiProgress>>,
 }
@@ -330,13 +328,8 @@ impl Coordinator {
         // Drop the coordinator's copy of the sender so the channel closes when workers finish
         drop(telemetry_tx);
 
-        // Setup progress tracking. Three cases by (quiet, parent_multi):
-        //   quiet=true             → no bars at all (skip LoadProgress).
-        //   quiet=false, parent=Some → migrate path: add bars under the
-        //                              caller's persistent dump bars,
-        //                              clear them when this table finishes.
-        //   quiet=false, parent=None → standalone path: own MultiProgress,
-        //                              leave bars visible at the end.
+        // `quiet` short-circuits bar construction; otherwise `parent_multi`
+        // selects attached (migrate) vs. own MultiProgress (standalone).
         let load_progress = if config.quiet {
             None
         } else {
@@ -352,11 +345,8 @@ impl Coordinator {
         // Wait for all workers to complete
         let worker_results = futures::future::join_all(worker_handles).await;
 
-        // Drain and finalize bars. Per-iteration ordering invariant:
+        // Ordering invariant (reordering corrupts the live render):
         // workers finished → channel closed → pump drains → bars finalize.
-        // `finish_clean` clears per-table bars (migrate); `finish_standalone`
-        // leaves them visible (load command). The clear path is selected by
-        // parent_multi presence — same matrix as construction above.
         if let Some(lp) = load_progress {
             if config.parent_multi.is_some() {
                 lp.finish_clean().await;

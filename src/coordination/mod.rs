@@ -7,4 +7,4 @@ pub mod worker;
 
 pub use coordinator::{Coordinator, LoadConfigBuilder};
 pub use manifest::{DsqlConfig, FileFormat};
-pub use progress::MigrateProgress;
+pub(crate) use progress::MigrateProgress;

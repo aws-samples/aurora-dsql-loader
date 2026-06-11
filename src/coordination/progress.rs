@@ -1,30 +1,18 @@
 //! Progress bar construction and lifecycle for both load and migrate flows.
 //!
-//! Two consumers:
-//! - `Coordinator::run_load` builds a [`LoadProgress`] either standalone
-//!   (its own `MultiProgress`) or `within` a parent `MultiProgress`
-//!   supplied by the migrate orchestrator.
-//! - `migrate::orchestrator::run_migrate` builds one [`MigrateProgress`]
-//!   for the whole-dump view and threads its `multi` handle into each
-//!   per-table load via `LoadConfig.parent_multi`.
-//!
 //! Bar layout during migrate (top → bottom):
 //! ```text
 //! [elapsed] Tables:     [bar] N/M (P%)              ← MigrateProgress, persistent
-//! [elapsed] Bytes:      [bar] X/Y (P%) | rate ETA Z ← MigrateProgress, persistent
+//! [elapsed] Dump Bytes: [bar] X/Y (P%) | rate ETA Z ← MigrateProgress, persistent
 //! [elapsed] Chunks:     [bar] n/m (P%)              ← LoadProgress, per-table
-//! [elapsed] Rows:       [bar] r/total (P%) | rate   ← LoadProgress, per-table (parquet only)
+//! [elapsed] Rows:       [bar] r/total (P%) | rate   ← LoadProgress, per-table (when row count is known)
 //! [elapsed] Bytes:      [bar] b/size (P%) | rate    ← LoadProgress, per-table
 //! [elapsed] Batch Time: p50/p90/p99                 ← LoadProgress, per-table
 //! ```
 //!
-//! Bar lifecycle (per table):
-//! 1. `LoadProgress::within` adds 4 bars below the 2 persistent ones.
-//! 2. Workers send `TelemetryEvent`s; the pump task updates the bars.
-//! 3. After the load returns, the channel is closed; the pump exits.
-//! 4. `LoadProgress::finish_clean` / `finish_halted` awaits the pump,
-//!    then either clears the per-table bars (clean) or freezes them
-//!    in place (halt) — see method docs for the ordering invariant.
+//! Bar lifecycle (per table): workers send telemetry → channel closes →
+//! pump drains → bars finalize. Finalizing while the pump is still
+//! writing corrupts the next render (see `LoadProgress::finish_clean`).
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::Arc;
@@ -34,12 +22,8 @@ use crate::formats::pgdump::CopyBlock;
 use crate::formats::reader::FileMetadata;
 use crate::telemetry::{ProgressStats, TelemetryEvent};
 
-/// Whole-dump progress view used by the migrate orchestrator.
-///
-/// Holds two persistent bars (Tables, Bytes) plus a shared
-/// `MultiProgress` handle that per-table [`LoadProgress`] instances
-/// attach to. Constructed once at the top of `run_migrate` and lives
-/// for the duration of the per-table loop.
+/// Whole-dump progress view: two persistent bars (Tables, Dump Bytes)
+/// plus the `MultiProgress` that per-table [`LoadProgress`] attach to.
 pub struct MigrateProgress {
     multi: Arc<MultiProgress>,
     tables_bar: ProgressBar,
@@ -47,16 +31,14 @@ pub struct MigrateProgress {
 }
 
 impl MigrateProgress {
-    /// Build the migrate-wide progress view from the resolved
-    /// `CopyBlock` list. `total_bytes` sums each block's data payload
-    /// (`data_end - data_start`) — already produced by `list_copy_blocks`.
+    /// Totals: tables = `blocks.len()`, bytes = sum of
+    /// `data_end - data_start` over each block.
     pub fn new(blocks: &[CopyBlock]) -> Self {
         Self::with_multi(blocks, MultiProgress::new())
     }
 
-    /// Test/internal constructor: callers can supply a `MultiProgress`
-    /// with `ProgressDrawTarget::hidden()` so `cargo test` doesn't
-    /// stream bars to stderr.
+    /// Test seam: pass a `ProgressDrawTarget::hidden()`-backed
+    /// `MultiProgress` so `cargo test` doesn't stream bars to stderr.
     pub fn with_multi(blocks: &[CopyBlock], multi: MultiProgress) -> Self {
         let total_tables = blocks.len() as u64;
         let total_bytes: u64 = blocks.iter().map(|b| b.data_end - b.data_start).sum();
@@ -88,30 +70,26 @@ impl MigrateProgress {
         }
     }
 
-    /// Shared `MultiProgress` handle for per-table [`LoadProgress`]
-    /// instances to attach to via [`LoadProgress::within`].
+    /// Handle for per-table [`LoadProgress`] instances to attach to.
     pub fn multi(&self) -> Arc<MultiProgress> {
         Arc::clone(&self.multi)
     }
 
-    /// Advance the persistent bars after a clean per-table load.
     pub fn record_table_loaded(&self, block_bytes: u64) {
         self.tables_bar.inc(1);
         self.bytes_bar.inc(block_bytes);
     }
 
-    /// Close the run cleanly: finish both persistent bars at full
-    /// position so the live render is closed before the orchestrator's
-    /// caller (e.g. `main.rs`'s "Loaded tables:" summary) prints.
+    /// Close the persistent bars before the caller prints any trailing
+    /// stdout — otherwise indicatif's live render corrupts that print.
     pub fn finish_clean(&self) {
         self.tables_bar.finish_with_message("done");
         self.bytes_bar.finish_with_message("done");
     }
 
-    /// Close the run on a halting iteration: freeze both persistent
-    /// bars at their current position with a "halted" message. The
-    /// per-table `LoadProgress` for the halting table is finalized
-    /// independently via [`LoadProgress::finish_halted`].
+    /// Freeze both persistent bars at their current position. The
+    /// halting table's per-load bars are finalized inside
+    /// `Coordinator::run_load` before this is called.
     pub fn finish_halted(&self, reason: &str) {
         self.tables_bar
             .abandon_with_message(format!("halted: {reason}"));
@@ -121,9 +99,7 @@ impl MigrateProgress {
 }
 
 /// Per-load progress: 4 bars (chunks / rows / bytes / batch-time) plus
-/// the telemetry pump task that drives them. Constructed by
-/// `Coordinator::run_load` either standalone or attached to a parent
-/// `MultiProgress` from [`MigrateProgress`].
+/// the telemetry pump task that drives them.
 pub struct LoadProgress {
     chunk_bar: ProgressBar,
     rows_bar: Option<ProgressBar>,
@@ -133,9 +109,8 @@ pub struct LoadProgress {
 }
 
 impl LoadProgress {
-    /// Standalone-load path: build a fresh `MultiProgress` and 4 bars,
-    /// spawn the pump task. Equivalent to the previous
-    /// `setup_progress_tracking` body.
+    /// Standalone-load path: own `MultiProgress`, leave bars visible
+    /// after `finish_standalone`.
     pub fn new(
         file_metadata: &FileMetadata,
         total_chunks: u64,
@@ -149,8 +124,8 @@ impl LoadProgress {
         )
     }
 
-    /// Migrate path: attach 4 bars to the caller's `MultiProgress` so
-    /// they render below the persistent dump-wide bars.
+    /// Attach 4 bars to an existing `MultiProgress`; bars render in
+    /// `add` order, so the dump-wide bars must already be inserted.
     pub fn within(
         parent: &MultiProgress,
         file_metadata: &FileMetadata,
@@ -200,12 +175,10 @@ impl LoadProgress {
         }
     }
 
-    /// Migrate clean path: await the pump (channel must already be
-    /// closed by the caller dropping its `telemetry_tx`), then
-    /// `finish_and_clear` the per-table bars so the next iteration's
-    /// bars render in the same screen position. Bars must NOT be
-    /// finalized while the pump is still writing to them — corrupts
-    /// the next bar's render.
+    /// Drain the pump (caller must have closed the channel) then clear
+    /// the bars so the next table's bars reuse the screen position.
+    /// Finalizing while the pump is still writing corrupts the next
+    /// bar's render.
     pub async fn finish_clean(self) {
         let _ = self.pump.await;
         self.chunk_bar.finish_and_clear();
@@ -216,10 +189,8 @@ impl LoadProgress {
         self.stats_bar.finish_and_clear();
     }
 
-    /// Standalone-load termination: same pump-wait ordering as
-    /// `finish_clean`, but leave the bars visible (not cleared) so
-    /// the operator keeps the final state on screen. This is the
-    /// historical behavior of `setup_progress_tracking`'s pump exit.
+    /// Same pump-wait ordering as `finish_clean`, but leave bars
+    /// visible so the operator keeps the final state on screen.
     pub async fn finish_standalone(self) {
         let _ = self.pump.await;
         self.chunk_bar.finish_with_message("All chunks completed");
@@ -231,9 +202,6 @@ impl LoadProgress {
     }
 }
 
-/// Add the four per-load bars to `multi` and return them. Shared
-/// between [`LoadProgress::new`] and [`LoadProgress::within`] so the
-/// templates live in one place.
 fn build_load_bars(
     multi: &MultiProgress,
     file_metadata: &FileMetadata,
@@ -303,10 +271,7 @@ mod tests {
         }
     }
 
-    /// `MigrateProgress::new` derives the dump totals straight from the
-    /// `CopyBlock` list — total tables = blocks.len(), total bytes =
-    /// sum of (data_end - data_start). Pinning so a future refactor of
-    /// `CopyBlock` field semantics surfaces here.
+    /// Pins: tables = `blocks.len()`, bytes = `sum(data_end - data_start)`.
     #[test]
     fn migrate_progress_totals_from_blocks() {
         let blocks = vec![
@@ -320,7 +285,6 @@ mod tests {
         assert_eq!(mp.bytes_bar.length(), Some(100 + 1000 + 50));
     }
 
-    /// `record_table_loaded` advances both persistent bars in lockstep.
     #[test]
     fn migrate_progress_records_advance_both_bars() {
         let blocks = vec![
@@ -337,9 +301,8 @@ mod tests {
         assert_eq!(mp.bytes_bar.position(), 300);
     }
 
-    /// `finish_halted` does NOT advance the bars — they freeze at the
-    /// last `record_table_loaded` position. Pin so a future "set to
-    /// total on halt" refactor surfaces.
+    /// Pins freeze-on-halt: bars stay at the last `record_table_loaded`
+    /// position rather than advancing to total.
     #[test]
     fn migrate_progress_finish_halted_freezes_position() {
         let blocks = vec![
@@ -354,11 +317,8 @@ mod tests {
         assert_eq!(mp.bytes_bar.position(), 100);
     }
 
-    /// `LoadProgress::within` smoke: build, send one telemetry event,
-    /// drop the channel, await `finish_clean`. Exercises the full
-    /// lifecycle (insert → pump → drop → finalize) without any real
-    /// load. Pinned so a future change to the pump's drain semantics
-    /// or finish ordering surfaces.
+    /// Smoke: build → send event → drop tx → `finish_clean` must not
+    /// panic. Catches regressions in the pump-drain-then-finalize order.
     #[tokio::test]
     async fn load_progress_within_lifecycle_finishes_cleanly() {
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());

@@ -175,10 +175,8 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         .await
         .context("Failed to apply DDL to cluster")?;
 
-    // Whole-dump progress view: 2 persistent bars (Tables, Bytes) plus
-    // the shared MultiProgress that per-table LoadProgress instances
-    // attach to. None when --quiet so the inner per-table loads also
-    // stay silent (parent_multi=None propagates that intent).
+    // None under `--quiet` so per-table loads inherit silence via
+    // `parent_multi = None`.
     let migrate_progress = if args.quiet {
         None
     } else {
@@ -803,15 +801,9 @@ COPY public.valid_first (id) FROM stdin;
         assert_eq!(row_count, 0);
     }
 
-    /// Pin: `quiet=false` migrate exercises the bar-construction path
-    /// (LoadProgress::within + MigrateProgress) without panicking and
-    /// returns the same report shape as the quiet path. This is the
-    /// regression guard for the "no bars at all → bars under a parent
-    /// MultiProgress" lifecycle: insert → pump → drop tx → join pump
-    /// → finish_clean → record_table_loaded → dump-wide finish_clean.
-    /// `cargo test`'s captured stderr swallows the actual render so we
-    /// can't assert on output, but exercising the path catches panics
-    /// from bar misuse (e.g. finish-before-pump-join, double-finish).
+    /// `quiet=false` smoke: captured stderr hides the render, so this
+    /// only catches panic-class bar misuse (finish-before-pump-join,
+    /// double-finish) plus pins the report shape.
     #[tokio::test]
     async fn run_migrate_quiet_false_drives_progress_lifecycle_without_panicking() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -840,12 +832,8 @@ COPY public.b (id, x) FROM stdin;
         }
     }
 
-    /// Halt path under `quiet=false`: dump-wide bars get
-    /// finish_halted, the per-table bar for the failing iteration is
-    /// already finalized inside run_load (LoadProgress::finish_clean
-    /// runs before records_failed is observed). Pin so a future
-    /// refactor that finalizes the migrate progress before the halt
-    /// branch surfaces here.
+    /// Pins ordering: the per-table bar is finalized inside `run_load`
+    /// before `records_failed` is observed by the orchestrator.
     #[tokio::test]
     async fn run_migrate_quiet_false_halts_on_records_failed_without_panicking() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
@@ -872,8 +860,6 @@ COPY public.t (id, x) FROM stdin;
         args.on_conflict = OnConflict::Error;
 
         let report = run_migrate(args).await.unwrap();
-        // First COPY block hits the duplicate → records_failed > 0 → halt
-        // before the second COPY block runs.
         assert_eq!(report.tables.len(), 1, "halt must skip the second block");
         assert!(report.tables[0].records_failed > 0);
     }
