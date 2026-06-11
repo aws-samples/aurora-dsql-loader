@@ -31,8 +31,6 @@ pub struct MigrateProgress {
 }
 
 impl MigrateProgress {
-    /// Totals: tables = `blocks.len()`, bytes = sum of
-    /// `data_end - data_start` over each block.
     pub fn new(blocks: &[CopyBlock]) -> Self {
         Self::with_multi(blocks, MultiProgress::new())
     }
@@ -175,10 +173,8 @@ impl LoadProgress {
         }
     }
 
-    /// Drain the pump (caller must have closed the channel) then clear
-    /// the bars so the next table's bars reuse the screen position.
-    /// Finalizing while the pump is still writing corrupts the next
-    /// bar's render.
+    /// Drain the pump before clearing — finalizing mid-write corrupts
+    /// the next table's render. Caller must have closed the channel.
     pub async fn finish_clean(self) {
         let _ = self.pump.await;
         self.chunk_bar.finish_and_clear();

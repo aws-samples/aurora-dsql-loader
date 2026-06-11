@@ -175,8 +175,8 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         .await
         .context("Failed to apply DDL to cluster")?;
 
-    // None under `--quiet` so per-table loads inherit silence via
-    // `parent_multi = None`.
+    // None under `--quiet` skips the dump-wide bars; per-table silence
+    // rides independently on `LoadArgs.quiet` set in `build_load_args`.
     let migrate_progress = if args.quiet {
         None
     } else {

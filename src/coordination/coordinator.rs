@@ -264,7 +264,7 @@ pub struct LoadConfig {
     #[builder(default)]
     exclude_columns: Vec<String>,
     /// `Some` attaches bars to the caller's `MultiProgress`; `None`
-    /// builds an own one. `quiet` overrides both to no bars.
+    /// builds its own. `quiet` overrides both to no bars.
     #[builder(default)]
     parent_multi: Option<Arc<MultiProgress>>,
 }
