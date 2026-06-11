@@ -107,8 +107,9 @@ fn validate_conflict_columns_not_all_excluded(
 }
 
 /// L1 source-row total across chunks. `None` if any chunk lacks a count
-/// (csv/tsv) or `chunk_results` is short of `expected_chunks` (worker crash) —
-/// forces classify() to SkippedNoExactSourceCount instead of a false Match.
+/// (csv/tsv), `chunk_results` is short of `expected_chunks` (worker crash),
+/// or the per-chunk counts overflow `u64` (adversarial parquet footer).
+/// Forces classify() to SkippedNoExactSourceCount instead of a false Match.
 fn aggregate_source_rows(chunk_results: &[ChunkResultFile], expected_chunks: usize) -> Option<u64> {
     if chunk_results.len() < expected_chunks {
         return None;
@@ -116,7 +117,7 @@ fn aggregate_source_rows(chunk_results: &[ChunkResultFile], expected_chunks: usi
     chunk_results
         .iter()
         .map(|r| r.source_rows_in_chunk)
-        .try_fold(0u64, |acc, n| n.map(|x| acc + x))
+        .try_fold(0u64, |acc, n| n.and_then(|x| acc.checked_add(x)))
 }
 
 /// Maximum bytes to read for schema inference
@@ -366,26 +367,28 @@ impl Coordinator {
             .await
     }
 
-    /// Collect all chunk results from manifest storage
+    /// Collect all chunk results from manifest storage. Returns the
+    /// results plus the IDs of any missing chunks so the caller can
+    /// surface them as a hard failure rather than a silent drop.
     async fn collect_results(
         &self,
         job_id: &str,
         chunk_count: usize,
-    ) -> Result<Vec<ChunkResultFile>> {
+    ) -> Result<(Vec<ChunkResultFile>, Vec<u32>)> {
         let mut results = Vec::with_capacity(chunk_count);
+        let mut missing = Vec::new();
 
         for chunk_id in 0..chunk_count as u32 {
             match self.manifest_storage.read_result(job_id, chunk_id).await {
                 Ok(result) => results.push(result),
                 Err(_) => {
-                    // Chunk result may be missing if worker crashed before writing result file
-                    // This is tracked in failure metrics and doesn't require hard failure
                     warn!("Chunk {chunk_id} result missing");
+                    missing.push(chunk_id);
                 }
             }
         }
 
-        Ok(results)
+        Ok((results, missing))
     }
 
     /// Create chunks from the source file and return metadata
@@ -1074,10 +1077,24 @@ impl Coordinator {
         start_time: Instant,
     ) -> Result<LoadResult> {
         info!("Aggregating results...");
-        let chunk_results = self
+        let (chunk_results, missing) = self
             .collect_results(job_id, chunks.len())
             .await
             .context("Failed to collect results")?;
+
+        // A missing chunk result = worker crashed mid-load. Without this
+        // bail, records_failed stays 0 and source_rows demotes to None
+        // (SkippedNoExactSourceCount → exit 0): a silent drop the
+        // verification layer cannot catch. Fail hard so the operator
+        // resumes from the manifest instead of shipping green.
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "Load incomplete: {n} chunk result(s) missing (likely worker crash). \
+                 Missing chunk IDs: {missing:?}. Re-run with --resume-job-id={job_id} \
+                 to retry the missing chunks.",
+                n = missing.len(),
+            );
+        }
 
         let total_records_loaded: u64 = chunk_results.iter().map(|r| r.records_loaded).sum();
         let total_records_failed: u64 = chunk_results.iter().map(|r| r.records_failed).sum();

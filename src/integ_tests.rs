@@ -1331,16 +1331,32 @@ mod tests {
             test_pool: Some(pool.clone()),
         };
 
-        let result1 = run_load(args1).await.unwrap();
-        let job_id = result1.job_id.clone();
-
-        // Verify first load had some successes and some failures
-        println!(
-            "First load: loaded={}, failed={}",
-            result1.records_loaded, result1.records_failed
+        // First load now fails hard when chunks are left without result
+        // files (single-worker exits on first batch failure → trailing
+        // chunks unprocessed). Pre-fix this returned a green LoadResult
+        // with silent drops; post-fix the operator gets a load-incomplete
+        // error pointing at --resume-job-id. Recover the job_id by
+        // listing the manifest dir.
+        let err = run_load(args1)
+            .await
+            .expect_err("first load must fail hard when worker exits with chunks unprocessed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Load incomplete"),
+            "expected load-incomplete error, got: {msg}"
         );
-        assert!(result1.records_loaded < 40, "Should have some failures");
-        assert!(result1.records_failed > 0, "Should have failures");
+        let job_id = {
+            let jobs_dir = manifest_path.join("jobs");
+            let mut entries = fs::read_dir(&jobs_dir).await.unwrap();
+            let mut found = None;
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                if entry.file_type().await.unwrap().is_dir() {
+                    found = Some(entry.file_name().to_string_lossy().into_owned());
+                    break;
+                }
+            }
+            found.expect("jobs dir must contain a job subdir")
+        };
 
         // Count records after first load - should only have records with value <= 300
         let mut conn = pool.acquire().await.unwrap();
@@ -4603,15 +4619,14 @@ mod tests {
             assert_eq!(
                 v.verdict,
                 crate::runner::VerifyVerdict::Match,
-                "{}.{} expected Match, got {:?} (source_rows={:?}, loaded={}, failed={}, target_pre={:?}, target_post={:?})",
+                "{}.{} expected Match, got {:?} (source_rows={:?}, loaded={}, failed={}, target_counts={:?})",
                 t.schema,
                 t.table,
                 v.verdict,
                 v.source_rows,
                 v.records_loaded,
                 v.records_failed,
-                v.target_pre_count,
-                v.target_post_count,
+                v.target_counts,
             );
             assert!(
                 v.source_rows.is_some(),
@@ -4879,8 +4894,10 @@ mod tests {
         assert_eq!(result.records_failed, 0);
         let v = result.verify.as_ref().unwrap();
         assert_eq!(v.verdict, crate::verify::VerifyVerdict::Match);
-        assert_eq!(v.target_pre_count, Some(0));
-        assert_eq!(v.target_post_count, Some(10));
+        assert_eq!(
+            v.target_counts,
+            Some(crate::verify::L2Counts { pre: 0, post: 10 })
+        );
         Ok(())
     }
 
@@ -4934,8 +4951,10 @@ mod tests {
         assert_eq!(result.records_loaded, 50);
         let v = result.verify.as_ref().unwrap();
         assert_eq!(v.verdict, crate::verify::VerifyVerdict::Match);
-        assert_eq!(v.target_pre_count, Some(0));
-        assert_eq!(v.target_post_count, Some(50));
+        assert_eq!(
+            v.target_counts,
+            Some(crate::verify::L2Counts { pre: 0, post: 50 })
+        );
     }
 
     /// csv + verify=Count → SkippedNoExactSourceCount (no exact source count).
@@ -5041,8 +5060,7 @@ mod tests {
             .as_ref()
             .expect("verify=Count must produce a VerifyOutcome");
         // L2 skipped under --if-not-exists.
-        assert_eq!(v.target_pre_count, None);
-        assert_eq!(v.target_post_count, None);
+        assert_eq!(v.target_counts, None);
         // csv → L1 also skipped → SkippedNoExactSourceCount.
         assert_eq!(
             v.verdict,

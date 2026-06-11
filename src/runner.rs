@@ -19,7 +19,7 @@ pub use crate::migrate::{
 // Re-export the verification surface — `VerifyMode` is set by the CLI on
 // `LoadArgs`, and `VerifyOutcome` / `VerifyVerdict` ship as fields of
 // `LoadResult` and `TableLoadSummary`.
-pub use crate::verify::{VerifyMode, VerifyOutcome, VerifyVerdict};
+pub use crate::verify::{L2Counts, VerifyMode, VerifyOutcome, VerifyVerdict};
 
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
@@ -223,7 +223,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     let l2_runs = args.verify == VerifyMode::Count
         && !args.create_table_if_missing
         && matches!(args.format, Format::PgDump | Format::Parquet);
-    let target_pre_count = if l2_runs {
+    let target_pre = if l2_runs {
         Some(
             verify::count_table_rows(&pool, &args.schema, &args.target_table)
                 .await
@@ -233,6 +233,16 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         None
     };
 
+    if args.verify == VerifyMode::Count && !l2_runs {
+        // Operator opted into count(*) but the gating conditions skipped
+        // L2; surface that instead of silently returning Match.
+        tracing::info!(
+            schema = %args.schema,
+            table = %args.target_table,
+            "verify=count: L2 skipped (--if-not-exists or csv/tsv); L1 only"
+        );
+    }
+
     let schema = args.schema.clone();
     let target_table = args.target_table.clone();
     let on_conflict = args.on_conflict;
@@ -241,7 +251,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     let mut result = run_load_with_pool(pool.clone(), args).await?;
 
     if verify_mode == VerifyMode::Count {
-        let target_post_count = if l2_runs {
+        let target_post = if l2_runs {
             Some(
                 verify::count_table_rows(&pool, &schema, &target_table)
                     .await
@@ -250,6 +260,9 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         } else {
             None
         };
+        let target_counts = target_pre
+            .zip(target_post)
+            .map(|(pre, post)| L2Counts { pre, post });
         result.verify = Some(VerifyOutcome::from_inputs(
             schema,
             target_table,
@@ -259,8 +272,7 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
                 source_rows: result.source_rows,
                 records_loaded: result.records_loaded,
                 records_failed: result.records_failed,
-                target_pre_count,
-                target_post_count,
+                target_counts,
             },
         ));
     }
@@ -348,6 +360,8 @@ pub(crate) async fn run_load_with_pool_for_pgdump_block(
     aws_config: Option<&aws_config::SdkConfig>,
 ) -> Result<LoadResult> {
     validate_load_args(&args)?;
+    debug_assert_eq!(args.target_table, block.table);
+    debug_assert_eq!(args.schema, block.schema);
 
     let delimited_config = maybe_delimited_config(&args);
     let parsed_uri = SourceUri::parse(&args.source_uri)?;
@@ -498,13 +512,24 @@ fn validate_load_args(args: &LoadArgs) -> Result<()> {
             );
         }
     }
+
+    // verify=count's L2 needs target_pre sampled at the start of the
+    // load; on resume the manifest already holds rows from the original
+    // run, so post-pre would be < records_loaded and classify produces a
+    // false MissingTarget/RowsConflictedAtTarget.
+    if args.resume_job_id.is_some() && args.verify == VerifyMode::Count {
+        anyhow::bail!(
+            "--verify=count cannot be combined with --resume-job-id: pre-count \
+             would not include rows from the original run. Re-run with --verify=off."
+        );
+    }
     Ok(())
 }
 
-/// Reject CLI identifiers that would break SQL identifier quoting.
-/// `Pool::qualified_table_name` wraps the value in `"…"` without
-/// escape-doubling, so embedded `"` / control bytes / bidi-format
-/// codepoints are blocked here.
+/// Reject CLI identifiers that would break SQL identifier quoting or
+/// deceive an operator reading logs. `Pool::qualified_table_name`
+/// escape-doubles `"` defensively, but control bytes and bidi/format
+/// codepoints are blocked here so they never reach SQL or terminals.
 fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("--{field} must not be empty");
@@ -705,6 +730,19 @@ mod tests {
         args.create_table_if_missing = true;
         let err = validate_load_args(&args).unwrap_err().to_string();
         assert!(err.contains("create_table_if_missing"), "{err}");
+    }
+
+    /// Resume + verify=count would mis-classify: pre-count is sampled
+    /// at resume start but records_loaded sums the entire manifest, so
+    /// post − pre < records_loaded → false MissingTarget.
+    #[test]
+    fn resume_with_verify_count_is_rejected_at_validation() {
+        let mut args = sample_pgdump_args();
+        args.resume_job_id = Some("abc-123".into());
+        args.verify = VerifyMode::Count;
+        let err = validate_load_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--verify=count"), "{err}");
+        assert!(err.contains("--resume-job-id"), "{err}");
     }
 
     #[tokio::test]

@@ -39,8 +39,26 @@
   formats up front with a diagnostic that points to `-Fp`, instead of
   failing later with a generic "no COPY block found" after streaming the
   binary file.
+- New `--verify <off|count>` flag on `load` and `migrate`. `count` adds
+  pre/post `count(*)` per loaded table and emits one verdict —
+  `Match`, `LoaderDropped(N)`, `MissingTarget(N)`, `ExtraTarget(N)`,
+  `RowsConflictedAtTarget(N)`, or `SkippedNoExactSourceCount`. Source-row
+  counting (L1) runs parser-side regardless of the flag for pgdump and
+  parquet. Defaults: `load=off` (avoid `count(*)` on populated targets),
+  `migrate=count` (fresh-cluster pre-counts are sub-ms). Any verdict
+  other than `Match` or `SkippedNoExactSourceCount` exits non-zero.
+  Assumes the loader is the sole writer to the target during the run.
 
 ### Changed
+- A worker-crash that leaves a chunk result file unwritten now fails
+  the load instead of being treated as 0 rows. Previously the missing
+  rows were invisible: `records_failed` stayed 0 and `source_rows`
+  collapsed to `None`, so the load exited green with rows silently
+  dropped. Re-run with `--resume-job-id=<id>` to retry the missing
+  chunks.
+- `Pool::qualified_table_name` now escape-doubles embedded `"`
+  defensively. A breaking change to the upstream identifier validators
+  no longer becomes an instant SQL identifier injection.
 - `migrate` now scans the dump for COPY blocks once and reuses the
   resolved blocks + AWS config across every per-table load. Previously
   each table re-walked the entire dump and re-ran the credential chain

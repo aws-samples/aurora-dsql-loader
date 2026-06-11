@@ -493,46 +493,57 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
                     String::new()
                 }
             );
+            if let Some(n) = t.source_rows {
+                println!("    Source rows: {n}");
+            }
             if let Some(path) = &t.persisted_manifest_dir {
                 println!("    Failed-row manifest: {}", path.display());
             }
             if let Some(v) = &t.verify {
                 print_verify_detail(v, true);
             }
+            if let Some(err) = &t.verify_error {
+                println!("    Verify: ERROR — {err}");
+            }
         }
-        // The orchestrator halts on the first failed table. If the last
-        // entry has failures, the operator needs to know the run was
-        // truncated — without FK enforcement on DSQL, continuing would
-        // silently load child rows against missing parents.
-        if report.tables.last().is_some_and(|t| t.records_failed > 0) {
+        // The orchestrator halts on the first table whose load failed
+        // OR whose post-count failed; in either case the report is
+        // truncated and re-running blind risks silent FK-less drift.
+        let last_halted = report
+            .tables
+            .last()
+            .is_some_and(|t| t.records_failed > 0 || t.verify_error.is_some());
+        if last_halted {
             let n = report.tables.len();
             let suffix = if n == 1 { "" } else { "s" };
             println!();
             println!(
-                "Halted after {n} table{suffix} due to load failures. \
-                 Inspect the manifest above before re-running."
+                "Halted after {n} table{suffix} due to load or verify failures. \
+                 Inspect the output above before re-running."
             );
         }
     }
 
-    // Mirror `run_loader`: per-table failures and non-Match verdicts
-    // both exit non-zero so a wrapping `migrate && deploy.sh` can't
-    // ship against a partially-loaded cluster.
+    // Mirror `run_loader`: per-table failures, non-Match verdicts, and
+    // post-count errors all exit non-zero so a wrapping
+    // `migrate && deploy.sh` can't ship against a partially-loaded cluster.
     let any_failed_records = report.tables.iter().any(|t| t.records_failed > 0);
     let any_bad_verdict = report.tables.iter().any(|t| {
         t.verify
             .as_ref()
             .is_some_and(|v| is_bad_verdict(&v.verdict))
     });
-    if any_failed_records || any_bad_verdict {
+    let any_verify_error = report.tables.iter().any(|t| t.verify_error.is_some());
+    if any_failed_records || any_bad_verdict || any_verify_error {
         std::process::exit(1);
     }
 
     Ok(())
 }
 
-/// True for verdicts that should make the CLI exit non-zero. Exhaustive
-/// match so a future verdict variant fails compilation here.
+/// True for verdicts that should make the CLI exit non-zero.
+/// `VerifyVerdict` is `#[non_exhaustive]`; unknown future variants
+/// default to non-zero so an unrecognised verdict can't ship green.
 fn is_bad_verdict(v: &VerifyVerdict) -> bool {
     match v {
         VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount => false,
@@ -540,6 +551,7 @@ fn is_bad_verdict(v: &VerifyVerdict) -> bool {
         | VerifyVerdict::MissingTarget(_)
         | VerifyVerdict::ExtraTarget(_)
         | VerifyVerdict::RowsConflictedAtTarget(_) => true,
+        _ => true,
     }
 }
 
@@ -556,13 +568,15 @@ fn print_verify_detail(v: &VerifyOutcome, nested: bool) {
         return;
     }
     let fmt = |n: Option<u64>| n.map_or("n/a".to_string(), |n| n.to_string());
+    let (pre, post) = match v.target_counts {
+        Some(c) => (fmt(Some(c.pre)), fmt(Some(c.post))),
+        None => (fmt(None), fmt(None)),
+    };
     println!(
         "{indent}  counts: source={src}, loaded={loaded}, failed={failed}, target_pre={pre}, target_post={post}",
         src = fmt(v.source_rows),
         loaded = v.records_loaded,
         failed = v.records_failed,
-        pre = fmt(v.target_pre_count),
-        post = fmt(v.target_post_count),
     );
 }
 
@@ -576,21 +590,24 @@ fn format_verdict(v: &VerifyVerdict) -> String {
             )
         }
         VerifyVerdict::MissingTarget(n) => {
-            format!("MISSING TARGET {n} row(s) — INSERT count exceeds target growth")
+            format!(
+                "MISSING TARGET {n} row(s) — target grew less than loader submitted (concurrent DELETE? verify=count assumes sole writer)"
+            )
         }
         VerifyVerdict::ExtraTarget(n) => {
             format!(
-                "EXTRA TARGET {n} row(s) — target grew more than loader submitted (concurrent writer?)"
+                "EXTRA TARGET {n} row(s) — target grew more than loader submitted (concurrent INSERT? verify=count assumes sole writer)"
             )
         }
         VerifyVerdict::RowsConflictedAtTarget(n) => {
             format!(
-                "CONFLICT: {n} row(s) conflict-resolved at target (expected under do-nothing/do-update)"
+                "CONFLICT: {n} row(s) conflict-resolved at target under do-nothing/do-update; CLI exits 1 — re-run with verify=off if this is the intended idempotent re-apply"
             )
         }
         VerifyVerdict::SkippedNoExactSourceCount => {
             "SKIPPED — no exact source-row count for this format (csv/tsv)".to_string()
         }
+        _ => format!("UNKNOWN VERDICT: {v:?}"),
     }
 }
 

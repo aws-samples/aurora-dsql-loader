@@ -155,9 +155,8 @@ mod tests {
         assert_eq!(chunk_data.parse_errors, 0);
     }
 
-    /// Multi-chunk invariant: per-chunk source_rows must sum to the
-    /// total record count. Pins the all-or-nothing fold in
-    /// `Coordinator::run_load`.
+    /// Per-chunk source_rows must sum to the total source-row count.
+    /// Pins the reader-side invariant that `aggregate_source_rows` folds.
     #[tokio::test]
     async fn pgdump_source_rows_sum_across_chunks_equals_total() {
         let mut f = tempfile::NamedTempFile::new().unwrap();

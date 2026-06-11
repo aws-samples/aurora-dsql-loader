@@ -12,7 +12,7 @@ use crate::migrate::transform::{Diagnostic, TransformResult, transform_ddl};
 use crate::runner::{
     Format, LoadArgs, OnConflict, VerifyMode, run_load_with_pool_for_pgdump_block,
 };
-use crate::verify::{VerifyInputs, VerifyOutcome, count_table_rows};
+use crate::verify::{L2Counts, VerifyInputs, VerifyOutcome, count_table_rows};
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;
@@ -104,6 +104,10 @@ pub struct TableLoadSummary {
     pub table: String,
     pub records_loaded: u64,
     pub records_failed: u64,
+    /// Mirrors `LoadResult.source_rows` — exact for pgdump, `None` for
+    /// other formats. Surfaced even under `--verify=off` so operators
+    /// have a per-table source-side number without paying for L2.
+    pub source_rows: Option<u64>,
     /// Path to the persisted manifest dir when this table had failures.
     /// Mirrors `LoadResult.persisted_manifest_dir` — the operator needs
     /// it to inspect the failed-row chunks. `None` when the table loaded
@@ -111,6 +115,10 @@ pub struct TableLoadSummary {
     pub persisted_manifest_dir: Option<PathBuf>,
     /// `Some` under verify=Count, `None` otherwise.
     pub verify: Option<VerifyOutcome>,
+    /// Set when `count(*)` failed mid-run (transient pool/IAM/network);
+    /// the load itself succeeded but the verdict could not be computed.
+    /// Halts the loop so the operator sees the partial report.
+    pub verify_error: Option<String>,
 }
 
 /// Drive the end-to-end migrate flow against a real (or test) cluster.
@@ -199,23 +207,30 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
     // each load skips the dump rescan + credential-chain walk.
     let mut tables = Vec::with_capacity(blocks.len());
     for block in &blocks {
-        // L2 pre-count. Table exists (apply_ddl ran). Source-row
-        // counting is parser-side and always free; classification only
-        // runs under verify=Count below.
-        let target_pre_count = if args.verify == VerifyMode::Count {
-            Some(
-                count_table_rows(&pool, &block.schema, &block.table)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "verify=count: failed to read pre-count for {schema}.{table}",
-                            schema = block.schema,
-                            table = block.table,
-                        )
-                    })?,
-            )
-        } else {
-            None
+        // Pre-count failure here means the load hasn't started; record a
+        // verify_error against an empty TableLoadSummary so the report
+        // shows which table blocked. The cluster is unchanged for this
+        // block (`apply_ddl` already ran but no INSERTs hit yet).
+        let target_pre = match args.verify {
+            VerifyMode::Count => match count_table_rows(&pool, &block.schema, &block.table).await {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    tables.push(TableLoadSummary {
+                        schema: block.schema.clone(),
+                        table: block.table.clone(),
+                        records_loaded: 0,
+                        records_failed: 0,
+                        source_rows: None,
+                        persisted_manifest_dir: None,
+                        verify: None,
+                        verify_error: Some(format!(
+                            "verify=count: pre-count failed (load not started): {e:#}"
+                        )),
+                    });
+                    break;
+                }
+            },
+            VerifyMode::Off => None,
         };
 
         let load_args = build_load_args(&args, &block.table, &block.schema);
@@ -235,44 +250,49 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         })?;
         let records_failed = r.records_failed;
 
-        let verify = if args.verify == VerifyMode::Count {
-            let target_post_count = Some(
-                count_table_rows(&pool, &block.schema, &block.table)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "verify=count: failed to read post-count for {schema}.{table}",
-                            schema = block.schema,
-                            table = block.table,
-                        )
-                    })?,
-            );
-            Some(VerifyOutcome::from_inputs(
-                block.schema.clone(),
-                block.table.clone(),
-                VerifyInputs {
-                    mode: args.verify,
-                    on_conflict: args.on_conflict,
-                    source_rows: r.source_rows,
-                    records_loaded: r.records_loaded,
-                    records_failed,
-                    target_pre_count,
-                    target_post_count,
-                },
-            ))
-        } else {
-            None
+        // Post-count failure: load committed, count(*) failed. Surface
+        // the error against a populated summary so the operator sees what
+        // landed and which table needs manual verification.
+        let (verify, verify_error) = match args.verify {
+            VerifyMode::Count => match count_table_rows(&pool, &block.schema, &block.table).await {
+                Ok(post) => {
+                    let target_counts = target_pre.map(|pre| L2Counts { pre, post });
+                    let outcome = VerifyOutcome::from_inputs(
+                        block.schema.clone(),
+                        block.table.clone(),
+                        VerifyInputs {
+                            mode: args.verify,
+                            on_conflict: args.on_conflict,
+                            source_rows: r.source_rows,
+                            records_loaded: r.records_loaded,
+                            records_failed,
+                            target_counts,
+                        },
+                    );
+                    (Some(outcome), None)
+                }
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "verify=count: post-count failed (load completed): {e:#}"
+                    )),
+                ),
+            },
+            VerifyMode::Off => (None, None),
         };
 
+        let halt_on_post_count_error = verify_error.is_some();
         tables.push(TableLoadSummary {
             schema: block.schema.clone(),
             table: block.table.clone(),
             records_loaded: r.records_loaded,
             records_failed,
+            source_rows: r.source_rows,
             persisted_manifest_dir: r.persisted_manifest_dir,
             verify,
+            verify_error,
         });
-        if records_failed > 0 {
+        if records_failed > 0 || halt_on_post_count_error {
             break;
         }
     }
@@ -885,8 +905,13 @@ COPY public.events (id, label) FROM stdin;
                 table = t.table,
                 verdict = v.verdict
             );
-            assert_eq!(v.target_pre_count, Some(0));
-            assert_eq!(v.target_post_count, Some(t.records_loaded));
+            assert_eq!(
+                v.target_counts,
+                Some(L2Counts {
+                    pre: 0,
+                    post: t.records_loaded
+                })
+            );
             assert_eq!(v.source_rows, Some(t.records_loaded));
         }
     }
@@ -949,8 +974,7 @@ COPY public.t (id, x) FROM stdin;
             .expect("verify must be Some under verify=Count");
         // 3 submitted, 2 conflicted, 1 landed → shortfall = 2.
         assert_eq!(v.records_loaded, 3);
-        assert_eq!(v.target_pre_count, Some(2));
-        assert_eq!(v.target_post_count, Some(3));
+        assert_eq!(v.target_counts, Some(L2Counts { pre: 2, post: 3 }));
         assert_eq!(
             v.verdict,
             VerifyVerdict::RowsConflictedAtTarget(2),
@@ -988,6 +1012,55 @@ COPY public.t (id, x) FROM stdin;
             report.tables[0].records_failed > 0,
             "duplicate PK with OnConflict::Error must produce records_failed > 0"
         );
+    }
+
+    /// Halt-on-fail in the per-table loop: first table fails → second
+    /// table never runs. Pins the README's "halts on the first failed
+    /// table" contract; a refactor that drops the `break` would compile
+    /// and pass every other test.
+    #[tokio::test]
+    async fn run_migrate_halts_after_first_failed_table() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // Pre-create t1 with PK + seed conflict; t2 is empty so its
+        // load would succeed if reached.
+        pool.execute_query("CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        pool.execute_query("INSERT INTO t1 VALUES (1)")
+            .await
+            .unwrap();
+        pool.execute_query("CREATE TABLE t2 (id INTEGER)")
+            .await
+            .unwrap();
+
+        let dump = write_dump(
+            "\
+COPY public.t1 (id) FROM stdin;
+1
+\\.
+COPY public.t2 (id) FROM stdin;
+99
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool.clone(), false);
+        args.verify = VerifyMode::Off;
+        args.on_conflict = OnConflict::Error;
+
+        let report = run_migrate(args).await.unwrap();
+        assert_eq!(
+            report.tables.len(),
+            1,
+            "halt-on-fail must skip t2 when t1 reports records_failed > 0"
+        );
+        assert_eq!(report.tables[0].table, "t1");
+        assert!(report.tables[0].records_failed > 0);
+        // t2 must not have received any inserts.
+        let rows: Vec<(i64,)> = pool
+            .fetch_all_with_binds::<(i64,)>("SELECT count(*) FROM t2", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].0, 0, "t2 must be untouched after t1 halt");
     }
 
     /// verify=Count + unfixable: short-circuit still wins, no tables

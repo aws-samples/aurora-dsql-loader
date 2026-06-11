@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 /// `Count` adds pre/post `count(*)` and produces a `VerifyOutcome` per
 /// loaded table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum VerifyMode {
     #[default]
     Off,
@@ -50,8 +51,18 @@ impl std::fmt::Display for VerifyMode {
     }
 }
 
+/// L2 pre/post pair. `Some` exactly when L2 ran; the `(pre, post)`
+/// invariant — both present together — is enforced by construction
+/// rather than by convention on two parallel `Option` fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L2Counts {
+    pub pre: u64,
+    pub post: u64,
+}
+
 /// One verification outcome per loaded table.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VerifyOutcome {
     pub schema: String,
     pub table: String,
@@ -59,49 +70,48 @@ pub struct VerifyOutcome {
     pub source_rows: Option<u64>,
     pub records_loaded: u64,
     pub records_failed: u64,
-    /// Both `Some` when L2 ran, both `None` otherwise.
-    pub target_pre_count: Option<u64>,
-    pub target_post_count: Option<u64>,
+    /// `Some` when L2 ran, `None` otherwise.
+    pub target_counts: Option<L2Counts>,
     pub verdict: VerifyVerdict,
 }
 
 /// Most actionable verdict per table; payload is the magnitude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VerifyVerdict {
     /// L1 clean, and L2 (if run) clean.
     Match,
     /// L1 shortfall: rows lost between source bytes and the DB layer.
     LoaderDropped(u64),
     /// L2 shortfall under `OnConflict::Error` — INSERT reported success
-    /// but target grew by less than `records_loaded`. Real bug.
+    /// but target grew by less than `records_loaded`. Concurrent DELETE
+    /// or rolled-back INSERT (verify=count assumes sole writer).
     MissingTarget(u64),
     /// L2 excess: target grew more than `records_loaded`. Concurrent
-    /// writer or duplicate accounting.
+    /// INSERT (verify=count assumes sole writer) or duplicate accounting.
     ExtraTarget(u64),
-    /// L2 shortfall under `DoNothing`/`DoUpdate` — N rows resolved by ON CONFLICT.
-    /// Expected under conflict-tolerant modes; CLI still exits 1 so a chained
-    /// `migrate && deploy.sh` does not ship a partially-loaded cluster without
-    /// operator review.
+    /// L2 shortfall under `DoNothing`/`DoUpdate` — N rows resolved by
+    /// ON CONFLICT. CLI exits 1 so chained `migrate && deploy.sh` does
+    /// not ship a partially-loaded cluster without operator review.
     RowsConflictedAtTarget(u64),
     /// csv/tsv: no exact source count, so L1 can't run.
     SkippedNoExactSourceCount,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct VerifyInputs {
+pub(crate) struct VerifyInputs {
     pub mode: VerifyMode,
     pub on_conflict: OnConflict,
     pub source_rows: Option<u64>,
     pub records_loaded: u64,
     pub records_failed: u64,
-    /// Both `Some` when L2 ran, both `None` otherwise.
-    pub target_pre_count: Option<u64>,
-    pub target_post_count: Option<u64>,
+    /// `Some` when L2 ran, `None` otherwise.
+    pub target_counts: Option<L2Counts>,
 }
 
 impl VerifyOutcome {
     /// Classify `inputs` and bind the verdict to `(schema, table)`.
-    pub fn from_inputs(schema: String, table: String, inputs: VerifyInputs) -> Self {
+    pub(crate) fn from_inputs(schema: String, table: String, inputs: VerifyInputs) -> Self {
         let verdict = classify(inputs);
         VerifyOutcome {
             schema,
@@ -109,8 +119,7 @@ impl VerifyOutcome {
             source_rows: inputs.source_rows,
             records_loaded: inputs.records_loaded,
             records_failed: inputs.records_failed,
-            target_pre_count: inputs.target_pre_count,
-            target_post_count: inputs.target_post_count,
+            target_counts: inputs.target_counts,
             verdict,
         }
     }
@@ -119,9 +128,9 @@ impl VerifyOutcome {
 /// Pure verdict classifier — no I/O, exhaustively unit-tested.
 ///
 /// Order: source `None` → `SkippedNoExactSourceCount`; L1 shortfall →
-/// `LoaderDropped`; L2 (if mode=Count and pre/post present) → see
+/// `LoaderDropped`; L2 (if mode=Count and counts present) → see
 /// variants; otherwise `Match`.
-pub fn classify(inputs: VerifyInputs) -> VerifyVerdict {
+pub(crate) fn classify(inputs: VerifyInputs) -> VerifyVerdict {
     let Some(source_rows) = inputs.source_rows else {
         return VerifyVerdict::SkippedNoExactSourceCount;
     };
@@ -135,7 +144,7 @@ pub fn classify(inputs: VerifyInputs) -> VerifyVerdict {
     // a future format introduces uncertainty.
 
     if inputs.mode == VerifyMode::Count
-        && let (Some(pre), Some(post)) = (inputs.target_pre_count, inputs.target_post_count)
+        && let Some(L2Counts { pre, post }) = inputs.target_counts
     {
         // saturating_sub: a concurrent DELETE (post < pre) normalises to
         // delta=0 → MissingTarget/RowsConflictedAtTarget, instead of
@@ -163,7 +172,7 @@ pub fn classify(inputs: VerifyInputs) -> VerifyVerdict {
 /// `SELECT COUNT(*)` for L2 pre/post. Reuses
 /// `Pool::qualified_table_name` so identifier quoting matches the rest
 /// of the loader.
-pub async fn count_table_rows(pool: &Pool, schema: &str, table: &str) -> Result<u64> {
+pub(crate) async fn count_table_rows(pool: &Pool, schema: &str, table: &str) -> Result<u64> {
     let qualified = pool.qualified_table_name(schema, table);
     let sql = format!("SELECT COUNT(*) FROM {qualified}");
     let rows: Vec<(i64,)> = pool
@@ -194,14 +203,18 @@ mod tests {
         pre: Option<u64>,
         post: Option<u64>,
     ) -> VerifyInputs {
+        let target_counts = match (pre, post) {
+            (Some(pre), Some(post)) => Some(L2Counts { pre, post }),
+            (None, None) => None,
+            _ => panic!("test helper: pre/post must both be Some or both None"),
+        };
         VerifyInputs {
             mode,
             on_conflict,
             source_rows,
             records_loaded: loaded,
             records_failed: failed,
-            target_pre_count: pre,
-            target_post_count: post,
+            target_counts,
         }
     }
 
