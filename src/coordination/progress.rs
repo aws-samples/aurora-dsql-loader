@@ -12,10 +12,9 @@
 //!
 //! Bar lifecycle (per table): workers send telemetry → channel closes →
 //! pump drains → bars finalize. Finalizing while the pump is still
-//! writing corrupts the next render (see `LoadProgress::finish_clean`).
+//! writing corrupts the next render (see `LoadProgress::finish_and_clear`).
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::formats::pgdump::CopyBlock;
@@ -25,7 +24,7 @@ use crate::telemetry::{ProgressStats, TelemetryEvent};
 /// Whole-dump progress view: two persistent bars (Tables, Dump Bytes)
 /// plus the `MultiProgress` that per-table [`LoadProgress`] attach to.
 pub struct MigrateProgress {
-    multi: Arc<MultiProgress>,
+    multi: MultiProgress,
     tables_bar: ProgressBar,
     bytes_bar: ProgressBar,
 }
@@ -62,15 +61,15 @@ impl MigrateProgress {
         );
 
         Self {
-            multi: Arc::new(multi),
+            multi,
             tables_bar,
             bytes_bar,
         }
     }
 
     /// Handle for per-table [`LoadProgress`] instances to attach to.
-    pub fn multi(&self) -> Arc<MultiProgress> {
-        Arc::clone(&self.multi)
+    pub fn multi(&self) -> MultiProgress {
+        self.multi.clone()
     }
 
     pub fn record_table_loaded(&self, block_bytes: u64) {
@@ -78,9 +77,9 @@ impl MigrateProgress {
         self.bytes_bar.inc(block_bytes);
     }
 
-    /// Close the persistent bars before the caller prints any trailing
-    /// stdout — otherwise indicatif's live render corrupts that print.
-    pub fn finish_clean(&self) {
+    /// Finish the persistent bars "done", leaving them visible. Call
+    /// before any trailing stdout so the live render doesn't corrupt it.
+    pub fn finish_visible(&self) {
         self.tables_bar.finish_with_message("done");
         self.bytes_bar.finish_with_message("done");
     }
@@ -96,9 +95,26 @@ impl MigrateProgress {
     }
 }
 
+impl Drop for MigrateProgress {
+    /// Safety net for `?`-unwind out of the migrate loop: abandon any
+    /// still-live bar so it doesn't interleave with the printed error.
+    /// No-op once `finish_visible`/`finish_halted` has run.
+    fn drop(&mut self) {
+        if !self.tables_bar.is_finished() {
+            self.tables_bar.abandon_with_message("interrupted");
+        }
+        if !self.bytes_bar.is_finished() {
+            self.bytes_bar.abandon_with_message("interrupted");
+        }
+    }
+}
+
 /// Per-load progress: 4 bars (chunks / rows / bytes / batch-time) plus
-/// the telemetry pump task that drives them.
+/// the telemetry pump task that drives them. Keeps its `MultiProgress`
+/// so the embedded path can `remove` finished bars (clearing alone
+/// leaves zombies that pile up across a multi-table migrate).
 pub struct LoadProgress {
+    multi: MultiProgress,
     chunk_bar: ProgressBar,
     rows_bar: Option<ProgressBar>,
     bytes_bar: ProgressBar,
@@ -115,7 +131,7 @@ impl LoadProgress {
         telemetry_rx: mpsc::UnboundedReceiver<TelemetryEvent>,
     ) -> Self {
         Self::with_multi(
-            &MultiProgress::new(),
+            MultiProgress::new(),
             file_metadata,
             total_chunks,
             telemetry_rx,
@@ -125,7 +141,7 @@ impl LoadProgress {
     /// Attach 4 bars to an existing `MultiProgress`; bars render in
     /// `add` order, so the dump-wide bars must already be inserted.
     pub fn within(
-        parent: &MultiProgress,
+        parent: MultiProgress,
         file_metadata: &FileMetadata,
         total_chunks: u64,
         telemetry_rx: mpsc::UnboundedReceiver<TelemetryEvent>,
@@ -134,13 +150,13 @@ impl LoadProgress {
     }
 
     fn with_multi(
-        multi: &MultiProgress,
+        multi: MultiProgress,
         file_metadata: &FileMetadata,
         total_chunks: u64,
         mut telemetry_rx: mpsc::UnboundedReceiver<TelemetryEvent>,
     ) -> Self {
         let (chunk_bar, rows_bar, bytes_bar, stats_bar) =
-            build_load_bars(multi, file_metadata, total_chunks);
+            build_load_bars(&multi, file_metadata, total_chunks);
 
         let chunk_bar_pump = chunk_bar.clone();
         let rows_bar_pump = rows_bar.clone();
@@ -165,6 +181,7 @@ impl LoadProgress {
         });
 
         Self {
+            multi,
             chunk_bar,
             rows_bar,
             bytes_bar,
@@ -173,28 +190,44 @@ impl LoadProgress {
         }
     }
 
-    /// Drain the pump before clearing — finalizing mid-write corrupts
-    /// the next table's render. Caller must have closed the channel.
-    pub async fn finish_clean(self) {
-        let _ = self.pump.await;
-        self.chunk_bar.finish_and_clear();
-        if let Some(bar) = self.rows_bar {
+    /// Drain the pump, then clear and remove each bar (embedded/migrate
+    /// path). Caller must have closed the channel first.
+    pub async fn finish_and_clear(mut self) {
+        self.join_pump().await;
+        for bar in self.bars() {
             bar.finish_and_clear();
+            self.multi.remove(&bar);
         }
-        self.bytes_bar.finish_and_clear();
-        self.stats_bar.finish_and_clear();
     }
 
-    /// Same pump-wait ordering as `finish_clean`, but leave bars
+    /// Same pump-wait ordering as `finish_and_clear`, but leave bars
     /// visible so the operator keeps the final state on screen.
-    pub async fn finish_standalone(self) {
-        let _ = self.pump.await;
+    pub async fn finish_standalone(mut self) {
+        self.join_pump().await;
         self.chunk_bar.finish_with_message("All chunks completed");
-        if let Some(bar) = self.rows_bar {
+        if let Some(bar) = &self.rows_bar {
             bar.finish();
         }
         self.bytes_bar.finish();
         self.stats_bar.finish();
+    }
+
+    fn bars(&self) -> Vec<ProgressBar> {
+        let mut v = vec![self.chunk_bar.clone()];
+        v.extend(self.rows_bar.clone());
+        v.push(self.bytes_bar.clone());
+        v.push(self.stats_bar.clone());
+        v
+    }
+
+    /// Await the pump, surfacing a panic instead of swallowing it — a
+    /// panicked pump means bar positions silently stopped advancing.
+    async fn join_pump(&mut self) {
+        if let Err(e) = (&mut self.pump).await
+            && e.is_panic()
+        {
+            tracing::error!(error = %e, "progress pump panicked; bar positions may under-count");
+        }
     }
 }
 
@@ -313,7 +346,7 @@ mod tests {
         assert_eq!(mp.bytes_bar.position(), 100);
     }
 
-    /// Smoke: build → send event → drop tx → `finish_clean` must not
+    /// Smoke: build → send event → drop tx → `finish_and_clear` must not
     /// panic. Catches regressions in the pump-drain-then-finalize order.
     #[tokio::test]
     async fn load_progress_within_lifecycle_finishes_cleanly() {
@@ -323,7 +356,7 @@ mod tests {
             estimated_rows: Some(50),
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        let lp = LoadProgress::within(&multi, &metadata, 5, rx);
+        let lp = LoadProgress::within(multi, &metadata, 5, rx);
 
         tx.send(TelemetryEvent::ChunkStarted).unwrap();
         tx.send(TelemetryEvent::BatchLoaded {
@@ -334,6 +367,53 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        lp.finish_clean().await;
+        lp.finish_and_clear().await;
+    }
+
+    /// Standalone path (own `MultiProgress`, `finish_standalone`) — the
+    /// entire non-migrate `load` surface, otherwise only covered via
+    /// `within`.
+    #[tokio::test]
+    async fn load_progress_standalone_lifecycle_finishes_cleanly() {
+        let metadata = FileMetadata {
+            file_size_bytes: 1000,
+            estimated_rows: Some(50),
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let lp = LoadProgress::new(&metadata, 5, rx);
+
+        tx.send(TelemetryEvent::BatchLoaded {
+            records_loaded: 10,
+            bytes_processed: 200,
+            duration_ms: 42,
+        })
+        .unwrap();
+        drop(tx);
+
+        lp.finish_standalone().await;
+    }
+
+    /// `estimated_rows: None` → no rows bar; finalizers must skip the
+    /// absent bar without panicking.
+    #[tokio::test]
+    async fn load_progress_without_rows_bar_finishes_cleanly() {
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let metadata = FileMetadata {
+            file_size_bytes: 1000,
+            estimated_rows: None,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let lp = LoadProgress::within(multi, &metadata, 5, rx);
+        assert!(lp.rows_bar.is_none());
+
+        tx.send(TelemetryEvent::BatchLoaded {
+            records_loaded: 10,
+            bytes_processed: 200,
+            duration_ms: 42,
+        })
+        .unwrap();
+        drop(tx);
+
+        lp.finish_and_clear().await;
     }
 }

@@ -61,8 +61,9 @@ impl ProgressStats {
         let mut sorted = self.batch_durations_ms.clone();
         sorted.sort_unstable();
 
-        let index = ((p / 100.0) * sorted.len() as f64).ceil() as usize - 1;
-        let index = index.min(sorted.len() - 1);
+        // saturating_sub guards p=0.0 (ceil → 0, would underflow on `- 1`).
+        let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+        let index = rank.saturating_sub(1).min(sorted.len() - 1);
 
         Some(sorted[index])
     }
@@ -74,5 +75,31 @@ impl ProgressStats {
             self.percentile(90.0),
             self.percentile(99.0),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_zero_does_not_underflow() {
+        // p=0.0 → ceil(0)=0; without saturating_sub this panics in debug
+        // / wraps to usize::MAX in release.
+        let mut stats = ProgressStats::new();
+        stats.batch_durations_ms = vec![10, 20, 30];
+        assert_eq!(stats.percentile(0.0), Some(10));
+    }
+
+    #[test]
+    fn percentile_empty_is_none() {
+        assert_eq!(ProgressStats::new().percentile(50.0), None);
+    }
+
+    #[test]
+    fn percentile_hundred_is_max() {
+        let mut stats = ProgressStats::new();
+        stats.batch_durations_ms = vec![10, 20, 30];
+        assert_eq!(stats.percentile(100.0), Some(30));
     }
 }

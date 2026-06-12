@@ -237,6 +237,16 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
                             "verify=count: pre-count failed (load not started): {e:#}"
                         )),
                     });
+                    // Mirror the post-count halt: mark halted so the bars
+                    // abandon instead of finishing "done".
+                    if let Some(mp) = &migrate_progress {
+                        mp.finish_halted(&format!(
+                            "{schema}.{table}: verify=count pre-count failed",
+                            schema = block.schema,
+                            table = block.table,
+                        ));
+                    }
+                    halted = true;
                     break;
                 }
             },
@@ -331,7 +341,7 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
     }
 
     if !halted && let Some(mp) = &migrate_progress {
-        mp.finish_clean();
+        mp.finish_visible();
     }
 
     Ok(MigrateReport {
@@ -931,6 +941,9 @@ COPY public.events (id, label) FROM stdin;
         let report = run_migrate(args).await.unwrap();
         assert_eq!(report.tables.len(), 2, "both COPY blocks should load");
         for t in &report.tables {
+            // TableLoadSummary mirrors r.source_rows independently of the
+            // verify outcome; pin it so dropping the plumbing is caught.
+            assert_eq!(t.source_rows, Some(t.records_loaded));
             let v = t
                 .verify
                 .as_ref()
@@ -1098,6 +1111,36 @@ COPY public.t2 (id) FROM stdin;
             .await
             .unwrap();
         assert_eq!(rows[0].0, 0, "t2 must be untouched after t1 halt");
+    }
+
+    /// Pre-count failure halts with a populated `verify_error` (load not
+    /// started) and freezes the report. Triggered by a COPY block whose
+    /// table is never created, so `count(*)` errors before the load.
+    #[tokio::test]
+    async fn run_migrate_verify_count_pre_count_failure_halts_with_error() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // No CREATE TABLE for `missing`, and not pre-created → the
+        // pre-count count(*) fails before any INSERT.
+        let dump = write_dump(
+            "\
+COPY public.missing (id) FROM stdin;
+1
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.verify = VerifyMode::Count;
+
+        let report = run_migrate(args).await.unwrap();
+        assert_eq!(report.tables.len(), 1);
+        let t = &report.tables[0];
+        assert_eq!(t.records_loaded, 0, "load must not have started");
+        assert!(t.verify.is_none());
+        let err = t.verify_error.as_ref().expect("pre-count error recorded");
+        assert!(
+            err.contains("pre-count failed (load not started)"),
+            "got: {err}"
+        );
     }
 
     /// verify=Count + unfixable: short-circuit still wins, no tables

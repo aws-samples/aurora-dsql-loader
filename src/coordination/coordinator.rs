@@ -279,7 +279,7 @@ pub struct LoadConfig {
     /// `Some` attaches bars to the caller's `MultiProgress`; `None`
     /// builds its own. `quiet` overrides both to no bars.
     #[builder(default)]
-    parent_multi: Option<Arc<MultiProgress>>,
+    parent_multi: Option<MultiProgress>,
 }
 
 /// Result of a completed data load operation
@@ -352,7 +352,7 @@ impl Coordinator {
             let total_chunks = chunks.len() as u64;
             Some(match &config.parent_multi {
                 Some(parent) => {
-                    LoadProgress::within(parent, &file_metadata, total_chunks, telemetry_rx)
+                    LoadProgress::within(parent.clone(), &file_metadata, total_chunks, telemetry_rx)
                 }
                 None => LoadProgress::new(&file_metadata, total_chunks, telemetry_rx),
             })
@@ -365,7 +365,7 @@ impl Coordinator {
         // workers finished → channel closed → pump drains → bars finalize.
         if let Some(lp) = load_progress {
             if config.parent_multi.is_some() {
-                lp.finish_clean().await;
+                lp.finish_and_clear().await;
             } else {
                 lp.finish_standalone().await;
             }
@@ -1113,6 +1113,17 @@ mod aggregate_tests {
             mk_chunk_result(2, Some(10)),
         ];
         assert_eq!(aggregate_source_rows(&results, 3), None);
+    }
+
+    #[test]
+    fn aggregate_source_rows_overflow_returns_none() {
+        // Adversarial parquet footer: u64::MAX + 1 must demote to None
+        // (checked_add), not wrap to a small number that fakes a Match.
+        let results = vec![
+            mk_chunk_result(0, Some(u64::MAX)),
+            mk_chunk_result(1, Some(1)),
+        ];
+        assert_eq!(aggregate_source_rows(&results, 2), None);
     }
 }
 
