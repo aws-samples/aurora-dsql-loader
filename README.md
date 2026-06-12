@@ -198,6 +198,13 @@ access yet.
   collapsed and will surface as `Unfixable` — drop it from the dump or
   inline the sequence.
 
+**Halt-on-failure:** if any per-table load reports failed records (or
+verify=count's post-count fails mid-run), `migrate` halts at that table
+and exits non-zero. Without DSQL FK enforcement, continuing past a
+partially-loaded parent would silently load child rows pointing at
+missing parents. The persisted manifest path is printed for each failed
+table so the operator can inspect the dropped chunks before re-running.
+
 **Destructive-statement caveat:** `migrate` is intended for fresh /
 empty DSQL clusters. `dsql-lint` does not flag `DROP TABLE`,
 `DROP SCHEMA`, `DROP INDEX`, `DELETE`, or `UPDATE` statements; if your
@@ -270,6 +277,10 @@ aurora-dsql-loader load \
 ```
 
 Resume automatically retries failed chunks and skips completed ones. For safety against duplicates on retry, use unique constraints on your table—the loader will use `ON CONFLICT DO NOTHING` to skip duplicates.
+
+## Verification
+
+`--verify=count` cross-checks row counts after a load and reports one verdict per table: `Match`, `LoaderDropped(N)`, `MissingTarget(N)`, `ExtraTarget(N)`, `RowsConflictedAtTarget(N)`, or `SkippedNoExactSourceCount` (csv/tsv). Any verdict other than `Match` or `SkippedNoExactSourceCount` exits non-zero. Default: `off` for `load`, `count` for `migrate`. Assumes the loader is the sole writer to the target during the run.
 
 ## Performance Tuning
 

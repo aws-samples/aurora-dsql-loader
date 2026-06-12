@@ -16,6 +16,11 @@ pub use crate::migrate::{
     TableLoadSummary, run_migrate,
 };
 
+// Re-export the verification surface — `VerifyMode` is set by the CLI on
+// `LoadArgs`, and `VerifyOutcome` / `VerifyVerdict` ship as fields of
+// `LoadResult` and `TableLoadSummary`.
+pub use crate::verify::{L2Counts, VerifyMode, VerifyOutcome, VerifyVerdict};
+
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;
@@ -31,6 +36,7 @@ use crate::db::{self as db_pool, SchemaInferrer};
 use crate::formats::pgdump::{CopyBlock, PgDumpReader, list_copy_blocks};
 use crate::formats::{DelimitedConfig, ReaderFactory};
 use crate::io::{LocalFileByteReader, S3ByteReader, SourceUri};
+use crate::verify::{self, VerifyInputs};
 
 /// File format for the source data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +117,11 @@ pub struct LoadArgs {
     // Conflict resolution strategy
     pub on_conflict: OnConflict,
 
+    /// L2 toggle. Source-row counting runs parser-side regardless;
+    /// `Count` adds pre/post `count(*)` and a per-table verdict. CLI
+    /// default: `load`=Off, `migrate`=Count.
+    pub verify: VerifyMode,
+
     // Columns to exclude from INSERT statements (DB applies DEFAULT values)
     pub exclude_columns: Vec<String>,
 
@@ -138,6 +149,13 @@ pub struct LoadResult {
     pub records_failed: u64,
     /// Estimated row count from file size (for mismatch detection)
     pub estimated_rows: Option<u64>,
+    /// Exact source-row count summed across chunks. `Some` for pgdump
+    /// and parquet; `None` for csv/tsv.
+    pub source_rows: Option<u64>,
+    /// `Some` under `--verify=count` on the `run_load` path. Migrate
+    /// builds its own outcome on `TableLoadSummary.verify` and leaves
+    /// this `None`.
+    pub verify: Option<VerifyOutcome>,
     pub duration: Duration,
     /// Path to persisted manifest directory (if errors occurred and temp dir was used)
     pub persisted_manifest_dir: Option<PathBuf>,
@@ -155,7 +173,7 @@ pub struct LoadResult {
 /// # Example
 ///
 /// ```no_run
-/// use aurora_dsql_loader::runner::{LoadArgs, Format, OnConflict, run_load};
+/// use aurora_dsql_loader::runner::{LoadArgs, Format, OnConflict, VerifyMode, run_load};
 /// use std::collections::HashMap;
 ///
 /// # async fn example() -> anyhow::Result<()> {
@@ -178,13 +196,10 @@ pub struct LoadResult {
 ///     debug: false,
 ///     resume_job_id: None,
 ///     on_conflict: OnConflict::DoNothing,
+///     verify: VerifyMode::Off,
 ///     delimiter: None,
 ///     quote: None,
 ///     escape: None,
-///     // The CSV in this example has a header row that names the destination
-///     // columns. With `create_table_if_missing: true`, leaving this as `None`
-///     // would name columns from row 1's data values (the new 3.0 default
-///     // treats every row as data). Set explicitly when loading a header-bearing file.
 ///     has_header: Some(true),
 ///     exclude_columns: Vec::new(),
 /// };
@@ -200,14 +215,72 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     // who skip `run_load` still get the same checks.
     validate_load_args(&args)?;
     let pool = build_pool(&args).await?;
-    run_load_with_pool(pool, args).await
+
+    // L2 needs a stable pre/post pair AND an exact source count to be
+    // meaningful. Skip on `--if-not-exists` (table may not exist yet, and a
+    // re-run would mis-classify as ExtraTarget) and on csv/tsv (classify()
+    // short-circuits to SkippedNoExactSourceCount, wasting two count(*)).
+    let l2_runs = args.verify == VerifyMode::Count
+        && !args.create_table_if_missing
+        && matches!(args.format, Format::PgDump | Format::Parquet);
+    let target_pre = if l2_runs {
+        Some(
+            verify::count_table_rows(&pool, &args.schema, &args.target_table)
+                .await
+                .context("verify=count: failed to read target pre-count")?,
+        )
+    } else {
+        None
+    };
+
+    if args.verify == VerifyMode::Count && !l2_runs {
+        // Operator opted into count(*) but the gating conditions skipped
+        // L2; surface that instead of silently returning Match.
+        tracing::info!(
+            schema = %args.schema,
+            table = %args.target_table,
+            "verify=count: L2 skipped (--if-not-exists or csv/tsv); L1 only"
+        );
+    }
+
+    let schema = args.schema.clone();
+    let target_table = args.target_table.clone();
+    let on_conflict = args.on_conflict;
+    let verify_mode = args.verify;
+
+    let mut result = run_load_with_pool(pool.clone(), args).await?;
+
+    if verify_mode == VerifyMode::Count {
+        let target_post = if l2_runs {
+            Some(
+                verify::count_table_rows(&pool, &schema, &target_table)
+                    .await
+                    .context("verify=count: failed to read target post-count")?,
+            )
+        } else {
+            None
+        };
+        let target_counts = target_pre
+            .zip(target_post)
+            .map(|(pre, post)| L2Counts { pre, post });
+        result.verify = Some(VerifyOutcome::from_inputs(
+            schema,
+            target_table,
+            VerifyInputs {
+                mode: verify_mode,
+                on_conflict,
+                source_rows: result.source_rows,
+                records_loaded: result.records_loaded,
+                records_failed: result.records_failed,
+                target_counts,
+            },
+        ));
+    }
+
+    Ok(result)
 }
 
-/// Build the connection pool from `args`, with the `#[cfg(test)] test_pool`
-/// shortcut applied first so SQLite-backed tests skip the IAM path. Pulled
-/// out of [`run_load`] so the body of `run_load` becomes "build pool, hand
-/// off to `run_load_with_pool`" — the migrate orchestrator drives
-/// `run_load_with_pool` directly with its own already-built pool.
+/// Build the connection pool. Honors `args.test_pool` in `#[cfg(test)]`.
 async fn build_pool(args: &LoadArgs) -> Result<crate::db::Pool> {
     #[cfg(test)]
     if let Some(test_pool) = args.test_pool.clone() {
@@ -246,9 +319,14 @@ pub(crate) async fn run_load_with_pool(
     let reader_factory = ReaderFactory::new(&aws_config);
     let (file_reader, pgdump_columns) = match args.format {
         Format::PgDump => {
-            reader_factory
+            let (reader, columns) = reader_factory
                 .create_pgdump_reader(&parsed_uri, &args.schema, &args.target_table)
-                .await?
+                .await?;
+            // Symmetric to migrate's per-block validation — guards INSERT SQL.
+            for col in &columns {
+                validate_pgdump_identifier("column", col)?;
+            }
+            (reader, columns)
         }
         _ => {
             let reader = reader_factory
@@ -291,6 +369,8 @@ pub(crate) async fn run_load_with_pool_for_pgdump_block(
     parent_multi: Option<std::sync::Arc<indicatif::MultiProgress>>,
 ) -> Result<LoadResult> {
     validate_load_args(&args)?;
+    debug_assert_eq!(args.target_table, block.table);
+    debug_assert_eq!(args.schema, block.schema);
 
     let delimited_config = maybe_delimited_config(&args);
     let parsed_uri = SourceUri::parse(&args.source_uri)?;
@@ -394,12 +474,16 @@ async fn run_load_with_pool_and_reader(
         None
     };
 
+    // L1 inputs only — callers (run_load / migrate orchestrator) own
+    // L2 and the final VerifyOutcome.
     Ok(LoadResult {
         job_id: result.job_id,
         chunks_processed: result.chunks_processed,
         records_loaded: result.records_loaded,
         records_failed: result.records_failed,
         estimated_rows: result.estimated_rows,
+        source_rows: result.source_rows,
+        verify: None,
         duration: result.duration,
         persisted_manifest_dir,
     })
@@ -447,15 +531,24 @@ fn validate_load_args(args: &LoadArgs) -> Result<()> {
             );
         }
     }
+
+    // verify=count's L2 needs target_pre sampled at the start of the
+    // load; on resume the manifest already holds rows from the original
+    // run, so post-pre would be < records_loaded and classify produces a
+    // false MissingTarget/RowsConflictedAtTarget.
+    if args.resume_job_id.is_some() && args.verify == VerifyMode::Count {
+        anyhow::bail!(
+            "--verify=count cannot be combined with --resume-job-id: pre-count \
+             would not include rows from the original run. Re-run with --verify=off."
+        );
+    }
     Ok(())
 }
 
-/// Reject SQL-identifier inputs (`--schema`, `--table`) that would break
-/// downstream identifier quoting. `Pool::qualified_table_name` interpolates
-/// the value into `format!("\"{}\"", …)` without escape-doubling embedded
-/// quotes, and the worker's INSERT generation does the same with column
-/// names. Rejecting embedded `"` and control bytes here closes the otherwise
-/// open path from CLI args into raw SQL.
+/// Reject CLI identifiers that would break SQL identifier quoting or
+/// deceive an operator reading logs. `Pool::qualified_table_name`
+/// escape-doubles `"` defensively, but control bytes and bidi/format
+/// codepoints are blocked here so they never reach SQL or terminals.
 fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("--{field} must not be empty");
@@ -471,14 +564,28 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Unicode bidi-control and zero-width / format codepoints that visually
-/// reorder or hide surrounding text in a terminal — RLM, LRM, RTL/LTR
-/// overrides, ZWSP/ZWNJ/ZWJ, BOM/ZWNBSP, line/paragraph separators, bidi
-/// isolates. A deceptive identifier carrying any of these would confuse an
-/// operator reading load logs even though it cannot escape SQL quoting.
-///
-/// Shared between `validate_identifier` (CLI `--schema` / `--table` inputs)
-/// and `main::is_unsafe_for_listing` (the `list-tables` TSV output guard).
+/// Same allowlist as `validate_identifier` but applied to identifiers
+/// parsed out of the dump (block.schema/table/columns). Distinct error
+/// wording so the operator knows the dump is at fault, not their CLI.
+pub(crate) fn validate_pgdump_identifier(field: &'static str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("pg_dump {field} identifier must not be empty");
+    }
+    if value.chars().any(is_unsafe_identifier_char) {
+        anyhow::bail!(
+            "pg_dump {field} identifier {value:?} contains an unsafe character \
+             (control byte, backslash, double-quote, or Unicode bidi/format \
+             codepoint) that would corrupt SQL identifier quoting or visually \
+             deceive an operator reading logs. Edit the dump to rename the \
+             offending identifier."
+        );
+    }
+    Ok(())
+}
+
+/// Unicode bidi/zero-width/format codepoints that visually reorder or
+/// hide surrounding text in a terminal. Shared between identifier
+/// validation and the `list-tables` TSV output guard.
 pub fn is_bidi_or_format_char(c: char) -> bool {
     matches!(
         c,
@@ -644,6 +751,19 @@ mod tests {
         assert!(err.contains("create_table_if_missing"), "{err}");
     }
 
+    /// Resume + verify=count would mis-classify: pre-count is sampled
+    /// at resume start but records_loaded sums the entire manifest, so
+    /// post − pre < records_loaded → false MissingTarget.
+    #[test]
+    fn resume_with_verify_count_is_rejected_at_validation() {
+        let mut args = sample_pgdump_args();
+        args.resume_job_id = Some("abc-123".into());
+        args.verify = VerifyMode::Count;
+        let err = validate_load_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--verify=count"), "{err}");
+        assert!(err.contains("--resume-job-id"), "{err}");
+    }
+
     #[tokio::test]
     async fn list_pgdump_tables_reports_each_block() -> Result<()> {
         let mut f = tempfile::NamedTempFile::new()?;
@@ -698,6 +818,7 @@ mod tests {
             column_mappings: Default::default(),
             resume_job_id: None,
             on_conflict: OnConflict::DoNothing,
+            verify: VerifyMode::Off,
             exclude_columns: Vec::new(),
             delimiter: None,
             quote: None,

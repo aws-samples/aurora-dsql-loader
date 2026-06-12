@@ -228,13 +228,18 @@ impl Pool {
     /// Get a fully qualified table name for SQL statements
     /// - PostgreSQL: Returns "schema"."table" for non-public, or "table" for public
     /// - SQLite: Returns "table" (possibly prefixed like "sales_orders")
+    ///
+    /// Escapes embedded `"` per SQL identifier-quoting rules (defense in
+    /// depth — `validate_identifier`/`validate_pgdump_identifier` should
+    /// already have rejected such input upstream).
     pub fn qualified_table_name(&self, schema_name: &str, table_name: &str) -> String {
         let (schema, table) = self.table_identifier(schema_name, table_name);
+        let q = |s: &str| s.replace('"', "\"\"");
 
         if self.is_postgres() && schema != "public" {
-            format!("\"{}\".\"{}\"", schema, table)
+            format!("\"{}\".\"{}\"", q(&schema), q(&table))
         } else {
-            format!("\"{}\"", table)
+            format!("\"{}\"", q(&table))
         }
     }
 

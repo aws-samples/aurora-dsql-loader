@@ -9,6 +9,7 @@ mod formats;
 mod io;
 mod migrate;
 mod telemetry;
+mod verify;
 
 #[cfg(test)]
 mod integ_tests;

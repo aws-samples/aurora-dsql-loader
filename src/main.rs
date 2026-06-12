@@ -1,5 +1,6 @@
 use aurora_dsql_loader::runner::{
-    ApplyOutcome, Format, LoadArgs, MigrateArgs, OnConflict, run_load, run_migrate,
+    ApplyOutcome, Format, LoadArgs, MigrateArgs, OnConflict, VerifyMode, VerifyOutcome,
+    VerifyVerdict, run_load, run_migrate,
 };
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand};
 use std::collections::HashMap;
@@ -106,6 +107,14 @@ struct LoadParams {
     /// Conflict resolution strategy (do-nothing, do-update, error)
     #[arg(long, default_value = "do-nothing")]
     on_conflict: String,
+
+    /// Post-load verification (`off` | `count`). `count` adds pre/post
+    /// `count(*)` and reports an L1+L2 verdict per table. Assumes the
+    /// loader is the sole writer during the run. L2 is skipped under
+    /// `--if-not-exists` (no stable pre-count) and on csv/tsv (no exact
+    /// source count); the per-table verdict still surfaces.
+    #[arg(long, default_value = "off")]
+    verify: String,
 
     /// Columns to exclude from INSERT statements so the DB applies DEFAULT values
     /// (format: col1,col2). Source records must still contain these columns - the
@@ -230,6 +239,13 @@ enum Command {
         #[arg(long, default_value = "error")]
         on_conflict: String,
 
+        /// Post-load verification (`off` | `count`). Default `count`:
+        /// pre/post `count(*)` per loaded table → L1+L2 verdict.
+        /// Fresh-cluster migrate makes the sole-writer assumption hold
+        /// trivially.
+        #[arg(long, default_value = "count")]
+        verify: String,
+
         /// Quiet mode - minimal output, only show summary.
         #[arg(short, long)]
         quiet: bool,
@@ -284,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
             batch_size,
             batch_concurrency,
             on_conflict,
+            verify,
             quiet,
             debug,
         } => {
@@ -297,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
                 batch_size,
                 batch_concurrency,
                 on_conflict,
+                verify,
                 quiet,
                 debug,
             })
@@ -322,6 +340,7 @@ struct MigrateCliArgs {
     batch_size: usize,
     batch_concurrency: usize,
     on_conflict: String,
+    verify: String,
     quiet: bool,
     debug: bool,
 }
@@ -369,6 +388,10 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
         .on_conflict
         .parse::<OnConflict>()
         .map_err(|e| anyhow::anyhow!("Invalid --on-conflict value: {}", e))?;
+    let verify = args
+        .verify
+        .parse::<VerifyMode>()
+        .map_err(|e| anyhow::anyhow!("Invalid --verify value: {}", e))?;
 
     let migrate_args = MigrateArgs {
         endpoint: args.connection.endpoint,
@@ -382,6 +405,7 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
         batch_concurrency: args.batch_concurrency,
         chunk_size_bytes,
         on_conflict,
+        verify,
         quiet: args.quiet,
         debug: args.debug,
     };
@@ -469,33 +493,122 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
                     String::new()
                 }
             );
+            if let Some(n) = t.source_rows {
+                println!("    Source rows: {n}");
+            }
             if let Some(path) = &t.persisted_manifest_dir {
                 println!("    Failed-row manifest: {}", path.display());
             }
+            if let Some(v) = &t.verify {
+                print_verify_detail(v, true);
+            }
+            if let Some(err) = &t.verify_error {
+                println!("    Verify: ERROR — {err}");
+            }
         }
-        // The orchestrator halts on the first failed table. If the last
-        // entry has failures, the operator needs to know the run was
-        // truncated — without FK enforcement on DSQL, continuing would
-        // silently load child rows against missing parents.
-        if report.tables.last().is_some_and(|t| t.records_failed > 0) {
+        // The orchestrator halts on the first table whose load failed
+        // OR whose post-count failed; in either case the report is
+        // truncated and re-running blind risks silent FK-less drift.
+        let last_halted = report
+            .tables
+            .last()
+            .is_some_and(|t| t.records_failed > 0 || t.verify_error.is_some());
+        if last_halted {
             let n = report.tables.len();
             let suffix = if n == 1 { "" } else { "s" };
             println!();
             println!(
-                "Halted after {n} table{suffix} due to load failures. \
-                 Inspect the manifest above before re-running."
+                "Halted after {n} table{suffix} due to load or verify failures. \
+                 Inspect the output above before re-running."
             );
         }
     }
 
-    // Mirror `run_loader`: any per-table failures must surface as a
-    // non-zero exit so a wrapping `migrate && deploy.sh` doesn't ship
-    // an app pointed at a partially-loaded cluster.
-    if report.tables.iter().any(|t| t.records_failed > 0) {
+    // Mirror `run_loader`: per-table failures, non-Match verdicts, and
+    // post-count errors all exit non-zero so a wrapping
+    // `migrate && deploy.sh` can't ship against a partially-loaded cluster.
+    let any_failed_records = report.tables.iter().any(|t| t.records_failed > 0);
+    let any_bad_verdict = report.tables.iter().any(|t| {
+        t.verify
+            .as_ref()
+            .is_some_and(|v| is_bad_verdict(&v.verdict))
+    });
+    let any_verify_error = report.tables.iter().any(|t| t.verify_error.is_some());
+    if any_failed_records || any_bad_verdict || any_verify_error {
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+/// True for verdicts that should make the CLI exit non-zero.
+/// `VerifyVerdict` is `#[non_exhaustive]`; unknown future variants
+/// default to non-zero so an unrecognised verdict can't ship green.
+fn is_bad_verdict(v: &VerifyVerdict) -> bool {
+    match v {
+        VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount => false,
+        VerifyVerdict::LoaderDropped(_)
+        | VerifyVerdict::MissingTarget(_)
+        | VerifyVerdict::ExtraTarget(_)
+        | VerifyVerdict::RowsConflictedAtTarget(_) => true,
+        _ => true,
+    }
+}
+
+/// Print `Verify: <verdict>` and, on a non-clean verdict, the raw counts
+/// so the operator can size the gap without re-running. `nested` indents
+/// under a parent bullet (used for per-table rows in the `migrate` report).
+fn print_verify_detail(v: &VerifyOutcome, nested: bool) {
+    let indent = if nested { "    " } else { "" };
+    println!("{indent}Verify: {}", format_verdict(&v.verdict));
+    if matches!(
+        v.verdict,
+        VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
+    ) {
+        return;
+    }
+    let fmt = |n: Option<u64>| n.map_or("n/a".to_string(), |n| n.to_string());
+    let (pre, post) = match v.target_counts {
+        Some(c) => (fmt(Some(c.pre)), fmt(Some(c.post))),
+        None => (fmt(None), fmt(None)),
+    };
+    println!(
+        "{indent}  counts: source={src}, loaded={loaded}, failed={failed}, target_pre={pre}, target_post={post}",
+        src = fmt(v.source_rows),
+        loaded = v.records_loaded,
+        failed = v.records_failed,
+    );
+}
+
+/// One-line CLI summary per VerifyVerdict.
+fn format_verdict(v: &VerifyVerdict) -> String {
+    match v {
+        VerifyVerdict::Match => "OK (counts match)".to_string(),
+        VerifyVerdict::LoaderDropped(n) => {
+            format!(
+                "LOADER DROPPED {n} row(s) — source count exceeds loaded+failed; investigate parser/chunker"
+            )
+        }
+        VerifyVerdict::MissingTarget(n) => {
+            format!(
+                "MISSING TARGET {n} row(s) — target grew less than loader submitted (concurrent DELETE? verify=count assumes sole writer)"
+            )
+        }
+        VerifyVerdict::ExtraTarget(n) => {
+            format!(
+                "EXTRA TARGET {n} row(s) — target grew more than loader submitted (concurrent INSERT? verify=count assumes sole writer)"
+            )
+        }
+        VerifyVerdict::RowsConflictedAtTarget(n) => {
+            format!(
+                "CONFLICT: {n} row(s) conflict-resolved at target under do-nothing/do-update; CLI exits 1 — re-run with verify=off if this is the intended idempotent re-apply"
+            )
+        }
+        VerifyVerdict::SkippedNoExactSourceCount => {
+            "SKIPPED — no exact source-row count for this format (csv/tsv)".to_string()
+        }
+        _ => format!("UNKNOWN VERDICT: {v:?}"),
+    }
 }
 
 async fn run_loader(
@@ -559,6 +672,11 @@ async fn run_loader(
         .parse::<OnConflict>()
         .map_err(|e| anyhow::anyhow!("Invalid --on-conflict value: {}", e))?;
 
+    let verify = load
+        .verify
+        .parse::<VerifyMode>()
+        .map_err(|e| anyhow::anyhow!("Invalid --verify value: {}", e))?;
+
     // Parse chunk size
     let chunk_size_bytes = cli::parse_size_string(&load.chunk_size)
         .map_err(|e| anyhow::anyhow!("Invalid chunk size '{}': {}", load.chunk_size, e))?;
@@ -612,11 +730,12 @@ async fn run_loader(
         column_mappings,
         resume_job_id: output.resume_job_id.clone(),
         on_conflict,
+        verify,
         exclude_columns,
         delimiter: source.delimiter.clone(),
         quote: source.quote.clone(),
         escape: source.escape.clone(),
-        // `header_mode` ArgGroup makes --header/--no-header mutually exclusive at parse time.
+        // --header / --no-header are mutually exclusive (clap `conflicts_with`).
         has_header: if source.header {
             Some(true)
         } else if source.no_header {
@@ -641,6 +760,12 @@ async fn run_loader(
         "Throughput: {:.2} records/sec",
         result.records_loaded as f64 / result.duration.as_secs_f64()
     );
+    if let Some(src) = result.source_rows {
+        println!("Source rows: {src}");
+    }
+    if let Some(v) = &result.verify {
+        print_verify_detail(v, false);
+    }
 
     // Warn if significantly fewer records were loaded than estimated
     let mut row_count_mismatch = false;
@@ -687,7 +812,11 @@ async fn run_loader(
         println!("Manifest was stored in a temporary directory and has been cleaned up.");
     }
 
-    if result.records_failed > 0 || row_count_mismatch {
+    let bad_verdict = result
+        .verify
+        .as_ref()
+        .is_some_and(|v| is_bad_verdict(&v.verdict));
+    if result.records_failed > 0 || row_count_mismatch || bad_verdict {
         std::process::exit(1);
     }
 
@@ -889,6 +1018,19 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::collections::HashSet;
+
+    /// Pin the CLI exit-code policy: only `Match` and
+    /// `SkippedNoExactSourceCount` are clean. A future verdict variant
+    /// will fail compilation here (no `_ =>` arm).
+    #[test]
+    fn is_bad_verdict_classifies_every_variant() {
+        assert!(!is_bad_verdict(&VerifyVerdict::Match));
+        assert!(!is_bad_verdict(&VerifyVerdict::SkippedNoExactSourceCount));
+        assert!(is_bad_verdict(&VerifyVerdict::LoaderDropped(1)));
+        assert!(is_bad_verdict(&VerifyVerdict::MissingTarget(1)));
+        assert!(is_bad_verdict(&VerifyVerdict::ExtraTarget(1)));
+        assert!(is_bad_verdict(&VerifyVerdict::RowsConflictedAtTarget(1)));
+    }
 
     #[test]
     fn parse_exclude_columns_basic() {
@@ -1138,6 +1280,7 @@ mod tests {
                 batch_size,
                 batch_concurrency,
                 on_conflict,
+                verify,
                 quiet,
                 debug,
             } => {
@@ -1152,6 +1295,7 @@ mod tests {
                 assert_eq!(batch_size, 2000);
                 assert_eq!(batch_concurrency, 32);
                 assert_eq!(on_conflict, "error");
+                assert_eq!(verify, "count");
                 assert!(!quiet);
                 assert!(!debug);
                 // The CLI default round-trips through `OnConflict::FromStr`
@@ -1162,6 +1306,12 @@ mod tests {
                     on_conflict.parse::<OnConflict>().unwrap(),
                     OnConflict::Error,
                     "migrate --on-conflict default must parse to OnConflict::Error",
+                );
+                // CLI default "count" must round-trip to VerifyMode::Count.
+                assert_eq!(
+                    verify.parse::<VerifyMode>().unwrap(),
+                    VerifyMode::Count,
+                    "migrate --verify default must parse to VerifyMode::Count",
                 );
             }
             _ => panic!("expected Migrate"),

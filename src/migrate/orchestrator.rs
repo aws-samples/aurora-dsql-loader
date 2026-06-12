@@ -10,7 +10,10 @@ use crate::formats::pgdump::{extract_ddl, list_copy_blocks};
 use crate::io::{ByteReader, LocalFileByteReader, S3ByteReader, SourceUri};
 use crate::migrate::apply::{AppliedStatement, apply_ddl};
 use crate::migrate::transform::{Diagnostic, TransformResult, transform_ddl};
-use crate::runner::{Format, LoadArgs, OnConflict, run_load_with_pool_for_pgdump_block};
+use crate::runner::{
+    Format, LoadArgs, OnConflict, VerifyMode, run_load_with_pool_for_pgdump_block,
+};
+use crate::verify::{L2Counts, VerifyInputs, VerifyOutcome, count_table_rows};
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;
@@ -51,6 +54,10 @@ pub struct MigrateArgs {
     /// `OnConflict::Error` — duplicate rows usually indicate a bug. The
     /// default mirrors what `run_load` accepts so this knob is opt-in.
     pub on_conflict: OnConflict,
+    /// L2 verification toggle. Default `Count`: cheap on a fresh
+    /// cluster (pre-count is sub-ms) and the verdict closes the loop
+    /// on the load.
+    pub verify: VerifyMode,
     /// Forwarded to `LoadArgs.quiet` for log-level control.
     pub quiet: bool,
     /// Forwarded to `LoadArgs.debug` for log-level control.
@@ -98,11 +105,21 @@ pub struct TableLoadSummary {
     pub table: String,
     pub records_loaded: u64,
     pub records_failed: u64,
+    /// Mirrors `LoadResult.source_rows` — exact for pgdump, `None` for
+    /// other formats. Surfaced even under `--verify=off` so operators
+    /// have a per-table source-side number without paying for L2.
+    pub source_rows: Option<u64>,
     /// Path to the persisted manifest dir when this table had failures.
     /// Mirrors `LoadResult.persisted_manifest_dir` — the operator needs
     /// it to inspect the failed-row chunks. `None` when the table loaded
     /// cleanly or when `--manifest-dir` was supplied (caller-owned).
     pub persisted_manifest_dir: Option<PathBuf>,
+    /// `Some` under verify=Count, `None` otherwise.
+    pub verify: Option<VerifyOutcome>,
+    /// Set when `count(*)` failed mid-run (transient pool/IAM/network);
+    /// the load itself succeeded but the verdict could not be computed.
+    /// Halts the loop so the operator sees the partial report.
+    pub verify_error: Option<String>,
 }
 
 /// Drive the end-to-end migrate flow against a real (or test) cluster.
@@ -115,8 +132,8 @@ pub struct TableLoadSummary {
 /// 5. if any `unfixable` diagnostic surfaced — short-circuit and return
 ///    the report so the operator can edit the dump and re-run,
 /// 6. otherwise apply the fixed DDL one statement at a time, and
-/// 7. load each table's data via `run_load_with_pool` reusing the same
-///    `Pool` the apply stage used.
+/// 7. load each table's data via `run_load_with_pool_for_pgdump_block`,
+///    reusing the same `Pool`, the pre-resolved `CopyBlock`, and `aws_config`.
 ///
 /// When `args.dry_run` is set the function stops after step 4 (transform)
 /// — the operator gets the proposed DDL and the diagnostic split, no
@@ -131,6 +148,15 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         copy_blocks = blocks.len(),
         "migrate: scanned pg_dump for COPY blocks"
     );
+
+    // Validate dump-parsed identifiers before they reach SQL or stdout.
+    for block in &blocks {
+        crate::runner::validate_pgdump_identifier("schema", &block.schema)?;
+        crate::runner::validate_pgdump_identifier("table", &block.table)?;
+        for col in &block.columns {
+            crate::runner::validate_pgdump_identifier("column", col)?;
+        }
+    }
 
     let ddl = extract_ddl(&*reader, &blocks)
         .await
@@ -191,6 +217,32 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
     let mut tables = Vec::with_capacity(blocks.len());
     let mut halted = false;
     for block in &blocks {
+        // Pre-count failure here means the load hasn't started; record a
+        // verify_error against an empty TableLoadSummary so the report
+        // shows which table blocked. The cluster is unchanged for this
+        // block (`apply_ddl` already ran but no INSERTs hit yet).
+        let target_pre = match args.verify {
+            VerifyMode::Count => match count_table_rows(&pool, &block.schema, &block.table).await {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    tables.push(TableLoadSummary {
+                        schema: block.schema.clone(),
+                        table: block.table.clone(),
+                        records_loaded: 0,
+                        records_failed: 0,
+                        source_rows: None,
+                        persisted_manifest_dir: None,
+                        verify: None,
+                        verify_error: Some(format!(
+                            "verify=count: pre-count failed (load not started): {e:#}"
+                        )),
+                    });
+                    break;
+                }
+            },
+            VerifyMode::Off => None,
+        };
+
         let load_args = build_load_args(&args, &block.table, &block.schema);
         let r = run_load_with_pool_for_pgdump_block(
             pool.clone(),
@@ -209,21 +261,66 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         })?;
         let records_failed = r.records_failed;
         let block_bytes = block.data_end - block.data_start;
+
+        // Post-count failure: load committed, count(*) failed. Surface
+        // the error against a populated summary so the operator sees what
+        // landed and which table needs manual verification.
+        let (verify, verify_error) = match args.verify {
+            VerifyMode::Count => match count_table_rows(&pool, &block.schema, &block.table).await {
+                Ok(post) => {
+                    let target_counts = target_pre.map(|pre| L2Counts { pre, post });
+                    let outcome = VerifyOutcome::from_inputs(
+                        block.schema.clone(),
+                        block.table.clone(),
+                        VerifyInputs {
+                            mode: args.verify,
+                            on_conflict: args.on_conflict,
+                            source_rows: r.source_rows,
+                            records_loaded: r.records_loaded,
+                            records_failed,
+                            target_counts,
+                        },
+                    );
+                    (Some(outcome), None)
+                }
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "verify=count: post-count failed (load completed): {e:#}"
+                    )),
+                ),
+            },
+            VerifyMode::Off => (None, None),
+        };
+
+        let halt_on_post_count_error = verify_error.is_some();
         tables.push(TableLoadSummary {
             schema: block.schema.clone(),
             table: block.table.clone(),
             records_loaded: r.records_loaded,
             records_failed,
+            source_rows: r.source_rows,
             persisted_manifest_dir: r.persisted_manifest_dir,
+            verify,
+            verify_error,
         });
-        if records_failed > 0 {
+        if records_failed > 0 || halt_on_post_count_error {
             if let Some(mp) = &migrate_progress {
-                mp.finish_halted(&format!(
-                    "{schema}.{table}: {n} rows failed",
-                    schema = block.schema,
-                    table = block.table,
-                    n = records_failed,
-                ));
+                let reason = if records_failed > 0 {
+                    format!(
+                        "{schema}.{table}: {n} rows failed",
+                        schema = block.schema,
+                        table = block.table,
+                        n = records_failed,
+                    )
+                } else {
+                    format!(
+                        "{schema}.{table}: verify=count post-count failed",
+                        schema = block.schema,
+                        table = block.table,
+                    )
+                };
+                mp.finish_halted(&reason);
             }
             halted = true;
             break;
@@ -319,6 +416,8 @@ fn build_load_args(args: &MigrateArgs, table: &str, schema: &str) -> LoadArgs {
         debug: args.debug,
         resume_job_id: None,
         on_conflict: args.on_conflict,
+        // Orchestrator owns L2; the inner call must not double-verify.
+        verify: VerifyMode::Off,
         exclude_columns: Vec::new(),
         delimiter: None,
         quote: None,
@@ -352,6 +451,7 @@ fn collect_warnings(changes: &[Diagnostic]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::migrate::apply::ApplyOutcome;
+    use crate::verify::VerifyVerdict;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -370,6 +470,7 @@ mod tests {
             batch_concurrency: 1,
             chunk_size_bytes: 1024 * 1024,
             on_conflict: OnConflict::Error,
+            verify: VerifyMode::Count,
             quiet: true,
             debug: false,
             test_pool: Some(pool),
@@ -570,6 +671,7 @@ COPY public.t (id) FROM stdin;
             // Critically: NO test_pool. If the orchestrator tried to
             // build a real pool against the bogus endpoint, this would
             // fail. It must stay offline.
+            verify: VerifyMode::Off,
             test_pool: None,
         };
         let report = run_migrate(args).await.unwrap();
@@ -603,6 +705,7 @@ COPY public.t (id) FROM stdin;
             on_conflict: OnConflict::Error,
             quiet: true,
             debug: false,
+            verify: VerifyMode::Off,
             test_pool: None,
         };
         let report = run_migrate(args).await.unwrap();
@@ -720,6 +823,7 @@ COPY public.events (id) FROM stdin;
             debug: false,
             // Critically: NO test_pool. If the orchestrator tried to build
             // a real pool against the bogus endpoint, this would fail.
+            verify: VerifyMode::Off,
             test_pool: None,
         };
         let report = run_migrate(args).await.unwrap();
@@ -799,6 +903,259 @@ COPY public.valid_first (id) FROM stdin;
             .unwrap()[0]
             .0;
         assert_eq!(row_count, 0);
+    }
+
+    /// verify=Count happy path: every table → Match, source_rows ==
+    /// loaded, pre=0, post=loaded.
+    #[tokio::test]
+    async fn run_migrate_verify_count_emits_match_per_table() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        let dump = write_dump(
+            "\
+CREATE TABLE users (id INTEGER, email TEXT);
+CREATE TABLE events (id INTEGER, label TEXT);
+COPY public.users (id, email) FROM stdin;
+1\ta@example.com
+2\tb@example.com
+3\tc@example.com
+\\.
+COPY public.events (id, label) FROM stdin;
+1\talpha
+2\tbeta
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.verify = VerifyMode::Count;
+
+        let report = run_migrate(args).await.unwrap();
+        assert_eq!(report.tables.len(), 2, "both COPY blocks should load");
+        for t in &report.tables {
+            let v = t
+                .verify
+                .as_ref()
+                .unwrap_or_else(|| panic!("verify must be Some on {table}", table = t.table));
+            assert_eq!(
+                v.verdict,
+                VerifyVerdict::Match,
+                "{table}: expected Match, got {verdict:?}",
+                table = t.table,
+                verdict = v.verdict
+            );
+            assert_eq!(
+                v.target_counts,
+                Some(L2Counts {
+                    pre: 0,
+                    post: t.records_loaded
+                })
+            );
+            assert_eq!(v.source_rows, Some(t.records_loaded));
+        }
+    }
+
+    /// verify=Off → TableLoadSummary.verify is None, no count(*) runs.
+    #[tokio::test]
+    async fn run_migrate_verify_off_leaves_summary_verify_none() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        let dump = write_dump(
+            "\
+CREATE TABLE t (id INTEGER, x TEXT);
+COPY public.t (id, x) FROM stdin;
+1\ta
+2\tb
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.verify = VerifyMode::Off;
+
+        let report = run_migrate(args).await.unwrap();
+        assert_eq!(report.tables.len(), 1);
+        assert!(
+            report.tables[0].verify.is_none(),
+            "verify=Off must leave TableLoadSummary.verify = None"
+        );
+    }
+
+    /// DoNothing + pre-existing duplicates → RowsConflictedAtTarget(N),
+    /// not MissingTarget(N).
+    #[tokio::test]
+    async fn run_migrate_verify_count_classifies_pk_conflicts_under_skip() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // Pre-create the table with PK and seed two conflicting rows so
+        // the dump's INSERTs hit ON CONFLICT DO NOTHING for those.
+        pool.execute_query("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)")
+            .await
+            .unwrap();
+        pool.execute_query("INSERT INTO t VALUES (1, 'pre1'), (2, 'pre2')")
+            .await
+            .unwrap();
+
+        let dump = write_dump(
+            "\
+COPY public.t (id, x) FROM stdin;
+1\ta
+2\tb
+3\tc
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.verify = VerifyMode::Count;
+        args.on_conflict = OnConflict::DoNothing;
+
+        let report = run_migrate(args).await.unwrap();
+        let v = report.tables[0]
+            .verify
+            .as_ref()
+            .expect("verify must be Some under verify=Count");
+        // 3 submitted, 2 conflicted, 1 landed → shortfall = 2.
+        assert_eq!(v.records_loaded, 3);
+        assert_eq!(v.target_counts, Some(L2Counts { pre: 2, post: 3 }));
+        assert_eq!(
+            v.verdict,
+            VerifyVerdict::RowsConflictedAtTarget(2),
+            "expected RowsConflictedAtTarget(2), got {:?}",
+            v.verdict
+        );
+    }
+
+    /// OnConflict::Error + duplicate → records_failed > 0 (not a verify
+    /// shortfall). Orchestrator halts before the next table.
+    #[tokio::test]
+    async fn run_migrate_verify_count_under_error_with_conflict_halts() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        pool.execute_query("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)")
+            .await
+            .unwrap();
+        pool.execute_query("INSERT INTO t VALUES (1, 'pre1')")
+            .await
+            .unwrap();
+
+        let dump = write_dump(
+            "\
+COPY public.t (id, x) FROM stdin;
+1\ta
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.verify = VerifyMode::Count;
+        args.on_conflict = OnConflict::Error;
+
+        let report = run_migrate(args).await.unwrap();
+        assert_eq!(report.tables.len(), 1);
+        assert!(
+            report.tables[0].records_failed > 0,
+            "duplicate PK with OnConflict::Error must produce records_failed > 0"
+        );
+    }
+
+    /// Halt-on-fail in the per-table loop: first table fails → second
+    /// table never runs. Pins the README's "halts on the first failed
+    /// table" contract; a refactor that drops the `break` would compile
+    /// and pass every other test.
+    #[tokio::test]
+    async fn run_migrate_halts_after_first_failed_table() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // Pre-create t1 with PK + seed conflict; t2 is empty so its
+        // load would succeed if reached.
+        pool.execute_query("CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        pool.execute_query("INSERT INTO t1 VALUES (1)")
+            .await
+            .unwrap();
+        pool.execute_query("CREATE TABLE t2 (id INTEGER)")
+            .await
+            .unwrap();
+
+        let dump = write_dump(
+            "\
+COPY public.t1 (id) FROM stdin;
+1
+\\.
+COPY public.t2 (id) FROM stdin;
+99
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool.clone(), false);
+        args.verify = VerifyMode::Off;
+        args.on_conflict = OnConflict::Error;
+
+        let report = run_migrate(args).await.unwrap();
+        assert_eq!(
+            report.tables.len(),
+            1,
+            "halt-on-fail must skip t2 when t1 reports records_failed > 0"
+        );
+        assert_eq!(report.tables[0].table, "t1");
+        assert!(report.tables[0].records_failed > 0);
+        // t2 must not have received any inserts.
+        let rows: Vec<(i64,)> = pool
+            .fetch_all_with_binds::<(i64,)>("SELECT count(*) FROM t2", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].0, 0, "t2 must be untouched after t1 halt");
+    }
+
+    /// verify=Count + unfixable: short-circuit still wins, no tables
+    /// load and no verify outcomes are built.
+    #[tokio::test]
+    async fn run_migrate_verify_unfixable_short_circuits_no_verify_outcome() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        let dump = "\
+ALTER TABLE public.events ALTER COLUMN id SET DEFAULT nextval('public.events_id_seq'::regclass);
+COPY public.events (id) FROM stdin;
+1
+\\.
+";
+        let f = write_dump(dump);
+        let mut args = args_with_pool(&file_uri(f.path()), pool, false);
+        args.verify = VerifyMode::Count;
+        let report = run_migrate(args).await.unwrap();
+        assert!(!report.ddl_unfixable.is_empty());
+        assert!(
+            report.tables.is_empty(),
+            "no per-table verify should be built on the unfixable path"
+        );
+    }
+
+    /// Embedded `"` in a dump-parsed table identifier is rejected
+    /// before any pool query or DDL apply.
+    #[tokio::test]
+    async fn run_migrate_rejects_dump_identifiers_with_embedded_quote() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // `""` decodes to a single `"` in the identifier — would
+        // corrupt `format!("\"{name}\"")` if validation is skipped.
+        let dump = "\
+COPY public.\"evil\"\"name\" (id) FROM stdin;
+1
+\\.
+";
+        let f = write_dump(dump);
+        let args = args_with_pool(&file_uri(f.path()), pool.clone(), false);
+        let err = run_migrate(args)
+            .await
+            .expect_err("dump-parsed identifier with embedded quote must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pg_dump table identifier") && msg.contains("unsafe character"),
+            "error must name the offending identifier and field; got: {msg}"
+        );
+        // Side-effect free: the table must NOT have been created.
+        let rows: Vec<(i64,)> = pool
+            .fetch_all_with_binds::<(i64,)>(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'evil%'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].0, 0,
+            "no DDL should run when identifier is rejected"
+        );
     }
 
     /// `quiet=false` smoke: captured stderr hides the render, so this

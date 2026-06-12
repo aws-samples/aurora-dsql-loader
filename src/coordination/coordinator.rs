@@ -107,6 +107,20 @@ fn validate_conflict_columns_not_all_excluded(
     Ok(())
 }
 
+/// L1 source-row total across chunks. `None` if any chunk lacks a count
+/// (csv/tsv), `chunk_results` is short of `expected_chunks` (worker crash),
+/// or the per-chunk counts overflow `u64` (adversarial parquet footer).
+/// Forces classify() to SkippedNoExactSourceCount instead of a false Match.
+fn aggregate_source_rows(chunk_results: &[ChunkResultFile], expected_chunks: usize) -> Option<u64> {
+    if chunk_results.len() < expected_chunks {
+        return None;
+    }
+    chunk_results
+        .iter()
+        .map(|r| r.source_rows_in_chunk)
+        .try_fold(0u64, |acc, n| n.and_then(|x| acc.checked_add(x)))
+}
+
 /// Maximum bytes to read for schema inference
 ///
 /// Caps the amount of data read to prevent loading entire large files just for
@@ -157,8 +171,7 @@ fn align_pgdump_schema_to_copy_columns(
 
     if copy_set != target_set {
         let target_names: Vec<&str> = resolved.columns.iter().map(|c| c.name.as_str()).collect();
-        // Sort the diff lists so the bail message is deterministic across runs
-        // (HashSet::difference iteration order is not stable).
+        // Sort for deterministic error output (HashSet iteration is unstable).
         let mut missing_in_target: Vec<&str> = copy_set.difference(&target_set).copied().collect();
         let mut missing_in_dump: Vec<&str> = target_set.difference(&copy_set).copied().collect();
         missing_in_target.sort_unstable();
@@ -279,6 +292,9 @@ pub struct LoadResult {
     /// Sum of per-chunk row estimates obtained by sampling the source bytes;
     /// used to flag a large delta vs records actually loaded.
     pub estimated_rows: Option<u64>,
+    /// Exact source-row count summed across chunks. `None` if any
+    /// chunk lacks a count (csv/tsv) — drives L1.
+    pub source_rows: Option<u64>,
     pub duration: Duration,
     /// Detailed results for each chunk (accessed in integration tests)
     #[cfg_attr(not(test), allow(dead_code))]
@@ -372,26 +388,28 @@ impl Coordinator {
             .await
     }
 
-    /// Collect all chunk results from manifest storage
+    /// Collect all chunk results from manifest storage. Returns the
+    /// results plus the IDs of any missing chunks so the caller can
+    /// surface them as a hard failure rather than a silent drop.
     async fn collect_results(
         &self,
         job_id: &str,
         chunk_count: usize,
-    ) -> Result<Vec<ChunkResultFile>> {
+    ) -> Result<(Vec<ChunkResultFile>, Vec<u32>)> {
         let mut results = Vec::with_capacity(chunk_count);
+        let mut missing = Vec::new();
 
         for chunk_id in 0..chunk_count as u32 {
             match self.manifest_storage.read_result(job_id, chunk_id).await {
                 Ok(result) => results.push(result),
                 Err(_) => {
-                    // Chunk result may be missing if worker crashed before writing result file
-                    // This is tracked in failure metrics and doesn't require hard failure
                     warn!("Chunk {chunk_id} result missing");
+                    missing.push(chunk_id);
                 }
             }
         }
 
-        Ok(results)
+        Ok((results, missing))
     }
 
     /// Create chunks from the source file and return metadata
@@ -778,12 +796,9 @@ impl Coordinator {
             }
         }
 
-        // --exclude-columns on resume: the flag may be omitted (the manifest's list
-        // is authoritative), but if supplied it must match the manifest as a set.
-        // Avoids forcing operators to retype the list while still catching accidental
-        // drift. Compare as sets (sorted) because the manifest stores the list in
-        // schema order while the user-passed list is in CLI order — semantically
-        // equivalent lists should not trip the check.
+        // --exclude-columns on resume: optional, but if supplied must
+        // match the manifest as a set (manifest order is schema-order,
+        // CLI order is user-order — both are valid).
         if !config.exclude_columns.is_empty() {
             let mut requested = config.exclude_columns.clone();
             let mut stored = manifest.table.excluded_columns.clone();
@@ -994,13 +1009,28 @@ impl Coordinator {
         start_time: Instant,
     ) -> Result<LoadResult> {
         info!("Aggregating results...");
-        let chunk_results = self
+        let (chunk_results, missing) = self
             .collect_results(job_id, chunks.len())
             .await
             .context("Failed to collect results")?;
 
+        // A missing chunk result = worker crashed mid-load. Without this
+        // bail, records_failed stays 0 and source_rows demotes to None
+        // (SkippedNoExactSourceCount → exit 0): a silent drop the
+        // verification layer cannot catch. Fail hard so the operator
+        // resumes from the manifest instead of shipping green.
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "Load incomplete: {n} chunk result(s) missing (likely worker crash). \
+                 Missing chunk IDs: {missing:?}. Re-run with --resume-job-id={job_id} \
+                 to retry the missing chunks.",
+                n = missing.len(),
+            );
+        }
+
         let total_records_loaded: u64 = chunk_results.iter().map(|r| r.records_loaded).sum();
         let total_records_failed: u64 = chunk_results.iter().map(|r| r.records_failed).sum();
+        let total_source_rows = aggregate_source_rows(&chunk_results, chunks.len());
         let duration = start_time.elapsed();
 
         // Warn if significantly fewer records were processed than estimated
@@ -1029,9 +1059,60 @@ impl Coordinator {
             records_loaded: total_records_loaded,
             records_failed: total_records_failed,
             estimated_rows: Some(total_estimated).filter(|&e| e > 0),
+            source_rows: total_source_rows,
             duration,
             chunk_results,
         })
+    }
+}
+
+#[cfg(test)]
+mod aggregate_tests {
+    use super::*;
+    use crate::coordination::manifest::ChunkStatus;
+
+    fn mk_chunk_result(id: u32, source_rows: Option<u64>) -> ChunkResultFile {
+        ChunkResultFile {
+            chunk_id: id,
+            worker_id: "w".into(),
+            status: ChunkStatus::Success,
+            records_loaded: source_rows.unwrap_or(0),
+            records_failed: 0,
+            bytes_processed: 0,
+            started_at: "1970-01-01T00:00:00Z".into(),
+            completed_at: "1970-01-01T00:00:00Z".into(),
+            duration_secs: 0,
+            errors: Vec::new(),
+            source_rows_in_chunk: source_rows,
+        }
+    }
+
+    #[test]
+    fn aggregate_source_rows_full_set_returns_sum() {
+        let results = vec![
+            mk_chunk_result(0, Some(7)),
+            mk_chunk_result(1, Some(3)),
+            mk_chunk_result(2, Some(10)),
+        ];
+        assert_eq!(aggregate_source_rows(&results, 3), Some(20));
+    }
+
+    #[test]
+    fn aggregate_source_rows_partial_results_returns_none() {
+        // Worker crashed: only 2 of 3 expected chunk results landed.
+        let results = vec![mk_chunk_result(0, Some(7)), mk_chunk_result(1, Some(3))];
+        assert_eq!(aggregate_source_rows(&results, 3), None);
+    }
+
+    #[test]
+    fn aggregate_source_rows_any_none_chunk_returns_none() {
+        // csv/tsv path: at least one chunk has no exact count.
+        let results = vec![
+            mk_chunk_result(0, Some(7)),
+            mk_chunk_result(1, None),
+            mk_chunk_result(2, Some(10)),
+        ];
+        assert_eq!(aggregate_source_rows(&results, 3), None);
     }
 }
 

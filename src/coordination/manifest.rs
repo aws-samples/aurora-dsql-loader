@@ -194,6 +194,11 @@ pub struct ChunkResultFile {
     pub completed_at: String, // ISO 8601
     pub duration_secs: u64,
     pub errors: Vec<ErrorRecord>,
+    /// Exact source-row count for this chunk (pgdump/parquet only).
+    /// Optional+skip_serializing_if for backward compatibility with
+    /// manifests written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rows_in_chunk: Option<u64>,
 }
 
 /// Record of an error that occurred during processing.

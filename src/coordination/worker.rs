@@ -457,6 +457,7 @@ impl Worker {
             completed_at: end_time.to_rfc3339(),
             duration_secs,
             errors,
+            source_rows_in_chunk: chunk_data.source_rows_in_chunk,
         };
 
         // Write result to manifest
