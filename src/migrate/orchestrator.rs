@@ -3,6 +3,7 @@
 //! table — all against a single shared `Pool` so the production path
 //! pays the IAM/connection-establishment cost only once.
 
+use crate::coordination::MigrateProgress;
 use crate::db::Pool;
 use crate::db::pool::{PoolArgsBuilder, pool as build_dsql_pool};
 use crate::formats::pgdump::{extract_ddl, list_copy_blocks};
@@ -174,12 +175,21 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         .await
         .context("Failed to apply DDL to cluster")?;
 
+    // None under `--quiet` skips the dump-wide bars; per-table silence
+    // rides independently on `LoadArgs.quiet` set in `build_load_args`.
+    let migrate_progress = if args.quiet {
+        None
+    } else {
+        Some(MigrateProgress::new(&blocks))
+    };
+
     // Halt on the first table with `records_failed > 0`. DSQL doesn't
     // enforce FKs, so continuing would silently load child rows against
     // a partially-loaded parent and the final report would look healthy.
     // The pre-resolved `blocks` and `aws_config` are threaded through so
     // each load skips the dump rescan + credential-chain walk.
     let mut tables = Vec::with_capacity(blocks.len());
+    let mut halted = false;
     for block in &blocks {
         let load_args = build_load_args(&args, &block.table, &block.schema);
         let r = run_load_with_pool_for_pgdump_block(
@@ -187,6 +197,7 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
             load_args,
             block.clone(),
             aws_config.as_ref(),
+            migrate_progress.as_ref().map(MigrateProgress::multi),
         )
         .await
         .with_context(|| {
@@ -197,6 +208,7 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
             )
         })?;
         let records_failed = r.records_failed;
+        let block_bytes = block.data_end - block.data_start;
         tables.push(TableLoadSummary {
             schema: block.schema.clone(),
             table: block.table.clone(),
@@ -205,8 +217,24 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
             persisted_manifest_dir: r.persisted_manifest_dir,
         });
         if records_failed > 0 {
+            if let Some(mp) = &migrate_progress {
+                mp.finish_halted(&format!(
+                    "{schema}.{table}: {n} rows failed",
+                    schema = block.schema,
+                    table = block.table,
+                    n = records_failed,
+                ));
+            }
+            halted = true;
             break;
         }
+        if let Some(mp) = &migrate_progress {
+            mp.record_table_loaded(block_bytes);
+        }
+    }
+
+    if !halted && let Some(mp) = &migrate_progress {
+        mp.finish_clean();
     }
 
     Ok(MigrateReport {
@@ -771,5 +799,68 @@ COPY public.valid_first (id) FROM stdin;
             .unwrap()[0]
             .0;
         assert_eq!(row_count, 0);
+    }
+
+    /// `quiet=false` smoke: captured stderr hides the render, so this
+    /// only catches panic-class bar misuse (finish-before-pump-join,
+    /// double-finish) plus pins the report shape.
+    #[tokio::test]
+    async fn run_migrate_quiet_false_drives_progress_lifecycle_without_panicking() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        let dump = write_dump(
+            "\
+CREATE TABLE a (id INTEGER, x TEXT);
+CREATE TABLE b (id INTEGER, x TEXT);
+COPY public.a (id, x) FROM stdin;
+1\tone
+2\ttwo
+\\.
+COPY public.b (id, x) FROM stdin;
+1\talpha
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.quiet = false;
+
+        let report = run_migrate(args).await.unwrap();
+        assert_eq!(report.tables.len(), 2);
+        assert_eq!(report.tables[0].records_loaded, 2);
+        assert_eq!(report.tables[1].records_loaded, 1);
+        for t in &report.tables {
+            assert_eq!(t.records_failed, 0);
+        }
+    }
+
+    /// Pins ordering: the per-table bar is finalized inside `run_load`
+    /// before `records_failed` is observed by the orchestrator.
+    #[tokio::test]
+    async fn run_migrate_quiet_false_halts_on_records_failed_without_panicking() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // Pre-create with PK, seed a row that the dump will conflict with.
+        pool.execute_query("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)")
+            .await
+            .unwrap();
+        pool.execute_query("INSERT INTO t VALUES (1, 'pre1')")
+            .await
+            .unwrap();
+
+        let dump = write_dump(
+            "\
+COPY public.t (id, x) FROM stdin;
+1\ta
+\\.
+COPY public.t (id, x) FROM stdin;
+2\tb
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.quiet = false;
+        args.on_conflict = OnConflict::Error;
+
+        let report = run_migrate(args).await.unwrap();
+        assert_eq!(report.tables.len(), 1, "halt must skip the second block");
+        assert!(report.tables[0].records_failed > 0);
     }
 }
