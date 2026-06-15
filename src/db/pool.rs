@@ -489,3 +489,26 @@ impl Executor<'_> for &'_ Pool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Embedded `"` must be doubled so it can't break out of the quoted
+    /// identifier — defense in depth behind the upstream validator.
+    #[tokio::test]
+    async fn qualified_table_name_escapes_embedded_quote() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        // SQLite path quotes the (prefixed) table only.
+        assert_eq!(
+            pool.qualified_table_name("public", "ev\"il"),
+            "\"ev\"\"il\""
+        );
+    }
+
+    #[tokio::test]
+    async fn qualified_table_name_plain_is_unchanged() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        assert_eq!(pool.qualified_table_name("public", "orders"), "\"orders\"");
+    }
+}

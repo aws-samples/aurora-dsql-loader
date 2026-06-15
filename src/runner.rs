@@ -366,7 +366,7 @@ pub(crate) async fn run_load_with_pool_for_pgdump_block(
     args: LoadArgs,
     block: CopyBlock,
     aws_config: Option<&aws_config::SdkConfig>,
-    parent_multi: Option<std::sync::Arc<indicatif::MultiProgress>>,
+    parent_multi: Option<indicatif::MultiProgress>,
 ) -> Result<LoadResult> {
     validate_load_args(&args)?;
     debug_assert_eq!(args.target_table, block.table);
@@ -408,7 +408,7 @@ async fn run_load_with_pool_and_reader(
     file_reader: Arc<dyn crate::formats::reader::FileReader>,
     pgdump_columns: Vec<String>,
     delimited_config: Option<DelimitedConfig>,
-    parent_multi: Option<std::sync::Arc<indicatif::MultiProgress>>,
+    parent_multi: Option<indicatif::MultiProgress>,
 ) -> Result<LoadResult> {
     // Set up manifest directory (use temp dir if not provided)
     let (mut temp_dir, manifest_dir_path) = if let Some(dir) = args.manifest_dir {
@@ -826,5 +826,27 @@ mod tests {
             has_header: None,
             test_pool: None,
         }
+    }
+
+    /// The `debug_assert_eq!` routing-identity guard must fire when
+    /// `args.target_table` and `block.table` disagree — the trap that
+    /// would otherwise allow silent cross-table writes.
+    #[tokio::test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    async fn pgdump_block_routing_mismatch_panics_in_debug() {
+        let pool = crate::db::Pool::sqlite_in_memory().await.unwrap();
+        let mut args = sample_pgdump_args();
+        args.target_table = "t".into();
+        args.test_pool = Some(pool.clone());
+        let block = CopyBlock {
+            schema: "public".into(),
+            table: "OTHER".into(),
+            header_start: 0,
+            data_start: 1,
+            data_end: 2,
+            block_end: 4,
+            columns: vec!["id".into()],
+        };
+        let _ = run_load_with_pool_for_pgdump_block(pool, args, block, None, None).await;
     }
 }

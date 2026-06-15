@@ -493,7 +493,11 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
                     String::new()
                 }
             );
-            if let Some(n) = t.source_rows {
+            // Skip when a verify outcome follows — it reprints the same
+            // count in its `counts:` line on non-Match verdicts.
+            if let Some(n) = t.source_rows
+                && t.verify.is_none()
+            {
                 println!("    Source rows: {n}");
             }
             if let Some(path) = &t.persisted_manifest_dir {
@@ -541,9 +545,9 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// True for verdicts that should make the CLI exit non-zero.
-/// `VerifyVerdict` is `#[non_exhaustive]`; unknown future variants
-/// default to non-zero so an unrecognised verdict can't ship green.
+/// True for verdicts that should make the CLI exit non-zero. The `_`
+/// arm is mandatory (cross-crate `#[non_exhaustive]`) and fails closed:
+/// an unknown future variant exits non-zero, never green.
 fn is_bad_verdict(v: &VerifyVerdict) -> bool {
     match v {
         VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount => false,
@@ -1019,9 +1023,10 @@ mod tests {
     use clap::Parser;
     use std::collections::HashSet;
 
-    /// Pin the CLI exit-code policy: only `Match` and
-    /// `SkippedNoExactSourceCount` are clean. A future verdict variant
-    /// will fail compilation here (no `_ =>` arm).
+    /// Behaviour table for the exit-code policy (not a compile-time
+    /// exhaustiveness pin — `VerifyVerdict` is cross-crate
+    /// `#[non_exhaustive]`, so `is_bad_verdict` keeps a fail-closed `_`
+    /// arm). Add new variants here when they land.
     #[test]
     fn is_bad_verdict_classifies_every_variant() {
         assert!(!is_bad_verdict(&VerifyVerdict::Match));
