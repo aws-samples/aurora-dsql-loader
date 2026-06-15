@@ -49,26 +49,6 @@ fn apply_field_exclusion(
     (filtered, mismatch, first_mismatch)
 }
 
-/// Type category for SQL type conversion strategy
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TypeCategory {
-    /// All types except text - bind as string and use CAST() in SQL for type conversion
-    /// This ensures PostgreSQL is the single source of truth for type validation
-    StringCast,
-    /// Text types with direct string binding (TEXT, VARCHAR, CHAR)
-    DirectString,
-}
-
-impl TypeCategory {
-    /// Classify a SQL type into its conversion category
-    fn from_sql_type(col_type: &str) -> Self {
-        match col_type {
-            "TEXT" | "VARCHAR" | "CHAR" => TypeCategory::DirectString,
-            _ => TypeCategory::StringCast,
-        }
-    }
-}
-
 /// Result of executing a batch of records
 #[derive(Debug)]
 struct BatchResult {
@@ -541,7 +521,7 @@ impl Worker {
                         return "NULL".to_string();
                     };
 
-                    let escaped = Self::escape_sql_string(field);
+                    let escaped = crate::db::schema::escape_sql_literal(field);
                     let value_expr = format!("'{}'", escaped);
 
                     // PostgreSQL only: wrap in CAST() for non-text columns
@@ -552,8 +532,7 @@ impl Worker {
                         .and_then(|s| s.columns.get(col_idx))
                         .filter(|col| {
                             use_pg_cast
-                                && TypeCategory::from_sql_type(&col.col_type)
-                                    == TypeCategory::StringCast
+                                && !crate::db::schema::inserts_as_bare_literal(&col.col_type)
                         })
                         .map(|col| format!("CAST({} AS {})", value_expr, col.col_type))
                         .unwrap_or(value_expr)
@@ -685,12 +664,6 @@ impl Worker {
                 }
             }
         }
-    }
-
-    /// Escape a string value for use in SQL
-    /// Handles single quotes by doubling them (SQL standard escaping)
-    fn escape_sql_string(value: &str) -> String {
-        value.replace('\'', "''")
     }
 
     /// Build the ON CONFLICT clause based on the conflict resolution mode

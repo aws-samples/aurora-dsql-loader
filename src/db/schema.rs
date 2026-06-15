@@ -28,6 +28,29 @@ pub enum SqlType {
     Interval,
     Uuid,
     Bytea,
+    /// `json` (the dsql-lint `JSONB`→`json` rewrite lands here). The `json`
+    /// type has no `=` operator, so L3 compares it cast to text rather than
+    /// via the null-safe-equality path used for other types.
+    Json,
+}
+
+/// Escape a value for a single-quoted SQL string literal (doubles embedded
+/// quotes). Shared between the worker's INSERT generation and verify's
+/// recast-compare so the two paths escape identically.
+pub fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+/// Whether a column of the given Postgres type name is written as a bare
+/// `'literal'` (TEXT family) rather than `CAST('literal' AS type)`.
+///
+/// Single source of truth for the cast-vs-bare decision, keyed on the
+/// `to_postgres()` type name both call sites share: the worker classifies
+/// `ColumnJson.col_type` (always `to_postgres()` output) at INSERT time, and
+/// verify classifies the same name when building its recast comparison, so
+/// the comparison runs through the identical coercion the write used.
+pub fn inserts_as_bare_literal(pg_type: &str) -> bool {
+    matches!(pg_type, "TEXT" | "VARCHAR" | "CHAR")
 }
 
 impl SqlType {
@@ -51,6 +74,7 @@ impl SqlType {
             SqlType::Interval => "INTERVAL",
             SqlType::Uuid => "UUID",
             SqlType::Bytea => "BYTEA",
+            SqlType::Json => "JSON",
         }
     }
 
@@ -273,6 +297,7 @@ pub async fn query_table_schema(
             "INTERVAL" => SqlType::Interval,
             "UUID" => SqlType::Uuid,
             "BYTEA" => SqlType::Bytea,
+            "JSON" | "JSONB" => SqlType::Json,
             _ => SqlType::Text, // Default to TEXT for unsupported types
         };
 

@@ -16,6 +16,21 @@ pub trait ByteReader: Send + Sync {
     async fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>>;
 }
 
+/// Forward `ByteReader` through an `Arc`, so a shared `Arc<dyn ByteReader>`
+/// (e.g. the source opened once by the migrate orchestrator) satisfies the
+/// `R: ByteReader` bound on readers like `PgDumpReader::from_block` without
+/// re-opening the underlying file/object.
+#[async_trait]
+impl<R: ByteReader + ?Sized> ByteReader for std::sync::Arc<R> {
+    async fn size(&self) -> Result<u64> {
+        (**self).size().await
+    }
+
+    async fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+        (**self).read_range(start, end).await
+    }
+}
+
 /// Helper functions for working with ByteReaders
 /// Find the start of the next complete record after the given offset
 /// Returns the byte offset of the start of the next line

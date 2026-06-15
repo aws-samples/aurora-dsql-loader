@@ -108,11 +108,12 @@ struct LoadParams {
     #[arg(long, default_value = "do-nothing")]
     on_conflict: String,
 
-    /// Post-load verification (`off` | `count`). `count` adds pre/post
-    /// `count(*)` and reports an L1+L2 verdict per table. Assumes the
-    /// loader is the sole writer during the run. L2 is skipped under
-    /// `--if-not-exists` (no stable pre-count) and on csv/tsv (no exact
-    /// source count); the per-table verdict still surfaces.
+    /// Post-load verification (`off` | `count` | `full`). `count` adds
+    /// pre/post `count(*)` and reports an L1+L2 verdict per table. `full`
+    /// adds per-row value verification (L3) — opt-in, ~one extra full table
+    /// read. Assumes the loader is the sole writer during the run. L2 is
+    /// skipped under `--if-not-exists` (no stable pre-count) and on csv/tsv
+    /// (no exact source count); the per-table verdict still surfaces.
     #[arg(long, default_value = "off")]
     verify: String,
 
@@ -239,10 +240,11 @@ enum Command {
         #[arg(long, default_value = "error")]
         on_conflict: String,
 
-        /// Post-load verification (`off` | `count`). Default `count`:
-        /// pre/post `count(*)` per loaded table → L1+L2 verdict.
-        /// Fresh-cluster migrate makes the sole-writer assumption hold
-        /// trivially.
+        /// Post-load verification (`off` | `count` | `full`). Default
+        /// `count`: pre/post `count(*)` per loaded table → L1+L2 verdict
+        /// plus the affirmative schema check. `full` adds per-row value
+        /// verification (L3) — ~one extra full table read. Fresh-cluster
+        /// migrate makes the sole-writer assumption hold trivially.
         #[arg(long, default_value = "count")]
         verify: String,
 
@@ -526,6 +528,18 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
                  Inspect the output above before re-running."
             );
         }
+
+        // Discoverability nudge: only when count+schema actually ran (mode
+        // Count) — point the operator at the deeper per-row check they
+        // didn't opt into. Not under `off` (nothing verified) or `full`
+        // (already the deepest).
+        if verify == VerifyMode::Count {
+            println!();
+            println!(
+                "Row counts and schema verified. For per-row value verification, \
+                 re-run with --verify=full."
+            );
+        }
     }
 
     // Mirror `run_loader`: per-table failures, non-Match verdicts, and
@@ -550,27 +564,52 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
 /// an unknown future variant exits non-zero, never green.
 fn is_bad_verdict(v: &VerifyVerdict) -> bool {
     match v {
-        VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount => false,
+        // `ValueCheckSkipped` mirrors `SkippedNoExactSourceCount`: an
+        // explicit "not checked" is not itself a failure.
+        VerifyVerdict::Match
+        | VerifyVerdict::SkippedNoExactSourceCount
+        | VerifyVerdict::ValueCheckSkipped => false,
         VerifyVerdict::LoaderDropped(_)
         | VerifyVerdict::MissingTarget(_)
         | VerifyVerdict::ExtraTarget(_)
-        | VerifyVerdict::RowsConflictedAtTarget(_) => true,
+        | VerifyVerdict::RowsConflictedAtTarget(_)
+        | VerifyVerdict::ValueMismatch(_)
+        | VerifyVerdict::ValueRowMissingAtTarget(_) => true,
         _ => true,
     }
 }
 
-/// Print `Verify: <verdict>` and, on a non-clean verdict, the raw counts
-/// so the operator can size the gap without re-running. `nested` indents
-/// under a parent bullet (used for per-table rows in the `migrate` report).
+/// Print `Verify: <verdict>`, the affirmative schema-conformance line (when
+/// present), and — on a non-clean verdict — the raw counts plus the first
+/// offending primary keys so the operator can act without re-running.
+/// `nested` indents under a parent bullet (per-table `migrate` rows).
 fn print_verify_detail(v: &VerifyOutcome, nested: bool) {
     let indent = if nested { "    " } else { "" };
     println!("{indent}Verify: {}", format_verdict(&v.verdict));
+
+    // Affirmative schema line: shown regardless of verdict (it's the
+    // default-on MUST #3 floor). Scoped to column-set + PK presence.
+    if let Some(s) = &v.schema_check {
+        let pk = if s.pk_present {
+            "primary key present"
+        } else {
+            "no primary key"
+        };
+        println!(
+            "{indent}  Schema: {cols} column(s) match, {pk}",
+            cols = s.columns_matched
+        );
+    }
+
     if matches!(
         v.verdict,
-        VerifyVerdict::Match | VerifyVerdict::SkippedNoExactSourceCount
+        VerifyVerdict::Match
+            | VerifyVerdict::SkippedNoExactSourceCount
+            | VerifyVerdict::ValueCheckSkipped
     ) {
         return;
     }
+
     let fmt = |n: Option<u64>| n.map_or("n/a".to_string(), |n| n.to_string());
     let (pre, post) = match v.target_counts {
         Some(c) => (fmt(Some(c.pre)), fmt(Some(c.post))),
@@ -582,6 +621,16 @@ fn print_verify_detail(v: &VerifyOutcome, nested: bool) {
         loaded = v.records_loaded,
         failed = v.records_failed,
     );
+
+    // First offending PKs (capped) so the operator can inspect them.
+    if let Some(d) = &v.l3_details {
+        if !d.mismatch_pks.is_empty() {
+            println!("{indent}  mismatched PKs: {}", d.mismatch_pks.join(", "));
+        }
+        if !d.missing_pks.is_empty() {
+            println!("{indent}  missing PKs: {}", d.missing_pks.join(", "));
+        }
+    }
 }
 
 /// One-line CLI summary per VerifyVerdict.
@@ -610,6 +659,15 @@ fn format_verdict(v: &VerifyVerdict) -> String {
         }
         VerifyVerdict::SkippedNoExactSourceCount => {
             "SKIPPED — no exact source-row count for this format (csv/tsv)".to_string()
+        }
+        VerifyVerdict::ValueMismatch(n) => {
+            format!("VALUE MISMATCH {n} row(s) — target value differs from source by primary key")
+        }
+        VerifyVerdict::ValueRowMissingAtTarget(n) => {
+            format!("MISSING AT TARGET {n} row(s) — source primary key not found in target")
+        }
+        VerifyVerdict::ValueCheckSkipped => {
+            "SKIPPED value check — no single-column primary key to align rows".to_string()
         }
         _ => format!("UNKNOWN VERDICT: {v:?}"),
     }
@@ -1031,10 +1089,13 @@ mod tests {
     fn is_bad_verdict_classifies_every_variant() {
         assert!(!is_bad_verdict(&VerifyVerdict::Match));
         assert!(!is_bad_verdict(&VerifyVerdict::SkippedNoExactSourceCount));
+        assert!(!is_bad_verdict(&VerifyVerdict::ValueCheckSkipped));
         assert!(is_bad_verdict(&VerifyVerdict::LoaderDropped(1)));
         assert!(is_bad_verdict(&VerifyVerdict::MissingTarget(1)));
         assert!(is_bad_verdict(&VerifyVerdict::ExtraTarget(1)));
         assert!(is_bad_verdict(&VerifyVerdict::RowsConflictedAtTarget(1)));
+        assert!(is_bad_verdict(&VerifyVerdict::ValueMismatch(1)));
+        assert!(is_bad_verdict(&VerifyVerdict::ValueRowMissingAtTarget(1)));
     }
 
     #[test]

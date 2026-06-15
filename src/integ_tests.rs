@@ -20,9 +20,9 @@ mod tests {
         },
         formats::{
             DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader,
-            parquet::GenericParquetReader,
+            parquet::GenericParquetReader, pgdump::find_copy_block,
         },
-        io::LocalFileByteReader,
+        io::{ByteReader, LocalFileByteReader},
         runner::{Format, LoadArgs, MigrateArgs, VerifyMode, run_load, run_migrate},
     };
     use arrow::array::*;
@@ -4551,10 +4551,12 @@ mod tests {
             batch_concurrency: 1,
             chunk_size_bytes: 1024 * 1024,
             on_conflict: OnConflict::Error,
-            // Exercise the migrate default end-to-end: every loaded table
-            // gets a VerifyOutcome and the assertions below pin the verdict
-            // shape we promise (`Match` for both tables on a fresh cluster).
-            verify: VerifyMode::Count,
+            // Exercise the deepest tier end-to-end: `Full` runs L1+L2 +
+            // the affirmative schema check + L3 per-row value verification.
+            // The assertions below pin `Match` for both tables on a fresh
+            // cluster, proving the recast-compare canonicalizes correctly
+            // against real DSQL (the claim SQLite tests cannot make).
+            verify: VerifyMode::Full,
             quiet: true,
             debug: false,
             test_pool: None,
@@ -4606,20 +4608,22 @@ mod tests {
         )
         .await?;
 
-        // ── Stage 1.5: per-table verification verdict ───────────────────
-        // verify=Count is on by default; every loaded table must come
-        // back as Match.
+        // ── Stage 1.5: per-table verification verdict (verify=Full) ─────
+        // L1+L2+L3 all ran; every loaded table must come back as Match —
+        // proving the server-side recast-compare canonicalizes the seeded
+        // values (numeric/timestamptz/jsonb/uuid/\N) on real DSQL. The
+        // affirmative schema check must also be populated.
         for t in &report.tables {
             let v = t.verify.as_ref().unwrap_or_else(|| {
                 panic!(
-                    "verify must be Some on {}.{} under default migrate verify=Count",
+                    "verify must be Some on {}.{} under verify=Full",
                     t.schema, t.table
                 )
             });
             assert_eq!(
                 v.verdict,
                 crate::runner::VerifyVerdict::Match,
-                "{}.{} expected Match, got {:?} (source_rows={:?}, loaded={}, failed={}, target_counts={:?})",
+                "{}.{} expected Match, got {:?} (source_rows={:?}, loaded={}, failed={}, target_counts={:?}, l3_details={:?})",
                 t.schema,
                 t.table,
                 v.verdict,
@@ -4627,10 +4631,23 @@ mod tests {
                 v.records_loaded,
                 v.records_failed,
                 v.target_counts,
+                v.l3_details,
             );
             assert!(
                 v.source_rows.is_some(),
                 "pgdump must produce exact source_rows; got None for {}.{}",
+                t.schema,
+                t.table,
+            );
+            let sc = v.schema_check.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "verify=Full must populate schema_check on {}.{}",
+                    t.schema, t.table
+                )
+            });
+            assert!(
+                sc.columns_matched > 0 && sc.pk_present,
+                "{}.{}: expected columns_matched>0 + pk_present, got {sc:?}",
                 t.schema,
                 t.table,
             );
@@ -4820,6 +4837,47 @@ mod tests {
                 .await?;
         let emails: Vec<&str> = user_rows.iter().map(|u| u.email.as_str()).collect();
         assert_eq!(emails, vec!["a@example.com", "b@example.com"]);
+
+        // ── Stage 4: L3 catches a post-load divergence on real DSQL ─────
+        // The migrate-time verify passed (Match) because the load was
+        // faithful. Now mutate one target value out from under the loader
+        // and re-run L3 directly: it must flag ValueMismatch and localize
+        // the offending PK. This is the case L3 exists for — a value that
+        // doesn't match the source, with counts intact (the gap count-only
+        // verification cannot see).
+        {
+            // Find events row (label 'alpha') and corrupt its note. `id` is
+            // BIGINT after the SERIAL→IDENTITY rewrite, so fetch as i64.
+            let (alpha_id,): (i64,) = sqlx::query_as(&format!(
+                "SELECT id FROM {events_src} WHERE label = 'alpha'"
+            ))
+            .fetch_one(&dsql_pool)
+            .await?;
+            dsql_pool
+                .execute_query(&format!(
+                    "UPDATE {events_src} SET note = 'CORRUPTED' WHERE id = {alpha_id}"
+                ))
+                .await?;
+
+            let reader: Arc<dyn ByteReader> = Arc::new(LocalFileByteReader::new(&dump_path));
+            let block = find_copy_block(&*reader, "public", &events_src).await?;
+            let (outcome, details) =
+                crate::verify::verify_table_values(&dsql_pool, reader, &block, 1024 * 1024).await?;
+
+            assert_eq!(
+                outcome,
+                crate::verify::L3Outcome::Ran {
+                    value_mismatches: 1,
+                    rows_missing_at_target: 0
+                },
+                "post-load mutation must surface exactly one value mismatch",
+            );
+            assert_eq!(
+                details.mismatch_pks,
+                vec![alpha_id.to_string()],
+                "L3 must localize the corrupted row's primary key",
+            );
+        }
 
         // ── Cleanup: best-effort (per-run CI cluster is torn down anyway).
         let _ = sqlx::query(&format!(
@@ -5109,6 +5167,36 @@ mod tests {
         assert!(
             err.contains("pg_dump column identifier") && err.contains("unsafe character"),
             "expected validation error naming the column field; got: {err}"
+        );
+        Ok(())
+    }
+
+    /// Plain `load --verify=full` on pgdump runs L3 end-to-end (resolving
+    /// the COPY block itself, unlike migrate) and reports a clean Match
+    /// with the affirmative schema_check populated. Pins the load-path L3
+    /// wiring, which is separate from the migrate orchestrator path.
+    #[tokio::test]
+    async fn pgdump_load_verify_full_matches_with_schema_check() -> anyhow::Result<()> {
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.things (id, name) FROM stdin;")?;
+        writeln!(f, "1\talpha")?;
+        writeln!(f, "2\tbeta")?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let pool = setup_sqlite_table("things", "id INTEGER PRIMARY KEY, name TEXT").await;
+        let mut args = pgdump_load_args(f.path().to_string_lossy().into_owned(), "things", pool);
+        args.verify = VerifyMode::Full;
+
+        let result = run_load(args).await?;
+        let v = result.verify.expect("verify=full must populate verify");
+        assert_eq!(v.verdict, crate::verify::VerifyVerdict::Match);
+        assert_eq!(
+            v.schema_check,
+            Some(crate::verify::SchemaCheck {
+                columns_matched: 2,
+                pk_present: true,
+            })
         );
         Ok(())
     }
