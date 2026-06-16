@@ -4897,6 +4897,107 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: `load --verify=full` into columns whose declared
+    /// precision/scale is NARROWER than the source text must still verify as
+    /// `Match`. The load coerces the value to the column's typmod (e.g.
+    /// `numeric(10,2)` stores `1.005`→`1.01`, `timestamp(0)` drops sub-second);
+    /// L3 must recast the source through the column's *parameterized* type so
+    /// it rounds identically. Before the fix L3 recast through the bare type
+    /// name (no scale), keeping `1.005`, and false-mismatched every such row.
+    ///
+    /// `#[ignore]` — needs a real DSQL cluster + IAM (CI `e2e-dsql`). DSQL is
+    /// the type authority here; SQLite can't reproduce typmod coercion.
+    #[tokio::test]
+    #[ignore]
+    async fn pgdump_load_verify_full_typmod_narrower_than_source_matches() -> anyhow::Result<()> {
+        let dsql_endpoint = std::env::var("LOADER_DSQL_E2E_ENDPOINT").map_err(|_| {
+            anyhow::anyhow!("LOADER_DSQL_E2E_ENDPOINT must be set (<cluster>.dsql.<region>.on.aws)")
+        })?;
+        let dsql_region =
+            std::env::var("LOADER_DSQL_E2E_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        anyhow::ensure!(
+            !dsql_endpoint.is_empty(),
+            "LOADER_DSQL_E2E_ENDPOINT is empty"
+        );
+
+        let dsql_pool = build_dsql_pool(
+            PoolArgsBuilder::default()
+                .endpoint(&dsql_endpoint)
+                .region(&dsql_region)
+                .username("admin")
+                .build()?,
+        )
+        .await?;
+
+        // UUID-suffixed table so parallel runs on a shared cluster don't collide.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let table = format!("e2e_typmod_{suffix}");
+
+        // Narrow columns: scale-2 numeric and second-precision timestamps.
+        dsql_pool
+            .execute_query(&format!(
+                "CREATE TABLE {table} (
+                    id    int PRIMARY KEY,
+                    amt   numeric(10,2),
+                    ts0   timestamp(0),
+                    tstz0 timestamptz(0)
+                )"
+            ))
+            .await?;
+
+        // Source COPY text is WIDER than every column's precision, so a
+        // faithful load must coerce: 1.005→1.01, .6 seconds→rounded.
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.{table} (id, amt, ts0, tstz0) FROM stdin;")?;
+        writeln!(
+            f,
+            "1\t1.005\t2024-01-01 10:23:54.6\t2024-01-01 10:23:54.6+02"
+        )?;
+        writeln!(
+            f,
+            "2\t2.675\t2024-06-30 23:59:59.5\t2024-06-30 23:59:59.5+00"
+        )?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let mut args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            &table,
+            dsql_pool.clone(),
+        );
+        args.verify = VerifyMode::Full;
+
+        let result = run_load(args).await?;
+
+        // The fix's payoff: a faithful narrowing load verifies clean. Before
+        // the parameterized recast this was ValueMismatch(2).
+        let v = result.verify.expect("verify=full must populate verify");
+        assert_eq!(
+            v.verdict,
+            crate::verify::VerifyVerdict::Match,
+            "narrowing load must verify as Match, got {:?} (l3_details={:?})",
+            v.verdict,
+            v.l3_details,
+        );
+
+        // Guard against a trivial pass: prove the column REALLY coerced the
+        // value (so the recast genuinely had to round to match, not just
+        // compare equal text). 1.005 must be stored as 1.01.
+        let (stored_amt,): (String,) =
+            sqlx::query_as(&format!("SELECT amt::text FROM {table} WHERE id = 1"))
+                .fetch_one(&dsql_pool)
+                .await?;
+        assert_eq!(
+            stored_amt, "1.01",
+            "column must have rounded 1.005→1.01 (else the test isn't exercising typmod)"
+        );
+
+        let _ = dsql_pool
+            .execute_query(&format!("DROP TABLE IF EXISTS {table}"))
+            .await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn pgdump_errors_on_column_set_mismatch() -> anyhow::Result<()> {
         // Target table has an extra column not present in the dump's COPY clause.

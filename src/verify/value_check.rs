@@ -1,9 +1,12 @@
 //! L3 value verification: build the server-side recast-compare query and
 //! diff the source (re-read, decoded TEXT) against the target by primary
-//! key. The DB is the type authority — a source field is pushed back
-//! through the same `CAST` the loader used at INSERT, compared null-safe
-//! (`IS NOT DISTINCT FROM` on Postgres/DSQL, `IS` on SQLite), so canonical
-//! forms (`1.5` vs `1.50`, `\N` vs NULL) match without a client normalizer.
+//! key. The DB is the type authority — a source field is recast through the
+//! column's *parameterized* type and compared null-safe (`IS NOT DISTINCT
+//! FROM` on Postgres/DSQL, `IS` on SQLite), so the comparison reproduces the
+//! column's assignment-time coercion: canonical forms (`1.5` vs `1.50`, `\N`
+//! vs NULL) and typmod rounding (`numeric(10,2)` storing `1.005`→`1.01`)
+//! match without a client normalizer. See [`column_types`] for why the type
+//! name must carry its precision/scale.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -238,11 +241,33 @@ fn is_match(matches_text: &str) -> bool {
     matches!(matches_text, "true" | "1")
 }
 
-/// name → Postgres type name (the [`SqlType::to_postgres`] form) for every
-/// column of the target table. Verify compares on the type *name* string —
-/// the same currency the worker's INSERT casts through — so it never needs
-/// the `SqlType` vocabulary itself, only the name it would have written.
+/// name → the column's fully-parameterized type name for every column of the
+/// target table, e.g. `numeric(10,2)`, `timestamp(0) without time zone`.
+/// Verify recasts each source value through this *exact* type so the compare
+/// reproduces the column's assignment-time coercion: a `numeric(10,2)` column
+/// rounds `'1.005'`→`1.01` on load, and recasting through the bare `NUMERIC`
+/// (no scale) keeps `1.005`, false-mismatching a faithful load. The
+/// parameterized recast rounds identically. (Verified on a live DSQL cluster.)
+///
+/// `pg_catalog.format_type(atttypid, atttypmod)` yields the parameterized
+/// spelling in one castable string. SQLite (tests) has no such catalog, so it
+/// falls back to the inferred [`SqlType::to_postgres`] name — SQLite's type
+/// affinity makes the recast forgiving and tests don't exercise typmod.
 async fn column_types(pool: &Pool, schema: &str, table: &str) -> Result<HashMap<String, String>> {
+    if pool.is_postgres() {
+        let sql = "SELECT a.attname, format_type(a.atttypid, a.atttypmod) \
+                   FROM pg_attribute a \
+                   JOIN pg_class c ON c.oid = a.attrelid \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                   WHERE n.nspname = $1 AND c.relname = $2 \
+                     AND a.attnum > 0 AND NOT a.attisdropped";
+        let rows: Vec<(String, String)> = pool
+            .fetch_all_with_binds(sql, &[schema, table])
+            .await
+            .with_context(|| format!("verify=full: type lookup for {schema}.{table}"))?;
+        return Ok(rows.into_iter().collect());
+    }
+    // SQLite test path: no pg_catalog; use the inferred type names.
     let resolved = query_table_schema(pool, schema, table).await?;
     Ok(resolved
         .columns
@@ -303,15 +328,18 @@ fn null_safe_eq(is_postgres: bool) -> &'static str {
     }
 }
 
-/// `true` for a type name (`to_postgres()` form) that must be compared as
-/// text rather than recast natively: `JSON` has no `=` operator (a direct
-/// `IS NOT DISTINCT FROM` against a `CAST(.. AS JSON)` errors), but it stores
-/// the verbatim source COPY text, so `CAST("col" AS TEXT)` vs the bare source
-/// text is exact and equality-capable. `JSONB` is deliberately excluded: it
-/// *has* `=` and canonicalizes input (key order / whitespace), so it recasts
-/// natively (a text compare would false-mismatch on the canonicalization).
+/// `true` for a type name that must be compared as text rather than recast
+/// natively: `json` has no `=` operator (a direct `IS NOT DISTINCT FROM`
+/// against a `CAST(.. AS json)` errors), but it stores the verbatim source
+/// COPY text, so `CAST("col" AS TEXT)` vs the bare source text is exact and
+/// equality-capable. `jsonb` is deliberately excluded: it *has* `=` and
+/// canonicalizes input (key order / whitespace), so it recasts natively (a
+/// text compare would false-mismatch on the canonicalization).
+///
+/// Case-insensitive: the name may be the worker's `to_postgres()` form
+/// (`JSON`) or the catalog's `format_type` form (`json`).
 fn compares_as_text(pg_type: &str) -> bool {
-    pg_type == "JSON"
+    pg_type.eq_ignore_ascii_case("json")
 }
 
 /// Per-column match predicate: `None` (source `\N`) → `"col" IS NULL`;
@@ -806,6 +834,53 @@ mod tests {
         assert_eq!(
             p,
             "\"payload\" IS NOT DISTINCT FROM CAST('{\"k\":\"v\"}' AS JSONB)"
+        );
+    }
+
+    #[test]
+    fn predicate_parameterized_type_recasts_with_precision() {
+        // The catalog (format_type) hands verify the *parameterized* type, so
+        // the recast reproduces the column's assignment-time rounding —
+        // `numeric(10,2)` stores '1.005' as 1.01 and the recast must round the
+        // same way (validated against live DSQL). The bare `NUMERIC` would
+        // keep 1.005 and false-mismatch a faithful load.
+        let p = column_predicate("amt", "numeric(10,2)", Some("1.005"), true);
+        assert_eq!(
+            p,
+            "\"amt\" IS NOT DISTINCT FROM CAST('1.005' AS numeric(10,2))"
+        );
+        let p = column_predicate(
+            "ts",
+            "timestamp(0) without time zone",
+            Some("2024-01-01 10:23:54.6"),
+            true,
+        );
+        assert_eq!(
+            p,
+            "\"ts\" IS NOT DISTINCT FROM CAST('2024-01-01 10:23:54.6' AS timestamp(0) without time zone)"
+        );
+    }
+
+    #[test]
+    fn predicate_lowercase_json_takes_text_path() {
+        // format_type yields lowercase `json`; compares_as_text must still
+        // route it to the text-compare (json has no `=` operator).
+        let p = column_predicate("payload", "json", Some("{\"k\":\"v\"}"), true);
+        assert_eq!(
+            p,
+            "CAST(\"payload\" AS TEXT) IS NOT DISTINCT FROM '{\"k\":\"v\"}'"
+        );
+    }
+
+    #[test]
+    fn predicate_parameterized_varchar_casts_with_length() {
+        // Verify casts the TEXT family through the parameterized name (it
+        // carries the length, unlike the worker's bare `VARCHAR`), so
+        // character varying(5) blank-/length-coerces faithfully.
+        let p = column_predicate("vc", "character varying(5)", Some("ab"), true);
+        assert_eq!(
+            p,
+            "\"vc\" IS NOT DISTINCT FROM CAST('ab' AS character varying(5))"
         );
     }
 

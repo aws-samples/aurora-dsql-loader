@@ -48,11 +48,13 @@ pub fn escape_sql_literal(value: &str) -> String {
 /// Whether a column of the given Postgres type name is written as a bare
 /// `'literal'` (TEXT family) rather than `CAST('literal' AS type)`.
 ///
-/// Single source of truth for the cast-vs-bare decision, keyed on the
-/// `to_postgres()` type name both call sites share: the worker classifies
-/// `ColumnJson.col_type` (always `to_postgres()` output) at INSERT time, and
-/// verify classifies the same name when building its recast comparison, so
-/// the comparison runs through the identical coercion the write used.
+/// Keyed on the worker's `to_postgres()` names (`TEXT`/`VARCHAR`/`CHAR`): the
+/// worker has only the *unparameterized* name, and `CAST('ab' AS CHAR)` would
+/// truncate to `char(1)` — so it inserts the TEXT family bare and lets the
+/// column coerce. Verify recasts through the column's *parameterized* name
+/// (e.g. `character varying(5)`), which carries the length and so casts
+/// faithfully; those names don't match here, so verify always casts. Bare and
+/// parameterized-cast yield the same stored comparison either way.
 pub fn inserts_as_bare_literal(pg_type: &str) -> bool {
     matches!(pg_type, "TEXT" | "VARCHAR" | "CHAR")
 }
