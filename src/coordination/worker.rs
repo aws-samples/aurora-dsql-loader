@@ -521,21 +521,16 @@ impl Worker {
                         return "NULL".to_string();
                     };
 
-                    let escaped = crate::db::schema::escape_sql_literal(field);
-                    let value_expr = format!("'{}'", escaped);
-
-                    // PostgreSQL only: wrap in CAST() for non-text columns
-                    // so the server is the single source of truth for type
-                    // coercion. SQLite handles literals natively.
-                    schema
-                        .as_ref()
-                        .and_then(|s| s.columns.get(col_idx))
-                        .filter(|col| {
-                            use_pg_cast
-                                && !crate::db::schema::inserts_as_bare_literal(&col.col_type)
-                        })
-                        .map(|col| format!("CAST({} AS {})", value_expr, col.col_type))
-                        .unwrap_or(value_expr)
+                    // PostgreSQL only: recast non-text columns so the server
+                    // is the single source of truth for type coercion (shared
+                    // with verify's recast-compare). SQLite handles literals
+                    // natively, so emit a bare escaped literal there.
+                    match schema.as_ref().and_then(|s| s.columns.get(col_idx)) {
+                        Some(col) if use_pg_cast => {
+                            crate::db::schema::recast_literal(&col.col_type, field)
+                        }
+                        _ => format!("'{}'", crate::db::schema::escape_sql_literal(field)),
+                    }
                 })
                 .collect();
             value_groups.push(format!("({})", values.join(", ")));

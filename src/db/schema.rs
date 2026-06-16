@@ -57,6 +57,27 @@ pub fn inserts_as_bare_literal(pg_type: &str) -> bool {
     matches!(pg_type, "TEXT" | "VARCHAR" | "CHAR")
 }
 
+/// Render `value` as the SQL literal a Postgres/DSQL load writes for a
+/// column of `pg_type` (a [`SqlType::to_postgres`] name): bare `'v'` for the
+/// TEXT family, `CAST('v' AS pg_type)` otherwise, so the server's input
+/// function owns the coercion.
+///
+/// Single source of truth for two call sites that must agree: the worker's
+/// INSERT (Postgres path) writes the value through this, and verify's
+/// recast-compare rebuilds the same literal to compare against — keyed on
+/// the identical `to_postgres()` name so a source value coerces the same way
+/// on both. (SQLite isn't Postgres, so the worker bypasses this and emits a
+/// bare literal there; verify still recasts so its comparison matches the
+/// affinity-coerced stored value.)
+pub fn recast_literal(pg_type: &str, value: &str) -> String {
+    let lit = format!("'{}'", escape_sql_literal(value));
+    if inserts_as_bare_literal(pg_type) {
+        lit
+    } else {
+        format!("CAST({lit} AS {pg_type})")
+    }
+}
+
 impl SqlType {
     /// Returns the Postgres type name
     pub fn to_postgres(&self) -> &'static str {
@@ -545,6 +566,26 @@ impl SchemaInferrer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recast_literal_bare_for_text_family_else_cast() {
+        // TEXT family → bare escaped literal (the worker inserts bare, so
+        // verify compares bare); everything else → CAST through the type.
+        assert_eq!(recast_literal("TEXT", "alice"), "'alice'");
+        assert_eq!(recast_literal("VARCHAR", "alice"), "'alice'");
+        assert_eq!(recast_literal("CHAR", "x"), "'x'");
+        assert_eq!(recast_literal("NUMERIC", "1.5"), "CAST('1.5' AS NUMERIC)");
+        assert_eq!(
+            recast_literal("TIMESTAMP WITH TIME ZONE", "2024-01-01Z"),
+            "CAST('2024-01-01Z' AS TIMESTAMP WITH TIME ZONE)"
+        );
+        // Embedded quotes are doubled on both paths.
+        assert_eq!(recast_literal("TEXT", "o'brien"), "'o''brien'");
+        assert_eq!(
+            recast_literal("JSONB", "{\"k\":\"v\"}"),
+            "CAST('{\"k\":\"v\"}' AS JSONB)"
+        );
+    }
 
     #[test]
     fn test_infer_value_types() {

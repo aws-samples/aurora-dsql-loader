@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 
 use super::{L3Details, L3Outcome, SchemaCheck};
 use crate::db::Pool;
-use crate::db::schema::{SqlType, escape_sql_literal, inserts_as_bare_literal, query_table_schema};
+use crate::db::schema::{escape_sql_literal, query_table_schema, recast_literal};
 use crate::formats::pgdump::{CopyBlock, PgDumpReader, find_copy_block};
 use crate::formats::reader::{FileReader, Record};
 use crate::io::{ByteReader, LocalFileByteReader, S3ByteReader, SourceUri};
@@ -161,8 +161,8 @@ pub(crate) async fn verify_table_values(
     };
 
     let col_types = column_types(pool, &block.schema, &block.table).await?;
-    // Every COPY column must resolve to a type for the recast compare.
-    let types: Vec<SqlType> = block
+    // Every COPY column must resolve to a type name for the recast compare.
+    let types: Vec<String> = block
         .columns
         .iter()
         .map(|c| {
@@ -238,13 +238,16 @@ fn is_match(matches_text: &str) -> bool {
     matches!(matches_text, "true" | "1")
 }
 
-/// name → SqlType for every column of the target table.
-async fn column_types(pool: &Pool, schema: &str, table: &str) -> Result<HashMap<String, SqlType>> {
+/// name → Postgres type name (the [`SqlType::to_postgres`] form) for every
+/// column of the target table. Verify compares on the type *name* string —
+/// the same currency the worker's INSERT casts through — so it never needs
+/// the `SqlType` vocabulary itself, only the name it would have written.
+async fn column_types(pool: &Pool, schema: &str, table: &str) -> Result<HashMap<String, String>> {
     let resolved = query_table_schema(pool, schema, table).await?;
     Ok(resolved
         .columns
         .into_iter()
-        .map(|c| (c.name, c.sql_type))
+        .map(|c| (c.name, c.sql_type.to_postgres().to_string()))
         .collect())
 }
 
@@ -271,7 +274,7 @@ fn source_row<'a>(
     rec: &'a Record,
     block: &'a CopyBlock,
     pk_idx: usize,
-    types: &'a [SqlType],
+    types: &'a [String],
 ) -> Result<SourceRow<'a>> {
     let pk_value = rec.fields[pk_idx].as_deref().with_context(|| {
         format!(
@@ -284,7 +287,7 @@ fn source_row<'a>(
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != pk_idx)
-        .map(|(i, name)| (name.as_str(), &types[i], rec.fields[i].as_deref()))
+        .map(|(i, name)| (name.as_str(), types[i].as_str(), rec.fields[i].as_deref()))
         .collect();
     Ok(SourceRow { pk_value, columns })
 }
@@ -300,41 +303,31 @@ fn null_safe_eq(is_postgres: bool) -> &'static str {
     }
 }
 
-/// Render a value as the SQL literal the worker would have inserted: bare
-/// `'v'` for the TEXT family, `CAST('v' AS TYPE)` otherwise. Shares
-/// `inserts_as_bare_literal` with the worker so the bare-vs-CAST decision
-/// matches the write path on Postgres/DSQL (SQLite tests accept the extra
-/// CAST harmlessly — the worker inserts bare there).
-fn recast_literal(ty: &SqlType, value: &str) -> String {
-    let lit = format!("'{}'", escape_sql_literal(value));
-    if inserts_as_bare_literal(ty.to_postgres()) {
-        lit
-    } else {
-        format!("CAST({lit} AS {})", ty.to_postgres())
-    }
+/// `true` for a type name (`to_postgres()` form) that must be compared as
+/// text rather than recast natively: `JSON` has no `=` operator (a direct
+/// `IS NOT DISTINCT FROM` against a `CAST(.. AS JSON)` errors), but it stores
+/// the verbatim source COPY text, so `CAST("col" AS TEXT)` vs the bare source
+/// text is exact and equality-capable. `JSONB` is deliberately excluded: it
+/// *has* `=` and canonicalizes input (key order / whitespace), so it recasts
+/// natively (a text compare would false-mismatch on the canonicalization).
+fn compares_as_text(pg_type: &str) -> bool {
+    pg_type == "JSON"
 }
 
 /// Per-column match predicate: `None` (source `\N`) → `"col" IS NULL`;
 /// `Some(v)` → `"col" <nseq> <recast literal>`. `col` is double-quoted.
-///
-/// `json` is special-cased: it has no `=` operator (a direct
-/// `IS NOT DISTINCT FROM` errors), but it stores the verbatim source COPY
-/// text, so we compare `CAST("col" AS text)` against the bare source text —
-/// exact and equality-capable. This is textual, not semantic-JSON. `jsonb`
-/// is NOT special-cased: it *has* `=` and canonicalizes input (key order /
-/// whitespace), so it must compare via native `CAST('v' AS jsonb)` (a text
-/// compare would false-mismatch on the canonicalization) — that's the
-/// default `recast_literal` arm below.
-fn column_predicate(col: &str, ty: &SqlType, value: Option<&str>, is_postgres: bool) -> String {
+/// `ty` is the column's `to_postgres()` type name; `JSON` takes the
+/// text-compare path (see [`compares_as_text`]), everything else recasts.
+fn column_predicate(col: &str, ty: &str, value: Option<&str>, is_postgres: bool) -> String {
     let quoted = format!("\"{col}\"");
     let nseq = null_safe_eq(is_postgres);
-    match (value, ty) {
-        (None, _) => format!("{quoted} IS NULL"),
-        (Some(v), SqlType::Json) => {
+    match value {
+        None => format!("{quoted} IS NULL"),
+        Some(v) if compares_as_text(ty) => {
             let lit = format!("'{}'", escape_sql_literal(v));
             format!("CAST({quoted} AS TEXT) {nseq} {lit}")
         }
-        (Some(v), _) => format!("{quoted} {nseq} {}", recast_literal(ty, v)),
+        Some(v) => format!("{quoted} {nseq} {}", recast_literal(ty, v)),
     }
 }
 
@@ -342,7 +335,7 @@ fn column_predicate(col: &str, ty: &SqlType, value: Option<&str>, is_postgres: b
 /// (column, type, value) tuples for every non-PK loaded column.
 pub(crate) struct SourceRow<'a> {
     pub pk_value: &'a str,
-    pub columns: Vec<(&'a str, &'a SqlType, Option<&'a str>)>,
+    pub columns: Vec<(&'a str, &'a str, Option<&'a str>)>,
 }
 
 /// Build the projected-bool batch query: for each `SourceRow`, return
@@ -358,7 +351,7 @@ pub(crate) struct SourceRow<'a> {
 fn build_batch_query(
     qualified_table: &str,
     pk_col: &str,
-    pk_type: &SqlType,
+    pk_type: &str,
     rows: &[SourceRow<'_>],
     is_postgres: bool,
 ) -> String {
@@ -756,38 +749,38 @@ mod tests {
 
     #[test]
     fn predicate_null_source_is_is_null() {
-        let p = column_predicate("note", &SqlType::Text, None, true);
+        let p = column_predicate("note", "TEXT", None, true);
         assert_eq!(p, "\"note\" IS NULL");
     }
 
     #[test]
     fn predicate_text_column_no_cast() {
         // TEXT family inserts bare, so verify compares bare.
-        let p = column_predicate("name", &SqlType::Text, Some("alice"), true);
+        let p = column_predicate("name", "TEXT", Some("alice"), true);
         assert_eq!(p, "\"name\" IS NOT DISTINCT FROM 'alice'");
     }
 
     #[test]
     fn predicate_numeric_column_casts() {
-        let p = column_predicate("amount", &SqlType::Numeric, Some("1.5"), true);
+        let p = column_predicate("amount", "NUMERIC", Some("1.5"), true);
         assert_eq!(p, "\"amount\" IS NOT DISTINCT FROM CAST('1.5' AS NUMERIC)");
     }
 
     #[test]
     fn predicate_sqlite_uses_is() {
-        let p = column_predicate("amount", &SqlType::Numeric, Some("1.5"), false);
+        let p = column_predicate("amount", "NUMERIC", Some("1.5"), false);
         assert_eq!(p, "\"amount\" IS CAST('1.5' AS NUMERIC)");
     }
 
     #[test]
     fn predicate_escapes_single_quotes() {
-        let p = column_predicate("note", &SqlType::Text, Some("o'brien"), true);
+        let p = column_predicate("note", "TEXT", Some("o'brien"), true);
         assert_eq!(p, "\"note\" IS NOT DISTINCT FROM 'o''brien'");
     }
 
     #[test]
     fn predicate_timestamptz_uses_full_type_name() {
-        let p = column_predicate("ts", &SqlType::TimestampTz, Some("2024-01-01Z"), true);
+        let p = column_predicate("ts", "TIMESTAMP WITH TIME ZONE", Some("2024-01-01Z"), true);
         assert_eq!(
             p,
             "\"ts\" IS NOT DISTINCT FROM CAST('2024-01-01Z' AS TIMESTAMP WITH TIME ZONE)"
@@ -798,7 +791,7 @@ mod tests {
     fn predicate_json_compares_column_as_text() {
         // json has no `=`; compare CAST(col AS TEXT) against the bare source
         // text instead of CAST('..' AS JSON) IS NOT DISTINCT FROM (which errors).
-        let p = column_predicate("payload", &SqlType::Json, Some("{\"k\":\"v\"}"), true);
+        let p = column_predicate("payload", "JSON", Some("{\"k\":\"v\"}"), true);
         assert_eq!(
             p,
             "CAST(\"payload\" AS TEXT) IS NOT DISTINCT FROM '{\"k\":\"v\"}'"
@@ -809,7 +802,7 @@ mod tests {
     fn predicate_jsonb_compares_natively_not_as_text() {
         // jsonb HAS `=` and canonicalizes input, so it must recast to jsonb
         // (a text compare would false-mismatch on key/whitespace reordering).
-        let p = column_predicate("payload", &SqlType::Jsonb, Some("{\"k\":\"v\"}"), true);
+        let p = column_predicate("payload", "JSONB", Some("{\"k\":\"v\"}"), true);
         assert_eq!(
             p,
             "\"payload\" IS NOT DISTINCT FROM CAST('{\"k\":\"v\"}' AS JSONB)"
@@ -818,20 +811,20 @@ mod tests {
 
     #[test]
     fn batch_query_projects_pk_and_match_bool_over_range() {
-        let int = SqlType::Integer;
-        let text = SqlType::Text;
-        let num = SqlType::Numeric;
         let rows = vec![
             SourceRow {
                 pk_value: "1",
-                columns: vec![("name", &text, Some("alice")), ("amt", &num, Some("1.5"))],
+                columns: vec![
+                    ("name", "TEXT", Some("alice")),
+                    ("amt", "NUMERIC", Some("1.5")),
+                ],
             },
             SourceRow {
                 pk_value: "2",
-                columns: vec![("name", &text, None), ("amt", &num, Some("2"))],
+                columns: vec![("name", "TEXT", None), ("amt", "NUMERIC", Some("2"))],
             },
         ];
-        let sql = build_batch_query("\"t\"", "id", &int, &rows, true);
+        let sql = build_batch_query("\"t\"", "id", "INTEGER", &rows, true);
 
         // PK projected as text; per-row CASE arm keyed by recast PK; the IN
         // list holds the same recast literals; null source field → IS NULL.
@@ -859,12 +852,11 @@ mod tests {
     #[test]
     fn batch_query_empty_columns_matches_true() {
         // A row with only a PK (no other loaded columns) trivially matches.
-        let int = SqlType::Integer;
         let rows = vec![SourceRow {
             pk_value: "5",
             columns: vec![],
         }];
-        let sql = build_batch_query("\"t\"", "id", &int, &rows, true);
+        let sql = build_batch_query("\"t\"", "id", "INTEGER", &rows, true);
         assert!(sql.contains("THEN (TRUE)"), "{sql}");
         assert!(
             sql.contains("WHERE \"id\" IN (CAST('5' AS INTEGER))"),
@@ -874,13 +866,11 @@ mod tests {
 
     #[test]
     fn batch_query_uuid_pk_casts_in_arm_and_in_list() {
-        let uuid = SqlType::Uuid;
-        let text = SqlType::Text;
         let rows = vec![SourceRow {
             pk_value: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
-            columns: vec![("v", &text, Some("x"))],
+            columns: vec![("v", "TEXT", Some("x"))],
         }];
-        let sql = build_batch_query("\"t\"", "id", &uuid, &rows, true);
+        let sql = build_batch_query("\"t\"", "id", "UUID", &rows, true);
         // PK literal recast in both the CASE arm and the IN list.
         assert_eq!(
             sql.matches("CAST('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' AS UUID)")
