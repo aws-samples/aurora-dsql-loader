@@ -1035,7 +1035,7 @@ COPY public.users (id, email) FROM stdin;
         assert_eq!(
             v.schema_check,
             Some(crate::verify::SchemaCheck {
-                columns_matched: 2,
+                columns_matched: Some(2),
                 pk_present: true,
             })
         );
@@ -1073,7 +1073,7 @@ COPY public.logs (id, msg) FROM stdin;
         assert_eq!(
             v.schema_check,
             Some(crate::verify::SchemaCheck {
-                columns_matched: 2,
+                columns_matched: Some(2),
                 pk_present: false,
             })
         );

@@ -62,7 +62,7 @@ pub(crate) async fn run_load_value_check(
             .with_context(|| format!("verify: PK lookup for {schema}.{table}"))?
             .is_empty();
         let sc = SchemaCheck {
-            columns_matched: 0,
+            columns_matched: None,
             pk_present,
         };
         return Ok((sc, L3Outcome::Skipped, L3Details::default()));
@@ -106,7 +106,7 @@ pub(crate) async fn schema_check(pool: &Pool, block: &CopyBlock) -> Result<Schem
         .with_context(|| format!("verify: PK lookup for {}.{}", block.schema, block.table))?
         .is_empty();
     Ok(SchemaCheck {
-        columns_matched: block.columns.len() as u64,
+        columns_matched: Some(block.columns.len() as u64),
         pk_present,
     })
 }
@@ -125,7 +125,7 @@ const DETAIL_CAP: usize = 100;
 /// plus the first-K offending PKs in [`L3Details`].
 ///
 /// `L3Outcome::Skipped` (never a silent pass) when the table has no usable
-/// single-column primary key — the only key shape v1 verifies.
+/// single-column key (primary or unique) — the only key shape v1 verifies.
 ///
 /// Reuses the live source `reader` (no re-open) and the existing pgdump
 /// decode path; assumes the pgdump/migrate field mapping where
@@ -150,7 +150,8 @@ pub(crate) async fn verify_table_values(
                 block.schema, block.table
             )
         })?;
-    // v1 verifies a single-column PK only; composite / no-PK → explicit skip.
+    // v1 verifies a single-column key (primary or unique) only; composite /
+    // no-key → explicit skip.
     let [pk_col] = pk_cols.as_slice() else {
         return Ok((L3Outcome::Skipped, L3Details::default()));
     };
@@ -301,7 +302,9 @@ fn null_safe_eq(is_postgres: bool) -> &'static str {
 
 /// Render a value as the SQL literal the worker would have inserted: bare
 /// `'v'` for the TEXT family, `CAST('v' AS TYPE)` otherwise. Shares
-/// `inserts_as_bare_literal` with the worker so verify coerces identically.
+/// `inserts_as_bare_literal` with the worker so the bare-vs-CAST decision
+/// matches the write path on Postgres/DSQL (SQLite tests accept the extra
+/// CAST harmlessly — the worker inserts bare there).
 fn recast_literal(ty: &SqlType, value: &str) -> String {
     let lit = format!("'{}'", escape_sql_literal(value));
     if inserts_as_bare_literal(ty.to_postgres()) {
@@ -578,6 +581,64 @@ mod tests {
 
         let (f, block) =
             fixture_block("COPY public.things (id, note) FROM stdin;", &["1\ta"]).await;
+
+        let (out, _details) = verify_table_values(&pool, reader_for(&f), &block, 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(out, L3Outcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn run_load_value_check_non_pgdump_skips_with_uncounted_columns() {
+        // csv/parquet under --verify=full: no COPY block to anchor a per-row
+        // compare or count columns → report PK presence only, columns
+        // uncounted (None, NOT Some(0)), and L3 Skipped (never a silent
+        // Match). The early return must not touch the source URI.
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        pool.execute_query("CREATE TABLE things (id INTEGER PRIMARY KEY, note TEXT)")
+            .await
+            .unwrap();
+
+        let (sc, outcome, details) = run_load_value_check(
+            &pool,
+            LoadVerifyTarget {
+                source_uri: "s3://unused/for-non-pgdump",
+                region: "us-west-2",
+                schema: "public",
+                table: "things",
+                is_pgdump: false,
+                run_value_check: true,
+                chunk_size_bytes: 1 << 20,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sc,
+            SchemaCheck {
+                columns_matched: None,
+                pk_present: true,
+            }
+        );
+        assert_eq!(outcome, L3Outcome::Skipped);
+        assert_eq!(details, L3Details::default());
+    }
+
+    #[tokio::test]
+    async fn l3_composite_primary_key_is_skipped() {
+        // v1 aligns rows on a single-column key only; a composite PK must
+        // Skip (explicit "not checked"), never silently verify on the first
+        // column. A regression to `pk_cols.first()` would mis-align rows.
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        pool.execute_query("CREATE TABLE parts (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))")
+            .await
+            .unwrap();
+        pool.execute_query("INSERT INTO parts VALUES (1, 2, 'x')")
+            .await
+            .unwrap();
+
+        let (f, block) =
+            fixture_block("COPY public.parts (a, b, v) FROM stdin;", &["1\t2\tx"]).await;
 
         let (out, _details) = verify_table_values(&pool, reader_for(&f), &block, 1 << 20)
             .await

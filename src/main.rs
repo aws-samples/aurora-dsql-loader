@@ -563,20 +563,14 @@ async fn run_migrate_cli(args: MigrateCliArgs) -> anyhow::Result<()> {
 /// arm is mandatory (cross-crate `#[non_exhaustive]`) and fails closed:
 /// an unknown future variant exits non-zero, never green.
 fn is_bad_verdict(v: &VerifyVerdict) -> bool {
-    match v {
-        // `ValueCheckSkipped` mirrors `SkippedNoExactSourceCount`: an
-        // explicit "not checked" is not itself a failure.
+    // Only a clean or explicitly-not-checked verdict is non-failing; every
+    // other variant (incl. unknown future ones, via the `_`) fails closed.
+    !matches!(
+        v,
         VerifyVerdict::Match
-        | VerifyVerdict::SkippedNoExactSourceCount
-        | VerifyVerdict::ValueCheckSkipped => false,
-        VerifyVerdict::LoaderDropped(_)
-        | VerifyVerdict::MissingTarget(_)
-        | VerifyVerdict::ExtraTarget(_)
-        | VerifyVerdict::RowsConflictedAtTarget(_)
-        | VerifyVerdict::ValueMismatch(_)
-        | VerifyVerdict::ValueRowMissingAtTarget(_) => true,
-        _ => true,
-    }
+            | VerifyVerdict::SkippedNoExactSourceCount
+            | VerifyVerdict::ValueCheckSkipped
+    )
 }
 
 /// Print `Verify: <verdict>`, the affirmative schema-conformance line (when
@@ -595,10 +589,11 @@ fn print_verify_detail(v: &VerifyOutcome, nested: bool) {
         } else {
             "no primary/unique key"
         };
-        println!(
-            "{indent}  Schema: {cols} column(s) match, {pk}",
-            cols = s.columns_matched
-        );
+        let cols = match s.columns_matched {
+            Some(n) => format!("{n} column(s) match"),
+            None => "column set verified via load".to_string(),
+        };
+        println!("{indent}  Schema: {cols}, {pk}");
     }
 
     if matches!(
@@ -667,7 +662,7 @@ fn format_verdict(v: &VerifyVerdict) -> String {
             format!("MISSING AT TARGET {n} row(s) — source primary key not found in target")
         }
         VerifyVerdict::ValueCheckSkipped => {
-            "SKIPPED value check — no single-column primary key to align rows".to_string()
+            "SKIPPED value check — no single-column primary/unique key to align rows".to_string()
         }
         _ => format!("UNKNOWN VERDICT: {v:?}"),
     }

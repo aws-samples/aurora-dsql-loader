@@ -98,7 +98,10 @@ pub enum L3Outcome {
 /// checks are out of scope, see the requirements doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchemaCheck {
-    pub columns_matched: u64,
+    /// `Some(n)` = the load enforced an n-column COPY set; `None` = not
+    /// counted (non-pgdump format has no COPY block to measure), distinct
+    /// from `Some(0)`.
+    pub columns_matched: Option<u64>,
     /// True when the target has a primary key OR a unique constraint
     /// (`get_unique_constraint_columns` falls back to the first unique key).
     pub pk_present: bool,
@@ -165,8 +168,8 @@ pub enum VerifyVerdict {
     /// `ValueMismatch` for the single verdict slot.
     ValueRowMissingAtTarget(u64),
     /// L3 requested (`mode=Full`) but could not run — no usable
-    /// single-column non-null primary key, or a format without an exact
-    /// source-row count. Explicit "not checked", never a silent pass.
+    /// single-column non-null primary/unique key, or a format without an
+    /// exact source-row count. Explicit "not checked", never a silent pass.
     ValueCheckSkipped,
 }
 

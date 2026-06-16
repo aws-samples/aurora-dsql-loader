@@ -4615,7 +4615,7 @@ mod tests {
         // ── Stage 1.5: per-table verification verdict (verify=Full) ─────
         // L1+L2+L3 all ran; every loaded table must come back as Match —
         // proving the server-side recast-compare canonicalizes the seeded
-        // values (numeric/timestamptz/jsonb/uuid/\N) on real DSQL. The
+        // values (timestamptz µs / jsonb / \N) on real DSQL. The
         // affirmative schema check must also be populated.
         for t in &report.tables {
             let v = t.verify.as_ref().unwrap_or_else(|| {
@@ -4650,7 +4650,7 @@ mod tests {
                 )
             });
             assert!(
-                sc.columns_matched > 0 && sc.pk_present,
+                sc.columns_matched.is_some_and(|n| n > 0) && sc.pk_present,
                 "{}.{}: expected columns_matched>0 + pk_present, got {sc:?}",
                 t.schema,
                 t.table,
@@ -5197,7 +5197,7 @@ mod tests {
         assert_eq!(
             v.schema_check,
             Some(crate::verify::SchemaCheck {
-                columns_matched: 2,
+                columns_matched: Some(2),
                 pk_present: true,
             })
         );

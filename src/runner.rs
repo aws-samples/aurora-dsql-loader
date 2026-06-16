@@ -119,8 +119,9 @@ pub struct LoadArgs {
     // Conflict resolution strategy
     pub on_conflict: OnConflict,
 
-    /// L2 toggle. Source-row counting runs parser-side regardless;
-    /// `Count` adds pre/post `count(*)` and a per-table verdict. CLI
+    /// Verification toggle. Source-row counting runs parser-side
+    /// regardless; `Count` adds pre/post `count(*)` + the affirmative schema
+    /// check; `Full` additionally runs the per-row L3 value check. CLI
     /// default: `load`=Off, `migrate`=Count.
     pub verify: VerifyMode,
 
