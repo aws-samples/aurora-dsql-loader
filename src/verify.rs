@@ -168,8 +168,9 @@ pub enum VerifyVerdict {
     /// `ValueMismatch` for the single verdict slot.
     ValueRowMissingAtTarget(u64),
     /// L3 requested (`mode=Full`) but could not run — no usable
-    /// single-column non-null primary/unique key, or a format without an
-    /// exact source-row count. Explicit "not checked", never a silent pass.
+    /// single-column primary/unique key, or a format without an exact
+    /// source-row count. Explicit "not checked", never a silent pass.
+    /// (A NULL value in the source key errors, it does not skip.)
     ValueCheckSkipped,
 }
 

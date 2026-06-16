@@ -1093,6 +1093,19 @@ mod tests {
         assert!(is_bad_verdict(&VerifyVerdict::ValueRowMissingAtTarget(1)));
     }
 
+    /// The L3 verdict strings are the operator's only window into a failed
+    /// value check; pin that each renders its key token and interpolates the
+    /// magnitude (a swapped arm or dropped count would ship silently).
+    #[test]
+    fn format_verdict_renders_l3_verdicts() {
+        assert!(format_verdict(&VerifyVerdict::ValueMismatch(7)).contains("VALUE MISMATCH 7"));
+        assert!(
+            format_verdict(&VerifyVerdict::ValueRowMissingAtTarget(3))
+                .contains("MISSING AT TARGET 3")
+        );
+        assert!(format_verdict(&VerifyVerdict::ValueCheckSkipped).contains("SKIPPED value check"));
+    }
+
     #[test]
     fn parse_exclude_columns_basic() {
         assert_eq!(
