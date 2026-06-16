@@ -28,10 +28,14 @@ pub enum SqlType {
     Interval,
     Uuid,
     Bytea,
-    /// `json` (the dsql-lint `JSONB`→`json` rewrite lands here). The `json`
-    /// type has no `=` operator, so L3 compares it cast to text rather than
-    /// via the null-safe-equality path used for other types.
+    /// `json` — preserves verbatim input text but has **no `=` operator**, so
+    /// L3 compares it as `CAST(col AS TEXT)` against the source text.
     Json,
+    /// `jsonb` — canonicalizes input (key order / whitespace) but **has `=`**,
+    /// so L3 compares it natively via `CAST('src' AS jsonb)`. (A text compare
+    /// would false-mismatch on the canonicalization.) DSQL supports it
+    /// natively; dsql-lint >=0.2.6 preserves it.
+    Jsonb,
 }
 
 /// Escape a value for a single-quoted SQL string literal (doubles embedded
@@ -75,6 +79,7 @@ impl SqlType {
             SqlType::Uuid => "UUID",
             SqlType::Bytea => "BYTEA",
             SqlType::Json => "JSON",
+            SqlType::Jsonb => "JSONB",
         }
     }
 
@@ -297,7 +302,8 @@ pub async fn query_table_schema(
             "INTERVAL" => SqlType::Interval,
             "UUID" => SqlType::Uuid,
             "BYTEA" => SqlType::Bytea,
-            "JSON" | "JSONB" => SqlType::Json,
+            "JSON" => SqlType::Json,
+            "JSONB" => SqlType::Jsonb,
             _ => SqlType::Text, // Default to TEXT for unsupported types
         };
 

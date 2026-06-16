@@ -4452,7 +4452,7 @@ mod tests {
         //   events.id       SERIAL PRIMARY KEY    → serial_sequence_idiom
         //                                           + alter_add_primary_key_collapse
         //   events.user_id  REFERENCES            → foreign_key (removed)
-        //   events.payload  JSONB                 → json_type
+        //   events.payload  JSONB                 (preserved — DSQL native)
         //   events_label_idx CREATE INDEX … USING btree
         //                                         → index_async + index_using
         //   events.note     NOT NULL DEFAULT ''   (preserved as-is)
@@ -4587,9 +4587,13 @@ mod tests {
             "UNIQUE should fold via alter_add_unique_collapse, got: {:?}",
             report.ddl_changes
         );
-        assert!(
-            rule_count("json_type") >= 1,
-            "JSONB → JSON rewrite should fire for events.payload, got: {:?}",
+        // DSQL supports JSONB natively (dsql-lint >=0.2.6 dropped the
+        // JSONB→JSON rewrite), so the json_type rule must NOT fire — the
+        // column is preserved as jsonb (asserted on the destination below).
+        assert_eq!(
+            rule_count("json_type"),
+            0,
+            "JSONB must be preserved (no json_type rewrite), got: {:?}",
             report.ddl_changes
         );
         assert!(
@@ -4691,7 +4695,8 @@ mod tests {
             "{users_src} must have exactly 1 UNIQUE constraint"
         );
 
-        // JSONB → JSON: post-migrate column data_type is `json`, not `jsonb`.
+        // JSONB preserved: DSQL supports it natively, so the column stays
+        // `jsonb` (dsql-lint >=0.2.6 no longer rewrites it to `json`).
         let (payload_type,): (String,) = sqlx::query_as(&format!(
             "SELECT data_type FROM information_schema.columns \
              WHERE table_schema='public' AND table_name='{events_src}' AND column_name='payload'"
@@ -4699,8 +4704,8 @@ mod tests {
         .fetch_one(&dsql_pool)
         .await?;
         assert_eq!(
-            payload_type, "json",
-            "{events_src}.payload must be data_type='json' (not 'jsonb')"
+            payload_type, "jsonb",
+            "{events_src}.payload must be preserved as data_type='jsonb'"
         );
 
         // NOT NULL DEFAULT '' preserved on events.note.

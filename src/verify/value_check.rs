@@ -314,12 +314,14 @@ fn recast_literal(ty: &SqlType, value: &str) -> String {
 /// Per-column match predicate: `None` (source `\N`) → `"col" IS NULL`;
 /// `Some(v)` → `"col" <nseq> <recast literal>`. `col` is double-quoted.
 ///
-/// `json` has no `=` operator, so a direct `IS NOT DISTINCT FROM` errors on
-/// Postgres/DSQL. The loader stores `json` as the verbatim source COPY text
-/// (the type preserves input formatting), so we compare `CAST("col" AS
-/// text)` against the bare source text — exact and equality-capable. This
-/// is a textual, not semantic-JSON, comparison (whitespace-sensitive),
-/// which is correct here because the target text IS the source text.
+/// `json` is special-cased: it has no `=` operator (a direct
+/// `IS NOT DISTINCT FROM` errors), but it stores the verbatim source COPY
+/// text, so we compare `CAST("col" AS text)` against the bare source text —
+/// exact and equality-capable. This is textual, not semantic-JSON. `jsonb`
+/// is NOT special-cased: it *has* `=` and canonicalizes input (key order /
+/// whitespace), so it must compare via native `CAST('v' AS jsonb)` (a text
+/// compare would false-mismatch on the canonicalization) — that's the
+/// default `recast_literal` arm below.
 fn column_predicate(col: &str, ty: &SqlType, value: Option<&str>, is_postgres: bool) -> String {
     let quoted = format!("\"{col}\"");
     let nseq = null_safe_eq(is_postgres);
@@ -739,6 +741,17 @@ mod tests {
         assert_eq!(
             p,
             "CAST(\"payload\" AS TEXT) IS NOT DISTINCT FROM '{\"k\":\"v\"}'"
+        );
+    }
+
+    #[test]
+    fn predicate_jsonb_compares_natively_not_as_text() {
+        // jsonb HAS `=` and canonicalizes input, so it must recast to jsonb
+        // (a text compare would false-mismatch on key/whitespace reordering).
+        let p = column_predicate("payload", &SqlType::Jsonb, Some("{\"k\":\"v\"}"), true);
+        assert_eq!(
+            p,
+            "\"payload\" IS NOT DISTINCT FROM CAST('{\"k\":\"v\"}' AS JSONB)"
         );
     }
 
