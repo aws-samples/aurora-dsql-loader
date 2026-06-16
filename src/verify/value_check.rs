@@ -203,7 +203,7 @@ pub(crate) async fn verify_table_values(
                     rows_missing_at_target += 1;
                     push_capped(&mut details.missing_pks, pk);
                 }
-                Some(m) if is_falsey(m) => {
+                Some(m) if !is_match(m) => {
                     value_mismatches += 1;
                     push_capped(&mut details.mismatch_pks, pk);
                 }
@@ -228,12 +228,13 @@ fn push_capped(list: &mut Vec<String>, pk: &str) {
     }
 }
 
-/// `true` when the projected match-bool text is the backend's false form.
-/// Postgres renders `bool::text` as `t`/`f`; SQLite renders the boolean
-/// expression as `1`/`0`. A NULL match column (CASE fell through — should
-/// not happen since the PK was requested) is treated as a mismatch.
-fn is_falsey(matches_text: &str) -> bool {
-    matches!(matches_text, "f" | "0" | "false" | "FALSE")
+/// `true` only when the projected match-bool text is the backend's true
+/// form: `CAST(bool AS TEXT)` yields `true` on Postgres/DSQL, `1` on SQLite.
+/// Fail-closed: anything else — the false form, or any unexpected token —
+/// counts as a mismatch, so a verification tool never silently passes a row
+/// it couldn't positively confirm matched.
+fn is_match(matches_text: &str) -> bool {
+    matches!(matches_text, "true" | "1")
 }
 
 /// name → SqlType for every column of the target table.
@@ -346,10 +347,9 @@ pub(crate) struct SourceRow<'a> {
 ///
 /// The `WHERE pk IN (...)` list and the per-row `CASE WHEN pk <nseq> ...`
 /// arms are built from the SAME recast PK literals, so the batch is exact
-/// regardless of PK type. (An earlier draft used `pk BETWEEN lo AND hi`,
-/// but that requires the caller to sort PKs in the DB's type order; a
-/// lexical sort of integer/uuid text would mis-window the batch. `IN` of
-/// the exact PKs sidesteps that — confirmed runnable on DSQL by the POC.)
+/// regardless of PK type. `IN` of the exact PKs (not `pk BETWEEN lo AND hi`)
+/// avoids needing the caller to sort PKs in the DB's type order — a lexical
+/// sort of integer/uuid text would mis-window a range.
 fn build_batch_query(
     qualified_table: &str,
     pk_col: &str,
@@ -388,8 +388,8 @@ fn build_batch_query(
         .join(", ");
 
     // Both columns are fetched as text: the match bool is wrapped in
-    // CAST(... AS TEXT) so it decodes uniformly — Postgres yields `t`/`f`,
-    // SQLite yields `1`/`0` (see `is_falsey`).
+    // CAST(... AS TEXT) so it decodes uniformly — Postgres yields
+    // `true`/`false`, SQLite yields `1`/`0` (see `is_match`).
     format!(
         "SELECT CAST({quoted_pk} AS TEXT), CAST(CASE\n{arms}\n    END AS TEXT)\n  \
          FROM {qualified_table}\n  WHERE {quoted_pk} IN ({in_list})"
@@ -456,10 +456,9 @@ mod tests {
 
     #[tokio::test]
     async fn l3_json_column_compares_as_text_no_equality_error() {
-        // Regression for the CI-breaking bug the real-DSQL E2E exposed:
         // `json` has no `=` operator, so the recast compare must route json
-        // through CAST(col AS TEXT). A clean load must Match (not error),
-        // and a corrupted json value must surface as a mismatch.
+        // through CAST(col AS TEXT): a clean load must Match (not error), and
+        // a corrupted json value must surface as a mismatch.
         let pool = Pool::sqlite_in_memory().await.unwrap();
         pool.execute_query("CREATE TABLE evts (id INTEGER PRIMARY KEY, payload JSON)")
             .await
@@ -586,9 +585,9 @@ mod tests {
 
     #[tokio::test]
     async fn l3_boolean_column_mismatch_counted() {
-        // BOOLEAN is where is_falsey's backend divergence bites: the match
-        // bool serializes as 0/1 (SQLite) vs t/f (PG). Pin that a real
-        // boolean-column mismatch is caught, not silently passed.
+        // BOOLEAN is where is_match's backend divergence bites: the match
+        // bool serializes as 0/1 (SQLite) vs false/true (PG). Pin that a
+        // real boolean-column mismatch is caught, not silently passed.
         let pool = Pool::sqlite_in_memory().await.unwrap();
         pool.execute_query("CREATE TABLE flags (id INTEGER PRIMARY KEY, ok BOOLEAN)")
             .await
@@ -675,6 +674,21 @@ mod tests {
                 rows_missing_at_target: 0
             }
         );
+    }
+
+    #[test]
+    fn is_match_is_fail_closed() {
+        // True forms: `true` (Postgres/DSQL `CAST(bool AS TEXT)`), `1` (SQLite).
+        assert!(is_match("true"));
+        assert!(is_match("1"));
+        // False forms and any unexpected token are NOT a match — a value the
+        // tool can't positively confirm must count as a mismatch, never a
+        // silent pass.
+        assert!(!is_match("false"));
+        assert!(!is_match("0"));
+        assert!(!is_match(""));
+        assert!(!is_match("t"));
+        assert!(!is_match("unexpected"));
     }
 
     #[test]

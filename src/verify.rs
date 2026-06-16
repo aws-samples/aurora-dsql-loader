@@ -76,8 +76,8 @@ pub struct L2Counts {
 }
 
 /// Result of the L3 value-verification pass (`mode=Full`). `Ran` carries
-/// the aggregate counts across all PK-range batches; `Skipped` means L3
-/// was requested but could not run (no usable PK / non-exact-count format).
+/// the aggregate counts across all PK batches; `Skipped` means L3 was
+/// requested but could not run (no usable PK / non-exact-count format).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L3Outcome {
     Ran {
@@ -92,13 +92,15 @@ pub enum L3Outcome {
 
 /// Affirmative schema-conformance line (MUST #3): the column set the load
 /// enforced matched the dump's COPY columns, and whether the table has a
-/// primary key. Scoped to **column-set + PK presence only** — NOT column
-/// types/nullability/defaults (a successful load already proves the column
-/// set matches via `align_pgdump_schema_to_copy_columns`; deeper checks are
-/// out of scope, see the requirements doc).
+/// primary or unique key. Scoped to **column-set + key presence only** —
+/// NOT column types/nullability/defaults (a successful load already proves
+/// the column set matches via `align_pgdump_schema_to_copy_columns`; deeper
+/// checks are out of scope, see the requirements doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchemaCheck {
     pub columns_matched: u64,
+    /// True when the target has a primary key OR a unique constraint
+    /// (`get_unique_constraint_columns` falls back to the first unique key).
     pub pk_present: bool,
 }
 
@@ -156,7 +158,7 @@ pub enum VerifyVerdict {
     SkippedNoExactSourceCount,
     /// L3 (`mode=Full`): N rows where the target value differs from the
     /// source after server-side re-cast. The **true total** across all
-    /// PK-range batches; per-PK detail (capped) rides `VerifyOutcome`.
+    /// PK batches; per-PK detail (capped) rides `VerifyOutcome`.
     ValueMismatch(u64),
     /// L3: N source PKs absent from the target. More fundamental than a
     /// value diff (the row isn't there at all), so it outranks

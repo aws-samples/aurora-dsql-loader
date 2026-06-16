@@ -1052,11 +1052,6 @@ COPY public.users (id, email) FROM stdin;
     /// silent pass), while the affirmative schema_check still reports
     /// `pk_present: false`. Pins that the Full wiring reaches L3 and routes
     /// the skip through to the summary.
-    ///
-    /// (An L3 `ValueMismatch` requires L1+L2 to both pass while a value
-    /// still diverges — only reachable via post-load mutation, which is the
-    /// real-DSQL E2E's job. The value_check unit tests pin mismatch +
-    /// PK-localization directly.)
     #[tokio::test]
     async fn run_migrate_verify_full_no_pk_skips_value_check() {
         let pool = Pool::sqlite_in_memory().await.unwrap();

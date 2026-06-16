@@ -591,9 +591,9 @@ fn print_verify_detail(v: &VerifyOutcome, nested: bool) {
     // default-on MUST #3 floor). Scoped to column-set + PK presence.
     if let Some(s) = &v.schema_check {
         let pk = if s.pk_present {
-            "primary key present"
+            "primary/unique key present"
         } else {
-            "no primary key"
+            "no primary/unique key"
         };
         println!(
             "{indent}  Schema: {cols} column(s) match, {pk}",

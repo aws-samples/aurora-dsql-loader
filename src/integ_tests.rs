@@ -4839,12 +4839,10 @@ mod tests {
         assert_eq!(emails, vec!["a@example.com", "b@example.com"]);
 
         // ── Stage 4: L3 catches a post-load divergence on real DSQL ─────
-        // The migrate-time verify passed (Match) because the load was
-        // faithful. Now mutate one target value out from under the loader
-        // and re-run L3 directly: it must flag ValueMismatch and localize
-        // the offending PK. This is the case L3 exists for — a value that
-        // doesn't match the source, with counts intact (the gap count-only
-        // verification cannot see).
+        // The migrate-time verify passed (Match). Now mutate one target
+        // value out from under the loader and re-run L3 directly: it must
+        // flag ValueMismatch and localize the offending PK — a value that
+        // diverges from the source while counts stay intact.
         {
             // Find events row (label 'alpha') and corrupt its note. `id` is
             // BIGINT after the SERIAL→IDENTITY rewrite, so fetch as i64.
