@@ -46,32 +46,18 @@ pub(crate) fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-/// Whether a column of the given Postgres type name is written as a bare
-/// `'literal'` (TEXT family) rather than `CAST('literal' AS type)`.
-///
-/// Keyed on the worker's `to_postgres()` names (`TEXT`/`VARCHAR`/`CHAR`): the
-/// worker has only the *unparameterized* name, and `CAST('ab' AS CHAR)` would
-/// truncate to `char(1)` — so it inserts the TEXT family bare and lets the
-/// column coerce. Verify recasts through the column's *parameterized* name
-/// (e.g. `character varying(5)`), which carries the length and so casts
-/// faithfully; those names don't match here, so verify always casts. Bare and
-/// parameterized-cast yield the same stored comparison either way.
+/// Whether the worker writes a column of this type as a bare `'literal'`
+/// rather than `CAST('literal' AS type)`. The TEXT family is bare because the
+/// worker has only the unparameterized name, and `CAST('ab' AS CHAR)` would
+/// truncate to `char(1)`.
 pub(crate) fn inserts_as_bare_literal(pg_type: &str) -> bool {
     matches!(pg_type, "TEXT" | "VARCHAR" | "CHAR")
 }
 
 /// Render `value` as the SQL literal a Postgres/DSQL load writes for a
-/// column of `pg_type` (a [`SqlType::to_postgres`] name): bare `'v'` for the
-/// TEXT family, `CAST('v' AS pg_type)` otherwise, so the server's input
-/// function owns the coercion.
-///
-/// Single source of truth for two call sites that must agree: the worker's
-/// INSERT (Postgres path) writes the value through this, and verify's
-/// recast-compare rebuilds the same literal to compare against — keyed on
-/// the identical `to_postgres()` name so a source value coerces the same way
-/// on both. (SQLite isn't Postgres, so the worker bypasses this and emits a
-/// bare literal there; verify still recasts so its comparison matches the
-/// affinity-coerced stored value.)
+/// `pg_type` column: bare `'v'` for the TEXT family, else `CAST('v' AS
+/// pg_type)`. Shared by the worker's INSERT and verify's recast-compare so a
+/// value coerces identically on write and check.
 pub(crate) fn recast_literal(pg_type: &str, value: &str) -> String {
     let lit = format!("'{}'", escape_sql_literal(value));
     if inserts_as_bare_literal(pg_type) {
