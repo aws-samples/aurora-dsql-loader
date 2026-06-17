@@ -16,4 +16,5 @@ mod scan;
 mod tests;
 
 pub use reader::PgDumpReader;
-pub use scan::{CopyBlock, extract_ddl, find_copy_block, list_copy_blocks};
+pub(crate) use scan::find_copy_block;
+pub use scan::{CopyBlock, extract_ddl, list_copy_blocks};

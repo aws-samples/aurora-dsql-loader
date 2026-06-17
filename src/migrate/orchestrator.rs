@@ -14,8 +14,7 @@ use crate::runner::{
     Format, LoadArgs, OnConflict, VerifyMode, run_load_with_pool_for_pgdump_block,
 };
 use crate::verify::{
-    L2Counts, L3Outcome, VerifyInputs, VerifyOutcome, count_table_rows, schema_check,
-    verify_table_values,
+    L2Counts, VerifyInputs, VerifyOutcome, count_table_rows, schema_check, verify_table_values,
 };
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
@@ -419,8 +418,7 @@ async fn build_table_verify(
     let (l3, l3_details) = if args.verify == VerifyMode::Full {
         let (outcome, details) =
             verify_table_values(pool, reader, block, args.chunk_size_bytes).await?;
-        let details = matches!(outcome, L3Outcome::Ran { .. }).then_some(details);
-        (Some(outcome), details)
+        outcome.with_details(details)
     } else {
         (None, None)
     };

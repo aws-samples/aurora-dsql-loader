@@ -138,6 +138,13 @@ const DETAIL_CAP: usize = 100;
 /// Assumes source PK values are unique (guaranteed for any real
 /// single-column-PK dump). A hand-corrupted dump with duplicate PKs would
 /// mis-count by the duplicate multiplicity but cannot panic.
+///
+/// Recast comparison assumes pg_dump's canonical COPY output: `timestamptz`
+/// values carry an explicit UTC offset (so the recast is session-`timezone`
+/// independent). A hand-edited dump with an *unqualified* timestamp for a
+/// `timestamptz` column could false-mismatch if the load and verify
+/// connections run under different session `timezone` — offset-bearing
+/// literals (what pg_dump emits) are immune.
 pub(crate) async fn verify_table_values(
     pool: &Pool,
     reader: Arc<dyn ByteReader>,
@@ -177,6 +184,22 @@ pub(crate) async fn verify_table_values(
         .collect::<Result<_>>()?;
 
     let records = read_source_records(reader, block, chunk_size_bytes).await?;
+
+    // Fail-closed floor: a non-empty COPY payload that re-reads to zero rows
+    // is a decode/short-read failure, not a clean table. Without this guard it
+    // would fall through to `Ran{0,0}` → `Match` (L1's counts are frozen at
+    // load time and can't see the re-read), silently passing the exact
+    // fidelity gap L3 exists to catch.
+    if records.is_empty() && block.data_end > block.data_start {
+        anyhow::bail!(
+            "verify=full: re-read of {}.{} decoded 0 rows from a non-empty COPY block \
+             ({} bytes) — possible short read or decode failure; not reporting Match",
+            block.schema,
+            block.table,
+            block.data_end - block.data_start,
+        );
+    }
+
     let qualified = pool.qualified_table_name(&block.schema, &block.table);
     let is_postgres = pool.is_postgres();
 
@@ -344,8 +367,10 @@ fn compares_as_text(pg_type: &str) -> bool {
 
 /// Per-column match predicate: `None` (source `\N`) → `"col" IS NULL`;
 /// `Some(v)` → `"col" <nseq> <recast literal>`. `col` is double-quoted.
-/// `ty` is the column's `to_postgres()` type name; `JSON` takes the
-/// text-compare path (see [`compares_as_text`]), everything else recasts.
+/// `ty` is the column's parameterized type name — `format_type(atttypid,
+/// atttypmod)` on Postgres/DSQL, `to_postgres()` on the SQLite test path;
+/// `json` takes the text-compare path (see [`compares_as_text`]), everything
+/// else recasts.
 fn column_predicate(col: &str, ty: &str, value: Option<&str>, is_postgres: bool) -> String {
     let quoted = format!("\"{col}\"");
     let nseq = null_safe_eq(is_postgres);
@@ -367,9 +392,18 @@ pub(crate) struct SourceRow<'a> {
 }
 
 /// Build the projected-bool batch query: for each `SourceRow`, return
-/// `(pk::text, matches)` where `matches` ANDs every column predicate. A
-/// requested PK absent from the result set is a missing row (the caller
+/// `(source_pk_text, matches)` where `matches` ANDs every column predicate.
+/// A requested PK absent from the result set is a missing row (the caller
 /// diffs requested vs returned PKs).
+///
+/// The first column echoes back the row's **verbatim source PK text**, not
+/// `CAST(pk AS TEXT)`. The target canonicalizes on cast (`numeric` `1.5`→
+/// `1.50`, `uuid` upper→lower), so projecting the target's text and matching
+/// it against the raw source text would false-miss every canonicalized PK and
+/// report `ValueRowMissingAtTarget` on a faithful load. Echoing the source
+/// text via a CASE that shares the recast `IS NOT DISTINCT FROM` arms keeps
+/// the row-match server-side (canonicalization-correct) while the caller's
+/// diff compares like-for-like.
 ///
 /// The `WHERE pk IN (...)` list and the per-row `CASE WHEN pk <nseq> ...`
 /// arms are built from the SAME recast PK literals, so the batch is exact
@@ -387,7 +421,22 @@ fn build_batch_query(
     let quoted_pk = format!("\"{pk_col}\"");
     let nseq = null_safe_eq(is_postgres);
 
-    let arms: String = rows
+    // Two CASE expressions over the same `WHEN pk <nseq> <recast literal>`
+    // arms: one echoes the verbatim source PK text (the map key), the other
+    // ANDs the row's column predicates (the match bool).
+    let key_arms: String = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "      WHEN {quoted_pk} {nseq} {} THEN '{}'",
+                pk_lit(row.pk_value),
+                escape_sql_literal(row.pk_value),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let match_arms: String = rows
         .iter()
         .map(|row| {
             let row_match = if row.columns.is_empty() {
@@ -413,11 +462,10 @@ fn build_batch_query(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Both columns are fetched as text: the match bool is wrapped in
-    // CAST(... AS TEXT) so it decodes uniformly — Postgres yields
-    // `true`/`false`, SQLite yields `1`/`0` (see `is_match`).
+    // The match bool is wrapped in CAST(... AS TEXT) so it decodes uniformly —
+    // Postgres yields `true`/`false`, SQLite yields `1`/`0` (see `is_match`).
     format!(
-        "SELECT CAST({quoted_pk} AS TEXT), CAST(CASE\n{arms}\n    END AS TEXT)\n  \
+        "SELECT CASE\n{key_arms}\n    END, CAST(CASE\n{match_arms}\n    END AS TEXT)\n  \
          FROM {qualified_table}\n  WHERE {quoted_pk} IN ({in_list})"
     )
 }
@@ -607,6 +655,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, L3Outcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn l3_pk_not_in_copy_set_is_skipped() {
+        // Target has a PK (`id`), but the COPY block doesn't include it — the
+        // row can't be aligned positionally, so L3 must Skip (never a silent
+        // pass), distinct from the no-PK case.
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        pool.execute_query("CREATE TABLE things (id INTEGER PRIMARY KEY, note TEXT)")
+            .await
+            .unwrap();
+        pool.execute_query("INSERT INTO things VALUES (1, 'a')")
+            .await
+            .unwrap();
+
+        // COPY clause omits the PK column `id`.
+        let (f, block) = fixture_block("COPY public.things (note) FROM stdin;", &["a"]).await;
+
+        let (out, details) = verify_table_values(&pool, reader_for(&f), &block, 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(out, L3Outcome::Skipped);
+        assert_eq!(details, L3Details::default());
+    }
+
+    #[tokio::test]
+    async fn l3_empty_block_does_not_trip_zero_row_floor() {
+        // A genuinely empty COPY block (header then `\.`, no data) has
+        // data_end == data_start, so the fail-closed floor must NOT fire — it
+        // reports a clean Ran{0,0}, not an error.
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        pool.execute_query("CREATE TABLE things (id INTEGER PRIMARY KEY, note TEXT)")
+            .await
+            .unwrap();
+        let (f, block) = fixture_block("COPY public.things (id, note) FROM stdin;", &[]).await;
+        assert_eq!(
+            block.data_end, block.data_start,
+            "empty block must have a zero-length payload"
+        );
+
+        let (out, _details) = verify_table_values(&pool, reader_for(&f), &block, 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            L3Outcome::Ran {
+                value_mismatches: 0,
+                rows_missing_at_target: 0
+            }
+        );
     }
 
     #[tokio::test]
@@ -901,13 +999,18 @@ mod tests {
         ];
         let sql = build_batch_query("\"t\"", "id", "INTEGER", &rows, true);
 
-        // PK projected as text; per-row CASE arm keyed by recast PK; the IN
-        // list holds the same recast literals; null source field → IS NULL.
+        // First column is a CASE that echoes the verbatim source PK text (not
+        // CAST(pk AS TEXT)); the match bool is the second CAST(... AS TEXT)
+        // CASE. Per-row arms keyed by recast PK; IN list holds the same
+        // recast literals; null source field → IS NULL.
+        assert!(sql.contains("SELECT CASE"), "{sql}");
+        assert!(sql.contains("END, CAST(CASE"), "{sql}");
+        assert!(sql.contains("END AS TEXT)"), "{sql}");
+        // Source PK text echoed as the key for row 1.
         assert!(
-            sql.contains("SELECT CAST(\"id\" AS TEXT), CAST(CASE"),
+            sql.contains("WHEN \"id\" IS NOT DISTINCT FROM CAST('1' AS INTEGER) THEN '1'"),
             "{sql}"
         );
-        assert!(sql.contains("END AS TEXT)"), "{sql}");
         assert!(
             sql.contains("WHEN \"id\" IS NOT DISTINCT FROM CAST('1' AS INTEGER) THEN ("),
             "{sql}"
@@ -922,6 +1025,30 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("FROM \"t\""), "{sql}");
+    }
+
+    #[test]
+    fn batch_query_echoes_source_pk_text_not_target_canonical() {
+        // Regression: a numeric(10,2) PK with source text `1.5` is stored as
+        // `1.50`. The key column must echo the SOURCE text `1.5` so the
+        // caller's diff (keyed on raw source text) matches — projecting
+        // CAST(pk AS TEXT) would yield `1.50` and false-report missing.
+        let rows = vec![SourceRow {
+            pk_value: "1.5",
+            columns: vec![("v", "TEXT", Some("x"))],
+        }];
+        let sql = build_batch_query("\"t\"", "id", "numeric(10,2)", &rows, true);
+        assert!(
+            sql.contains(
+                "WHEN \"id\" IS NOT DISTINCT FROM CAST('1.5' AS numeric(10,2)) THEN '1.5'"
+            ),
+            "key column must echo verbatim source text '1.5': {sql}"
+        );
+        // The target's canonical form must NOT be what we key on.
+        assert!(
+            !sql.contains("CAST(\"id\" AS TEXT)"),
+            "must not project target-canonical PK text: {sql}"
+        );
     }
 
     #[test]
@@ -946,11 +1073,11 @@ mod tests {
             columns: vec![("v", "TEXT", Some("x"))],
         }];
         let sql = build_batch_query("\"t\"", "id", "UUID", &rows, true);
-        // PK literal recast in both the CASE arm and the IN list.
+        // PK literal recast in: key-CASE arm, match-CASE arm, and IN list.
         assert_eq!(
             sql.matches("CAST('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' AS UUID)")
                 .count(),
-            2,
+            3,
             "{sql}"
         );
     }

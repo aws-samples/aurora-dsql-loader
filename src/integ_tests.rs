@@ -4998,6 +4998,91 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: `load --verify=full` on a table whose PRIMARY KEY is a type
+    /// the target canonicalizes (numeric scale, uuid case) must verify as
+    /// `Match`. L3 keys its row diff on the verbatim source PK text; if the
+    /// query projected `CAST(pk AS TEXT)` (target-canonical) instead, a source
+    /// PK `1.5` stored as `1.50` would miss the lookup and false-report
+    /// `ValueRowMissingAtTarget` on a faithful load.
+    ///
+    /// `#[ignore]` — needs a real DSQL cluster + IAM (CI `e2e-dsql`). SQLite
+    /// doesn't canonicalize numeric scale, so only DSQL exercises the gap.
+    #[tokio::test]
+    #[ignore]
+    async fn pgdump_load_verify_full_canonicalizing_pk_matches() -> anyhow::Result<()> {
+        let dsql_endpoint = std::env::var("LOADER_DSQL_E2E_ENDPOINT").map_err(|_| {
+            anyhow::anyhow!("LOADER_DSQL_E2E_ENDPOINT must be set (<cluster>.dsql.<region>.on.aws)")
+        })?;
+        let dsql_region =
+            std::env::var("LOADER_DSQL_E2E_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        anyhow::ensure!(
+            !dsql_endpoint.is_empty(),
+            "LOADER_DSQL_E2E_ENDPOINT is empty"
+        );
+
+        let dsql_pool = build_dsql_pool(
+            PoolArgsBuilder::default()
+                .endpoint(&dsql_endpoint)
+                .region(&dsql_region)
+                .username("admin")
+                .build()?,
+        )
+        .await?;
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let table = format!("e2e_canonpk_{suffix}");
+
+        // numeric(10,2) PK: source text `1.5` is stored canonical as `1.50`.
+        dsql_pool
+            .execute_query(&format!(
+                "CREATE TABLE {table} (id numeric(10,2) PRIMARY KEY, note text)"
+            ))
+            .await?;
+
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.{table} (id, note) FROM stdin;")?;
+        writeln!(f, "1.5\talpha")?;
+        writeln!(f, "2.675\tbeta")?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let mut args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            &table,
+            dsql_pool.clone(),
+        );
+        args.verify = VerifyMode::Full;
+
+        let result = run_load(args).await?;
+
+        let v = result.verify.expect("verify=full must populate verify");
+        assert_eq!(
+            v.verdict,
+            crate::verify::VerifyVerdict::Match,
+            "canonicalizing PK must verify as Match, got {:?} (l3_details={:?})",
+            v.verdict,
+            v.l3_details,
+        );
+
+        // Guard against a trivial pass: prove the PK actually canonicalized
+        // (so the source-text echo genuinely had to differ from the target's
+        // CAST(pk AS TEXT)). Source `1.5` must be stored as `1.50`.
+        let (stored_pk,): (String,) = sqlx::query_as(&format!(
+            "SELECT id::text FROM {table} WHERE note = 'alpha'"
+        ))
+        .fetch_one(&dsql_pool)
+        .await?;
+        assert_eq!(
+            stored_pk, "1.50",
+            "PK must have canonicalized 1.5→1.50 (else the test isn't exercising the gap)"
+        );
+
+        let _ = dsql_pool
+            .execute_query(&format!("DROP TABLE IF EXISTS {table}"))
+            .await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn pgdump_errors_on_column_set_mismatch() -> anyhow::Result<()> {
         // Target table has an extra column not present in the dump's COPY clause.

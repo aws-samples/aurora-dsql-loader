@@ -617,15 +617,41 @@ fn print_verify_detail(v: &VerifyOutcome, nested: bool) {
         failed = v.records_failed,
     );
 
-    // First offending PKs (capped) so the operator can inspect them.
+    // First offending PKs (capped) so the operator can inspect them. PK
+    // values are dump ROW data (never run through identifier validation), so
+    // defang control/bidi bytes before they hit the terminal — a crafted dump
+    // could otherwise smuggle an ANSI escape or RTL-override to stdout.
     if let Some(d) = &v.l3_details {
         if !d.mismatch_pks.is_empty() {
-            println!("{indent}  mismatched PKs: {}", d.mismatch_pks.join(", "));
+            println!(
+                "{indent}  mismatched PKs: {}",
+                defang_pk_list(&d.mismatch_pks)
+            );
         }
         if !d.missing_pks.is_empty() {
-            println!("{indent}  missing PKs: {}", d.missing_pks.join(", "));
+            println!("{indent}  missing PKs: {}", defang_pk_list(&d.missing_pks));
         }
     }
+}
+
+/// Render offending PK values for the terminal with control and bidi/format
+/// bytes escaped (reusing the `list-tables` defang set), so untrusted dump row
+/// data can't reorder or hide output. Comma-joined for the report line.
+fn defang_pk_list(pks: &[String]) -> String {
+    pks.iter()
+        .map(|pk| {
+            pk.chars()
+                .map(|c| {
+                    if c.is_control() || aurora_dsql_loader::runner::is_bidi_or_format_char(c) {
+                        c.escape_default().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One-line CLI summary per VerifyVerdict.
@@ -662,7 +688,12 @@ fn format_verdict(v: &VerifyVerdict) -> String {
             format!("MISSING AT TARGET {n} row(s) — source primary key not found in target")
         }
         VerifyVerdict::ValueCheckSkipped => {
-            "SKIPPED value check — no single-column primary/unique key to align rows".to_string()
+            // Covers every reason L3 couldn't align rows: no single-column
+            // primary/unique key, the key absent from the COPY set, or a
+            // non-pgdump format. Stay general — a specific cause here can
+            // contradict the schema line (which may show a key IS present).
+            "SKIPPED value check — could not align source rows to the target by primary key"
+                .to_string()
         }
         _ => format!("UNKNOWN VERDICT: {v:?}"),
     }
