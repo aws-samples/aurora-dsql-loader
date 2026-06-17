@@ -280,7 +280,27 @@ Resume automatically retries failed chunks and skips completed ones. For safety 
 
 ## Verification
 
-`--verify=count` cross-checks row counts after a load and reports one verdict per table: `Match`, `LoaderDropped(N)`, `MissingTarget(N)`, `ExtraTarget(N)`, `RowsConflictedAtTarget(N)`, or `SkippedNoExactSourceCount` (csv/tsv). Any verdict other than `Match` or `SkippedNoExactSourceCount` exits non-zero. Default: `off` for `load`, `count` for `migrate`. Assumes the loader is the sole writer to the target during the run.
+After a load, `--verify` cross-checks what landed and prints one verdict per table. Pick the level by how much assurance you need vs. how much extra time you'll spend.
+
+| `--verify` | What it confirms | Cost |
+|------------|------------------|------|
+| `off` | Nothing (load only). | None. |
+| `count` | **No rows were lost.** Source row count = rows loaded + rows that failed, and the target table grew by exactly the number loaded. Also confirms the target's columns match the file and it has a primary/unique key. | Two `COUNT(*)` per table. Negligible. |
+| `full` | Everything `count` does, **plus every value landed correctly.** Each row is re-read from the source and compared to the target by primary key, letting the database decide equality (so `1.50` vs `1.5`, JSON key order, timestamp precision, etc. are not false alarms). | One extra full read of each table — roughly doubles load time. Opt-in. |
+
+Default: `off` for `load`, `count` for `migrate`. Both `count` and `full` assume the loader is the sole writer to the target during the run.
+
+**Verdicts** (anything but `Match`, `SkippedNoExactSourceCount`, or `ValueCheckSkipped` exits non-zero, so it fails CI/scripts):
+
+- `Match` — clean.
+- `LoaderDropped(N)` — rows lost before the database (parser/chunker issue).
+- `MissingTarget(N)` / `ExtraTarget(N)` — target grew by less / more than loaded (concurrent writer?).
+- `RowsConflictedAtTarget(N)` — N rows hit `ON CONFLICT` under `do-nothing`/`do-update` (re-run with `--verify=off` if that's an intended idempotent re-apply).
+- `ValueMismatch(N)` / `ValueRowMissingAtTarget(N)` — *(`full` only)* N rows differ in value / are absent at the target; the report lists the offending primary keys.
+- `SkippedNoExactSourceCount` — csv/tsv have no exact source count, so row-count checks can't run.
+- `ValueCheckSkipped` — *(`full` only)* no single-column primary/unique key to align rows by, so the value check couldn't run (explicit, never a silent pass).
+
+`full` verifies that the target faithfully reproduces what the loader read from your file — it catches load, transport, and type-coercion errors, but trusts the reader to have decoded the file correctly (it does not re-validate against the original live source).
 
 ## Performance Tuning
 
