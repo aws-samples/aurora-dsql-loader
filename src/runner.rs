@@ -295,9 +295,8 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
             )
             .await?;
             if run_value_check {
-                let details =
-                    matches!(outcome, crate::verify::L3Outcome::Ran { .. }).then_some(details);
-                (Some(outcome), Some(sc), details)
+                let (l3, details) = outcome.with_details(details);
+                (l3, Some(sc), details)
             } else {
                 (None, Some(sc), None)
             }

@@ -34,14 +34,15 @@ pub enum SqlType {
     /// `jsonb` — canonicalizes input (key order / whitespace) but **has `=`**,
     /// so L3 compares it natively via `CAST('src' AS jsonb)`. (A text compare
     /// would false-mismatch on the canonicalization.) DSQL supports it
-    /// natively; dsql-lint >=0.2.6 preserves it.
+    /// natively and dsql-lint preserves it (the Cargo.toml dep floor pins the
+    /// version that stopped rewriting it to `json`).
     Jsonb,
 }
 
 /// Escape a value for a single-quoted SQL string literal (doubles embedded
 /// quotes). Shared between the worker's INSERT generation and verify's
 /// recast-compare so the two paths escape identically.
-pub fn escape_sql_literal(value: &str) -> String {
+pub(crate) fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
@@ -55,7 +56,7 @@ pub fn escape_sql_literal(value: &str) -> String {
 /// (e.g. `character varying(5)`), which carries the length and so casts
 /// faithfully; those names don't match here, so verify always casts. Bare and
 /// parameterized-cast yield the same stored comparison either way.
-pub fn inserts_as_bare_literal(pg_type: &str) -> bool {
+pub(crate) fn inserts_as_bare_literal(pg_type: &str) -> bool {
     matches!(pg_type, "TEXT" | "VARCHAR" | "CHAR")
 }
 
@@ -71,7 +72,7 @@ pub fn inserts_as_bare_literal(pg_type: &str) -> bool {
 /// on both. (SQLite isn't Postgres, so the worker bypasses this and emits a
 /// bare literal there; verify still recasts so its comparison matches the
 /// affinity-coerced stored value.)
-pub fn recast_literal(pg_type: &str, value: &str) -> String {
+pub(crate) fn recast_literal(pg_type: &str, value: &str) -> String {
     let lit = format!("'{}'", escape_sql_literal(value));
     if inserts_as_bare_literal(pg_type) {
         lit

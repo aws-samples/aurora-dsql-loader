@@ -285,7 +285,7 @@ After a load, `--verify` cross-checks what landed and prints one verdict per tab
 | `--verify` | What it confirms | Cost |
 |------------|------------------|------|
 | `off` | Nothing (load only). | None. |
-| `count` | **No rows were lost.** Source row count = rows loaded + rows that failed, and the target table grew by exactly the number loaded. Also confirms the target's columns match the file and it has a primary/unique key. | Two `COUNT(*)` per table. Negligible. |
+| `count` | **No rows were lost.** Source row count = rows loaded + rows that failed, and the target table grew by exactly the number loaded. Also confirms the target's columns match the file and it has a primary/unique key. (csv/tsv have no exact source count, so the row-count check reports `SkippedNoExactSourceCount` — use pgdump or parquet for it.) | Two `COUNT(*)` per table. Negligible. |
 | `full` | Everything `count` does, **plus every value landed correctly.** Each row is re-read from the source and compared to the target by primary key, letting the database decide equality (so `1.50` vs `1.5`, JSON key order, timestamp precision, etc. are not false alarms). | One extra full read of each table — roughly doubles load time. Opt-in. |
 
 Default: `off` for `load`, `count` for `migrate`. Both `count` and `full` assume the loader is the sole writer to the target during the run.

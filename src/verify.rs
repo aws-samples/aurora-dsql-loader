@@ -79,7 +79,7 @@ pub struct L2Counts {
 /// the aggregate counts across all PK batches; `Skipped` means L3 was
 /// requested but could not run (no usable PK / non-exact-count format).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum L3Outcome {
+pub(crate) enum L3Outcome {
     Ran {
         /// True total of rows whose target value diverged, summed across
         /// every batch (not capped — the detail list is capped separately).
@@ -90,6 +90,16 @@ pub enum L3Outcome {
     Skipped,
 }
 
+impl L3Outcome {
+    /// Pair this outcome with its per-PK detail, keeping `details` only when
+    /// L3 actually `Ran` (a `Skipped` run has no PKs to localize). Centralizes
+    /// the "details only when Ran" invariant the migrate and load paths share.
+    pub(crate) fn with_details(self, details: L3Details) -> (Option<L3Outcome>, Option<L3Details>) {
+        let details = matches!(self, L3Outcome::Ran { .. }).then_some(details);
+        (Some(self), details)
+    }
+}
+
 /// Affirmative schema-conformance line (MUST #3): the column set the load
 /// enforced matched the dump's COPY columns, and whether the table has a
 /// primary or unique key. Scoped to **column-set + key presence only** —
@@ -97,6 +107,7 @@ pub enum L3Outcome {
 /// the column set matches via `align_pgdump_schema_to_copy_columns`; deeper
 /// checks are out of scope, see the requirements doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SchemaCheck {
     /// `Some(n)` = the load enforced an n-column COPY set; `None` = not
     /// counted (non-pgdump format has no COPY block to measure), distinct
@@ -113,6 +124,7 @@ pub struct SchemaCheck {
 /// `DETAILS`) is a follow-up. Lists are capped; the verdict magnitude
 /// carries the true total.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct L3Details {
     pub mismatch_pks: Vec<String>,
     pub missing_pks: Vec<String>,

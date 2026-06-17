@@ -39,15 +39,21 @@
   formats up front with a diagnostic that points to `-Fp`, instead of
   failing later with a generic "no COPY block found" after streaming the
   binary file.
-- New `--verify <off|count>` flag on `load` and `migrate`. `count` adds
-  pre/post `count(*)` per loaded table and emits one verdict —
+- New `--verify <off|count|full>` flag on `load` and `migrate`. `count` adds
+  pre/post `count(*)` per loaded table plus an affirmative schema check
+  (column set + primary/unique key present), and emits one verdict —
   `Match`, `LoaderDropped(N)`, `MissingTarget(N)`, `ExtraTarget(N)`,
-  `RowsConflictedAtTarget(N)`, or `SkippedNoExactSourceCount`. Source-row
-  counting (L1) runs parser-side regardless of the flag for pgdump and
-  parquet. Defaults: `load=off` (avoid `count(*)` on populated targets),
-  `migrate=count` (fresh-cluster pre-counts are sub-ms). Any verdict
-  other than `Match` or `SkippedNoExactSourceCount` exits non-zero.
-  Assumes the loader is the sole writer to the target during the run.
+  `RowsConflictedAtTarget(N)`, or `SkippedNoExactSourceCount`. `full` adds
+  per-row value verification (L3): each row is re-read from the source and
+  compared to the target by primary key via a server-side recast, adding the
+  verdicts `ValueMismatch(N)`, `ValueRowMissingAtTarget(N)`, and
+  `ValueCheckSkipped` (and listing the offending PKs). It costs roughly one
+  extra full read of each table. Source-row counting (L1) runs parser-side
+  regardless of the flag for pgdump and parquet. Defaults: `load=off` (avoid
+  `count(*)` on populated targets), `migrate=count` (fresh-cluster pre-counts
+  are sub-ms). Any verdict other than `Match`, `SkippedNoExactSourceCount`, or
+  `ValueCheckSkipped` exits non-zero. Assumes the loader is the sole writer to
+  the target during the run.
 
 ### Changed
 - A worker-crash that leaves a chunk result file unwritten now fails
