@@ -13,7 +13,10 @@ use crate::migrate::transform::{Diagnostic, TransformResult, transform_ddl};
 use crate::runner::{
     Format, LoadArgs, OnConflict, VerifyMode, run_load_with_pool_for_pgdump_block,
 };
-use crate::verify::{L2Counts, VerifyInputs, VerifyOutcome, count_table_rows};
+use crate::verify::{
+    L2Counts, L3Outcome, VerifyInputs, VerifyOutcome, count_table_rows, schema_check,
+    verify_table_values,
+};
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use std::collections::HashMap;
@@ -221,35 +224,39 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         // verify_error against an empty TableLoadSummary so the report
         // shows which table blocked. The cluster is unchanged for this
         // block (`apply_ddl` already ran but no INSERTs hit yet).
+        // `Count` and `Full` both need the L2 pre-count; `Full` adds L3
+        // on top after the load (wired below). `Off` skips L2 entirely.
         let target_pre = match args.verify {
-            VerifyMode::Count => match count_table_rows(&pool, &block.schema, &block.table).await {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    tables.push(TableLoadSummary {
-                        schema: block.schema.clone(),
-                        table: block.table.clone(),
-                        records_loaded: 0,
-                        records_failed: 0,
-                        source_rows: None,
-                        persisted_manifest_dir: None,
-                        verify: None,
-                        verify_error: Some(format!(
-                            "verify=count: pre-count failed (load not started): {e:#}"
-                        )),
-                    });
-                    // Mirror the post-count halt: mark halted so the bars
-                    // abandon instead of finishing "done".
-                    if let Some(mp) = &migrate_progress {
-                        mp.finish_halted(&format!(
-                            "{schema}.{table}: verify=count pre-count failed",
-                            schema = block.schema,
-                            table = block.table,
-                        ));
+            VerifyMode::Count | VerifyMode::Full => {
+                match count_table_rows(&pool, &block.schema, &block.table).await {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        tables.push(TableLoadSummary {
+                            schema: block.schema.clone(),
+                            table: block.table.clone(),
+                            records_loaded: 0,
+                            records_failed: 0,
+                            source_rows: None,
+                            persisted_manifest_dir: None,
+                            verify: None,
+                            verify_error: Some(format!(
+                                "verify: pre-count failed (load not started): {e:#}"
+                            )),
+                        });
+                        // Mirror the post-count halt: mark halted so the bars
+                        // abandon instead of finishing "done".
+                        if let Some(mp) = &migrate_progress {
+                            mp.finish_halted(&format!(
+                                "{schema}.{table}: verify pre-count failed",
+                                schema = block.schema,
+                                table = block.table,
+                            ));
+                        }
+                        halted = true;
+                        break;
                     }
-                    halted = true;
-                    break;
                 }
-            },
+            }
             VerifyMode::Off => None,
         };
 
@@ -274,32 +281,26 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
 
         // Post-count failure: load committed, count(*) failed. Surface
         // the error against a populated summary so the operator sees what
-        // landed and which table needs manual verification.
+        // landed and which table needs manual verification. `Count` and
+        // `Full` both run the L2 post-count + the affirmative schema check;
+        // `Full` additionally runs L3 value verification.
         let (verify, verify_error) = match args.verify {
-            VerifyMode::Count => match count_table_rows(&pool, &block.schema, &block.table).await {
-                Ok(post) => {
-                    let target_counts = target_pre.map(|pre| L2Counts { pre, post });
-                    let outcome = VerifyOutcome::from_inputs(
-                        block.schema.clone(),
-                        block.table.clone(),
-                        VerifyInputs {
-                            mode: args.verify,
-                            on_conflict: args.on_conflict,
-                            source_rows: r.source_rows,
-                            records_loaded: r.records_loaded,
-                            records_failed,
-                            target_counts,
-                        },
-                    );
-                    (Some(outcome), None)
+            VerifyMode::Count | VerifyMode::Full => {
+                match build_table_verify(
+                    &args,
+                    &pool,
+                    reader.clone(),
+                    block,
+                    &r,
+                    records_failed,
+                    target_pre,
+                )
+                .await
+                {
+                    Ok(outcome) => (Some(outcome), None),
+                    Err(e) => (None, Some(format!("verify failed (load completed): {e:#}"))),
                 }
-                Err(e) => (
-                    None,
-                    Some(format!(
-                        "verify=count: post-count failed (load completed): {e:#}"
-                    )),
-                ),
-            },
+            }
             VerifyMode::Off => (None, None),
         };
 
@@ -325,7 +326,7 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
                     )
                 } else {
                     format!(
-                        "{schema}.{table}: verify=count post-count failed",
+                        "{schema}.{table}: post-load verification failed",
                         schema = block.schema,
                         table = block.table,
                     )
@@ -395,6 +396,50 @@ async fn open_source(
             )
         }
     })
+}
+
+/// Build the per-table [`VerifyOutcome`] after a load completes: the L2
+/// post-count, the affirmative schema check (both `Count` and `Full`), and
+/// — under `Full` — the L3 value verification (reusing the already-open
+/// `reader`, no re-open). Any DB error here propagates as a single
+/// `verify failed` so the caller records it against the table.
+async fn build_table_verify(
+    args: &MigrateArgs,
+    pool: &Pool,
+    reader: Arc<dyn ByteReader>,
+    block: &crate::formats::pgdump::CopyBlock,
+    r: &crate::runner::LoadResult,
+    records_failed: u64,
+    target_pre: Option<u64>,
+) -> Result<VerifyOutcome> {
+    let post = count_table_rows(pool, &block.schema, &block.table).await?;
+    let target_counts = target_pre.map(|pre| L2Counts { pre, post });
+    let schema = schema_check(pool, block).await?;
+
+    let (l3, l3_details) = if args.verify == VerifyMode::Full {
+        let (outcome, details) =
+            verify_table_values(pool, reader, block, args.chunk_size_bytes).await?;
+        let details = matches!(outcome, L3Outcome::Ran { .. }).then_some(details);
+        (Some(outcome), details)
+    } else {
+        (None, None)
+    };
+
+    Ok(VerifyOutcome::from_inputs(
+        block.schema.clone(),
+        block.table.clone(),
+        VerifyInputs {
+            mode: args.verify,
+            on_conflict: args.on_conflict,
+            source_rows: r.source_rows,
+            records_loaded: r.records_loaded,
+            records_failed,
+            target_counts,
+            l3,
+        },
+        Some(schema),
+        l3_details,
+    ))
 }
 
 /// Build the `LoadArgs` for a single COPY block. Forwards the migrate
@@ -964,6 +1009,74 @@ COPY public.events (id, label) FROM stdin;
             );
             assert_eq!(v.source_rows, Some(t.records_loaded));
         }
+    }
+
+    /// verify=Full happy path: every table reports `Match`, the affirmative
+    /// `schema_check` is populated (column-set + PK presence), and the L3
+    /// value pass found no divergence (empty `l3_details`).
+    #[tokio::test]
+    async fn run_migrate_verify_full_clean_load_matches_with_schema_check() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        let dump = write_dump(
+            "\
+CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);
+COPY public.users (id, email) FROM stdin;
+1\ta@example.com
+2\tb@example.com
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.verify = VerifyMode::Full;
+
+        let report = run_migrate(args).await.unwrap();
+        let v = report.tables[0].verify.as_ref().unwrap();
+        assert_eq!(v.verdict, VerifyVerdict::Match);
+        assert_eq!(
+            v.schema_check,
+            Some(crate::verify::SchemaCheck {
+                columns_matched: Some(2),
+                pk_present: true,
+            })
+        );
+        // Clean load → no per-PK detail recorded.
+        assert!(
+            v.l3_details
+                .as_ref()
+                .is_none_or(|d| d.mismatch_pks.is_empty() && d.missing_pks.is_empty())
+        );
+    }
+
+    /// verify=Full on a table with no primary key: L3 cannot row-align, so
+    /// the verdict is `ValueCheckSkipped` (explicit "not checked", never a
+    /// silent pass), while the affirmative schema_check still reports
+    /// `pk_present: false`. Pins that the Full wiring reaches L3 and routes
+    /// the skip through to the summary.
+    #[tokio::test]
+    async fn run_migrate_verify_full_no_pk_skips_value_check() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        let dump = write_dump(
+            "\
+CREATE TABLE logs (id INTEGER, msg TEXT);
+COPY public.logs (id, msg) FROM stdin;
+1\thello
+2\tworld
+\\.
+",
+        );
+        let mut args = args_with_pool(&file_uri(dump.path()), pool, false);
+        args.verify = VerifyMode::Full;
+
+        let report = run_migrate(args).await.unwrap();
+        let v = report.tables[0].verify.as_ref().unwrap();
+        assert_eq!(v.verdict, VerifyVerdict::ValueCheckSkipped);
+        assert_eq!(
+            v.schema_check,
+            Some(crate::verify::SchemaCheck {
+                columns_matched: Some(2),
+                pk_present: false,
+            })
+        );
     }
 
     /// verify=Off → TableLoadSummary.verify is None, no count(*) runs.

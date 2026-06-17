@@ -28,6 +28,56 @@ pub enum SqlType {
     Interval,
     Uuid,
     Bytea,
+    /// `json` — preserves verbatim input text but has **no `=` operator**, so
+    /// L3 compares it as `CAST(col AS TEXT)` against the source text.
+    Json,
+    /// `jsonb` — canonicalizes input (key order / whitespace) but **has `=`**,
+    /// so L3 compares it natively via `CAST('src' AS jsonb)`. (A text compare
+    /// would false-mismatch on the canonicalization.) DSQL supports it
+    /// natively; dsql-lint >=0.2.6 preserves it.
+    Jsonb,
+}
+
+/// Escape a value for a single-quoted SQL string literal (doubles embedded
+/// quotes). Shared between the worker's INSERT generation and verify's
+/// recast-compare so the two paths escape identically.
+pub fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+/// Whether a column of the given Postgres type name is written as a bare
+/// `'literal'` (TEXT family) rather than `CAST('literal' AS type)`.
+///
+/// Keyed on the worker's `to_postgres()` names (`TEXT`/`VARCHAR`/`CHAR`): the
+/// worker has only the *unparameterized* name, and `CAST('ab' AS CHAR)` would
+/// truncate to `char(1)` — so it inserts the TEXT family bare and lets the
+/// column coerce. Verify recasts through the column's *parameterized* name
+/// (e.g. `character varying(5)`), which carries the length and so casts
+/// faithfully; those names don't match here, so verify always casts. Bare and
+/// parameterized-cast yield the same stored comparison either way.
+pub fn inserts_as_bare_literal(pg_type: &str) -> bool {
+    matches!(pg_type, "TEXT" | "VARCHAR" | "CHAR")
+}
+
+/// Render `value` as the SQL literal a Postgres/DSQL load writes for a
+/// column of `pg_type` (a [`SqlType::to_postgres`] name): bare `'v'` for the
+/// TEXT family, `CAST('v' AS pg_type)` otherwise, so the server's input
+/// function owns the coercion.
+///
+/// Single source of truth for two call sites that must agree: the worker's
+/// INSERT (Postgres path) writes the value through this, and verify's
+/// recast-compare rebuilds the same literal to compare against — keyed on
+/// the identical `to_postgres()` name so a source value coerces the same way
+/// on both. (SQLite isn't Postgres, so the worker bypasses this and emits a
+/// bare literal there; verify still recasts so its comparison matches the
+/// affinity-coerced stored value.)
+pub fn recast_literal(pg_type: &str, value: &str) -> String {
+    let lit = format!("'{}'", escape_sql_literal(value));
+    if inserts_as_bare_literal(pg_type) {
+        lit
+    } else {
+        format!("CAST({lit} AS {pg_type})")
+    }
 }
 
 impl SqlType {
@@ -51,6 +101,8 @@ impl SqlType {
             SqlType::Interval => "INTERVAL",
             SqlType::Uuid => "UUID",
             SqlType::Bytea => "BYTEA",
+            SqlType::Json => "JSON",
+            SqlType::Jsonb => "JSONB",
         }
     }
 
@@ -273,6 +325,8 @@ pub async fn query_table_schema(
             "INTERVAL" => SqlType::Interval,
             "UUID" => SqlType::Uuid,
             "BYTEA" => SqlType::Bytea,
+            "JSON" => SqlType::Json,
+            "JSONB" => SqlType::Jsonb,
             _ => SqlType::Text, // Default to TEXT for unsupported types
         };
 
@@ -514,6 +568,26 @@ impl SchemaInferrer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recast_literal_bare_for_text_family_else_cast() {
+        // TEXT family → bare escaped literal (the worker inserts bare, so
+        // verify compares bare); everything else → CAST through the type.
+        assert_eq!(recast_literal("TEXT", "alice"), "'alice'");
+        assert_eq!(recast_literal("VARCHAR", "alice"), "'alice'");
+        assert_eq!(recast_literal("CHAR", "x"), "'x'");
+        assert_eq!(recast_literal("NUMERIC", "1.5"), "CAST('1.5' AS NUMERIC)");
+        assert_eq!(
+            recast_literal("TIMESTAMP WITH TIME ZONE", "2024-01-01Z"),
+            "CAST('2024-01-01Z' AS TIMESTAMP WITH TIME ZONE)"
+        );
+        // Embedded quotes are doubled on both paths.
+        assert_eq!(recast_literal("TEXT", "o'brien"), "'o''brien'");
+        assert_eq!(
+            recast_literal("JSONB", "{\"k\":\"v\"}"),
+            "CAST('{\"k\":\"v\"}' AS JSONB)"
+        );
+    }
 
     #[test]
     fn test_infer_value_types() {

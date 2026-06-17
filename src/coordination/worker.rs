@@ -49,26 +49,6 @@ fn apply_field_exclusion(
     (filtered, mismatch, first_mismatch)
 }
 
-/// Type category for SQL type conversion strategy
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TypeCategory {
-    /// All types except text - bind as string and use CAST() in SQL for type conversion
-    /// This ensures PostgreSQL is the single source of truth for type validation
-    StringCast,
-    /// Text types with direct string binding (TEXT, VARCHAR, CHAR)
-    DirectString,
-}
-
-impl TypeCategory {
-    /// Classify a SQL type into its conversion category
-    fn from_sql_type(col_type: &str) -> Self {
-        match col_type {
-            "TEXT" | "VARCHAR" | "CHAR" => TypeCategory::DirectString,
-            _ => TypeCategory::StringCast,
-        }
-    }
-}
-
 /// Result of executing a batch of records
 #[derive(Debug)]
 struct BatchResult {
@@ -541,22 +521,16 @@ impl Worker {
                         return "NULL".to_string();
                     };
 
-                    let escaped = Self::escape_sql_string(field);
-                    let value_expr = format!("'{}'", escaped);
-
-                    // PostgreSQL only: wrap in CAST() for non-text columns
-                    // so the server is the single source of truth for type
-                    // coercion. SQLite handles literals natively.
-                    schema
-                        .as_ref()
-                        .and_then(|s| s.columns.get(col_idx))
-                        .filter(|col| {
-                            use_pg_cast
-                                && TypeCategory::from_sql_type(&col.col_type)
-                                    == TypeCategory::StringCast
-                        })
-                        .map(|col| format!("CAST({} AS {})", value_expr, col.col_type))
-                        .unwrap_or(value_expr)
+                    // PostgreSQL only: recast non-text columns so the server
+                    // is the single source of truth for type coercion (shared
+                    // with verify's recast-compare). SQLite handles literals
+                    // natively, so emit a bare escaped literal there.
+                    match schema.as_ref().and_then(|s| s.columns.get(col_idx)) {
+                        Some(col) if use_pg_cast => {
+                            crate::db::schema::recast_literal(&col.col_type, field)
+                        }
+                        _ => format!("'{}'", crate::db::schema::escape_sql_literal(field)),
+                    }
                 })
                 .collect();
             value_groups.push(format!("({})", values.join(", ")));
@@ -685,12 +659,6 @@ impl Worker {
                 }
             }
         }
-    }
-
-    /// Escape a string value for use in SQL
-    /// Handles single quotes by doubling them (SQL standard escaping)
-    fn escape_sql_string(value: &str) -> String {
-        value.replace('\'', "''")
     }
 
     /// Build the ON CONFLICT clause based on the conflict resolution mode

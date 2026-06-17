@@ -19,7 +19,9 @@ pub use crate::migrate::{
 // Re-export the verification surface — `VerifyMode` is set by the CLI on
 // `LoadArgs`, and `VerifyOutcome` / `VerifyVerdict` ship as fields of
 // `LoadResult` and `TableLoadSummary`.
-pub use crate::verify::{L2Counts, VerifyMode, VerifyOutcome, VerifyVerdict};
+pub use crate::verify::{
+    L2Counts, L3Details, SchemaCheck, VerifyMode, VerifyOutcome, VerifyVerdict,
+};
 
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
@@ -117,8 +119,9 @@ pub struct LoadArgs {
     // Conflict resolution strategy
     pub on_conflict: OnConflict,
 
-    /// L2 toggle. Source-row counting runs parser-side regardless;
-    /// `Count` adds pre/post `count(*)` and a per-table verdict. CLI
+    /// Verification toggle. Source-row counting runs parser-side
+    /// regardless; `Count` adds pre/post `count(*)` + the affirmative schema
+    /// check; `Full` additionally runs the per-row L3 value check. CLI
     /// default: `load`=Off, `migrate`=Count.
     pub verify: VerifyMode,
 
@@ -220,26 +223,28 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     // meaningful. Skip on `--if-not-exists` (table may not exist yet, and a
     // re-run would mis-classify as ExtraTarget) and on csv/tsv (classify()
     // short-circuits to SkippedNoExactSourceCount, wasting two count(*)).
-    let l2_runs = args.verify == VerifyMode::Count
+    // L2 runs under Count and Full alike (Full implies Count). Off skips it.
+    let verify_on = matches!(args.verify, VerifyMode::Count | VerifyMode::Full);
+    let l2_runs = verify_on
         && !args.create_table_if_missing
         && matches!(args.format, Format::PgDump | Format::Parquet);
     let target_pre = if l2_runs {
         Some(
             verify::count_table_rows(&pool, &args.schema, &args.target_table)
                 .await
-                .context("verify=count: failed to read target pre-count")?,
+                .context("verify: failed to read target pre-count")?,
         )
     } else {
         None
     };
 
-    if args.verify == VerifyMode::Count && !l2_runs {
-        // Operator opted into count(*) but the gating conditions skipped
+    if verify_on && !l2_runs {
+        // Operator opted into verification but the gating conditions skipped
         // L2; surface that instead of silently returning Match.
         tracing::info!(
             schema = %args.schema,
             table = %args.target_table,
-            "verify=count: L2 skipped (--if-not-exists or csv/tsv); L1 only"
+            "verify: L2 skipped (--if-not-exists or csv/tsv); L1 only"
         );
     }
 
@@ -247,15 +252,20 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     let target_table = args.target_table.clone();
     let on_conflict = args.on_conflict;
     let verify_mode = args.verify;
+    // Captured for the L3 re-read (args is moved into run_load_with_pool).
+    let source_uri = args.source_uri.clone();
+    let region = args.region.clone();
+    let format = args.format;
+    let chunk_size_bytes = args.chunk_size_bytes;
 
     let mut result = run_load_with_pool(pool.clone(), args).await?;
 
-    if verify_mode == VerifyMode::Count {
+    if verify_on {
         let target_post = if l2_runs {
             Some(
                 verify::count_table_rows(&pool, &schema, &target_table)
                     .await
-                    .context("verify=count: failed to read target post-count")?,
+                    .context("verify: failed to read target post-count")?,
             )
         } else {
             None
@@ -263,6 +273,36 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
         let target_counts = target_pre
             .zip(target_post)
             .map(|(pre, post)| L2Counts { pre, post });
+
+        // Affirmative schema check runs under both Count and Full (the
+        // MUST #3 floor, matching migrate); the per-row L3 value check runs
+        // under Full only. The load path resolves the COPY block itself
+        // (unlike migrate, which pre-resolved it). `l3`/`l3_details` ride
+        // only under Full (and details only when L3 actually Ran).
+        let run_value_check = verify_mode == VerifyMode::Full;
+        let (l3, schema_check, l3_details) = {
+            let (sc, outcome, details) = verify::run_load_value_check(
+                &pool,
+                verify::LoadVerifyTarget {
+                    source_uri: &source_uri,
+                    region: &region,
+                    schema: &schema,
+                    table: &target_table,
+                    is_pgdump: format == Format::PgDump,
+                    run_value_check,
+                    chunk_size_bytes,
+                },
+            )
+            .await?;
+            if run_value_check {
+                let details =
+                    matches!(outcome, crate::verify::L3Outcome::Ran { .. }).then_some(details);
+                (Some(outcome), Some(sc), details)
+            } else {
+                (None, Some(sc), None)
+            }
+        };
+
         result.verify = Some(VerifyOutcome::from_inputs(
             schema,
             target_table,
@@ -273,7 +313,10 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
                 records_loaded: result.records_loaded,
                 records_failed: result.records_failed,
                 target_counts,
+                l3,
             },
+            schema_check,
+            l3_details,
         ));
     }
 
@@ -532,13 +575,14 @@ fn validate_load_args(args: &LoadArgs) -> Result<()> {
         }
     }
 
-    // verify=count's L2 needs target_pre sampled at the start of the
-    // load; on resume the manifest already holds rows from the original
-    // run, so post-pre would be < records_loaded and classify produces a
-    // false MissingTarget/RowsConflictedAtTarget.
-    if args.resume_job_id.is_some() && args.verify == VerifyMode::Count {
+    // L2 (run under both Count and Full) needs target_pre sampled at the
+    // start of the load; on resume the manifest already holds rows from the
+    // original run, so post-pre would be < records_loaded and classify
+    // produces a false MissingTarget/RowsConflictedAtTarget. Full also
+    // re-reads only the resumed portion for L3, compounding the problem.
+    if args.resume_job_id.is_some() && matches!(args.verify, VerifyMode::Count | VerifyMode::Full) {
         anyhow::bail!(
-            "--verify=count cannot be combined with --resume-job-id: pre-count \
+            "--verify (count/full) cannot be combined with --resume-job-id: pre-count \
              would not include rows from the original run. Re-run with --verify=off."
         );
     }
@@ -751,17 +795,28 @@ mod tests {
         assert!(err.contains("create_table_if_missing"), "{err}");
     }
 
-    /// Resume + verify=count would mis-classify: pre-count is sampled
-    /// at resume start but records_loaded sums the entire manifest, so
-    /// post − pre < records_loaded → false MissingTarget.
+    /// Resume + verify (count OR full) would mis-classify: pre-count is
+    /// sampled at resume start but records_loaded sums the entire manifest,
+    /// so post − pre < records_loaded → false MissingTarget. Both L2-running
+    /// modes must be rejected.
     #[test]
-    fn resume_with_verify_count_is_rejected_at_validation() {
+    fn resume_with_verify_count_or_full_is_rejected_at_validation() {
+        for mode in [VerifyMode::Count, VerifyMode::Full] {
+            let mut args = sample_pgdump_args();
+            args.resume_job_id = Some("abc-123".into());
+            args.verify = mode;
+            let err = validate_load_args(&args).unwrap_err().to_string();
+            assert!(err.contains("--resume-job-id"), "mode {mode:?}: {err}");
+        }
+    }
+
+    /// Resume + verify=off is allowed (no L2 to mis-classify).
+    #[test]
+    fn resume_with_verify_off_is_allowed() {
         let mut args = sample_pgdump_args();
         args.resume_job_id = Some("abc-123".into());
-        args.verify = VerifyMode::Count;
-        let err = validate_load_args(&args).unwrap_err().to_string();
-        assert!(err.contains("--verify=count"), "{err}");
-        assert!(err.contains("--resume-job-id"), "{err}");
+        args.verify = VerifyMode::Off;
+        validate_load_args(&args).unwrap();
     }
 
     #[tokio::test]

@@ -20,9 +20,9 @@ mod tests {
         },
         formats::{
             DelimitedConfig, FileReader, delimited::reader::GenericDelimitedReader,
-            parquet::GenericParquetReader,
+            parquet::GenericParquetReader, pgdump::find_copy_block,
         },
-        io::LocalFileByteReader,
+        io::{ByteReader, LocalFileByteReader},
         runner::{Format, LoadArgs, MigrateArgs, VerifyMode, run_load, run_migrate},
     };
     use arrow::array::*;
@@ -4452,7 +4452,7 @@ mod tests {
         //   events.id       SERIAL PRIMARY KEY    → serial_sequence_idiom
         //                                           + alter_add_primary_key_collapse
         //   events.user_id  REFERENCES            → foreign_key (removed)
-        //   events.payload  JSONB                 → json_type
+        //   events.payload  JSONB                 (preserved — DSQL native)
         //   events_label_idx CREATE INDEX … USING btree
         //                                         → index_async + index_using
         //   events.note     NOT NULL DEFAULT ''   (preserved as-is)
@@ -4551,10 +4551,12 @@ mod tests {
             batch_concurrency: 1,
             chunk_size_bytes: 1024 * 1024,
             on_conflict: OnConflict::Error,
-            // Exercise the migrate default end-to-end: every loaded table
-            // gets a VerifyOutcome and the assertions below pin the verdict
-            // shape we promise (`Match` for both tables on a fresh cluster).
-            verify: VerifyMode::Count,
+            // Exercise the deepest tier end-to-end: `Full` runs L1+L2 +
+            // the affirmative schema check + L3 per-row value verification.
+            // The assertions below pin `Match` for both tables on a fresh
+            // cluster, proving the recast-compare canonicalizes correctly
+            // against real DSQL (the claim SQLite tests cannot make).
+            verify: VerifyMode::Full,
             quiet: true,
             debug: false,
             test_pool: None,
@@ -4585,9 +4587,13 @@ mod tests {
             "UNIQUE should fold via alter_add_unique_collapse, got: {:?}",
             report.ddl_changes
         );
-        assert!(
-            rule_count("json_type") >= 1,
-            "JSONB → JSON rewrite should fire for events.payload, got: {:?}",
+        // DSQL supports JSONB natively (dsql-lint >=0.2.6 dropped the
+        // JSONB→JSON rewrite), so the json_type rule must NOT fire — the
+        // column is preserved as jsonb (asserted on the destination below).
+        assert_eq!(
+            rule_count("json_type"),
+            0,
+            "JSONB must be preserved (no json_type rewrite), got: {:?}",
             report.ddl_changes
         );
         assert!(
@@ -4606,20 +4612,22 @@ mod tests {
         )
         .await?;
 
-        // ── Stage 1.5: per-table verification verdict ───────────────────
-        // verify=Count is on by default; every loaded table must come
-        // back as Match.
+        // ── Stage 1.5: per-table verification verdict (verify=Full) ─────
+        // L1+L2+L3 all ran; every loaded table must come back as Match —
+        // proving the server-side recast-compare canonicalizes the seeded
+        // values (timestamptz µs / jsonb / \N) on real DSQL. The
+        // affirmative schema check must also be populated.
         for t in &report.tables {
             let v = t.verify.as_ref().unwrap_or_else(|| {
                 panic!(
-                    "verify must be Some on {}.{} under default migrate verify=Count",
+                    "verify must be Some on {}.{} under verify=Full",
                     t.schema, t.table
                 )
             });
             assert_eq!(
                 v.verdict,
                 crate::runner::VerifyVerdict::Match,
-                "{}.{} expected Match, got {:?} (source_rows={:?}, loaded={}, failed={}, target_counts={:?})",
+                "{}.{} expected Match, got {:?} (source_rows={:?}, loaded={}, failed={}, target_counts={:?}, l3_details={:?})",
                 t.schema,
                 t.table,
                 v.verdict,
@@ -4627,10 +4635,23 @@ mod tests {
                 v.records_loaded,
                 v.records_failed,
                 v.target_counts,
+                v.l3_details,
             );
             assert!(
                 v.source_rows.is_some(),
                 "pgdump must produce exact source_rows; got None for {}.{}",
+                t.schema,
+                t.table,
+            );
+            let sc = v.schema_check.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "verify=Full must populate schema_check on {}.{}",
+                    t.schema, t.table
+                )
+            });
+            assert!(
+                sc.columns_matched.is_some_and(|n| n > 0) && sc.pk_present,
+                "{}.{}: expected columns_matched>0 + pk_present, got {sc:?}",
                 t.schema,
                 t.table,
             );
@@ -4674,7 +4695,8 @@ mod tests {
             "{users_src} must have exactly 1 UNIQUE constraint"
         );
 
-        // JSONB → JSON: post-migrate column data_type is `json`, not `jsonb`.
+        // JSONB preserved: DSQL supports it natively, so the column stays
+        // `jsonb` (dsql-lint >=0.2.6 no longer rewrites it to `json`).
         let (payload_type,): (String,) = sqlx::query_as(&format!(
             "SELECT data_type FROM information_schema.columns \
              WHERE table_schema='public' AND table_name='{events_src}' AND column_name='payload'"
@@ -4682,8 +4704,8 @@ mod tests {
         .fetch_one(&dsql_pool)
         .await?;
         assert_eq!(
-            payload_type, "json",
-            "{events_src}.payload must be data_type='json' (not 'jsonb')"
+            payload_type, "jsonb",
+            "{events_src}.payload must be preserved as data_type='jsonb'"
         );
 
         // NOT NULL DEFAULT '' preserved on events.note.
@@ -4821,6 +4843,45 @@ mod tests {
         let emails: Vec<&str> = user_rows.iter().map(|u| u.email.as_str()).collect();
         assert_eq!(emails, vec!["a@example.com", "b@example.com"]);
 
+        // ── Stage 4: L3 catches a post-load divergence on real DSQL ─────
+        // The migrate-time verify passed (Match). Now mutate one target
+        // value out from under the loader and re-run L3 directly: it must
+        // flag ValueMismatch and localize the offending PK — a value that
+        // diverges from the source while counts stay intact.
+        {
+            // Find events row (label 'alpha') and corrupt its note. `id` is
+            // BIGINT after the SERIAL→IDENTITY rewrite, so fetch as i64.
+            let (alpha_id,): (i64,) = sqlx::query_as(&format!(
+                "SELECT id FROM {events_src} WHERE label = 'alpha'"
+            ))
+            .fetch_one(&dsql_pool)
+            .await?;
+            dsql_pool
+                .execute_query(&format!(
+                    "UPDATE {events_src} SET note = 'CORRUPTED' WHERE id = {alpha_id}"
+                ))
+                .await?;
+
+            let reader: Arc<dyn ByteReader> = Arc::new(LocalFileByteReader::new(&dump_path));
+            let block = find_copy_block(&*reader, "public", &events_src).await?;
+            let (outcome, details) =
+                crate::verify::verify_table_values(&dsql_pool, reader, &block, 1024 * 1024).await?;
+
+            assert_eq!(
+                outcome,
+                crate::verify::L3Outcome::Ran {
+                    value_mismatches: 1,
+                    rows_missing_at_target: 0
+                },
+                "post-load mutation must surface exactly one value mismatch",
+            );
+            assert_eq!(
+                details.mismatch_pks,
+                vec![alpha_id.to_string()],
+                "L3 must localize the corrupted row's primary key",
+            );
+        }
+
         // ── Cleanup: best-effort (per-run CI cluster is torn down anyway).
         let _ = sqlx::query(&format!(
             "DROP TABLE IF EXISTS {events_src}, {users_src} CASCADE"
@@ -4832,6 +4893,107 @@ mod tests {
             .await;
         let _ = dsql_pool
             .execute_query(&format!("DROP TABLE IF EXISTS {users_src}"))
+            .await;
+        Ok(())
+    }
+
+    /// Regression: `load --verify=full` into columns whose declared
+    /// precision/scale is NARROWER than the source text must still verify as
+    /// `Match`. The load coerces the value to the column's typmod (e.g.
+    /// `numeric(10,2)` stores `1.005`→`1.01`, `timestamp(0)` drops sub-second);
+    /// L3 must recast the source through the column's *parameterized* type so
+    /// it rounds identically. Before the fix L3 recast through the bare type
+    /// name (no scale), keeping `1.005`, and false-mismatched every such row.
+    ///
+    /// `#[ignore]` — needs a real DSQL cluster + IAM (CI `e2e-dsql`). DSQL is
+    /// the type authority here; SQLite can't reproduce typmod coercion.
+    #[tokio::test]
+    #[ignore]
+    async fn pgdump_load_verify_full_typmod_narrower_than_source_matches() -> anyhow::Result<()> {
+        let dsql_endpoint = std::env::var("LOADER_DSQL_E2E_ENDPOINT").map_err(|_| {
+            anyhow::anyhow!("LOADER_DSQL_E2E_ENDPOINT must be set (<cluster>.dsql.<region>.on.aws)")
+        })?;
+        let dsql_region =
+            std::env::var("LOADER_DSQL_E2E_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        anyhow::ensure!(
+            !dsql_endpoint.is_empty(),
+            "LOADER_DSQL_E2E_ENDPOINT is empty"
+        );
+
+        let dsql_pool = build_dsql_pool(
+            PoolArgsBuilder::default()
+                .endpoint(&dsql_endpoint)
+                .region(&dsql_region)
+                .username("admin")
+                .build()?,
+        )
+        .await?;
+
+        // UUID-suffixed table so parallel runs on a shared cluster don't collide.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let table = format!("e2e_typmod_{suffix}");
+
+        // Narrow columns: scale-2 numeric and second-precision timestamps.
+        dsql_pool
+            .execute_query(&format!(
+                "CREATE TABLE {table} (
+                    id    int PRIMARY KEY,
+                    amt   numeric(10,2),
+                    ts0   timestamp(0),
+                    tstz0 timestamptz(0)
+                )"
+            ))
+            .await?;
+
+        // Source COPY text is WIDER than every column's precision, so a
+        // faithful load must coerce: 1.005→1.01, .6 seconds→rounded.
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.{table} (id, amt, ts0, tstz0) FROM stdin;")?;
+        writeln!(
+            f,
+            "1\t1.005\t2024-01-01 10:23:54.6\t2024-01-01 10:23:54.6+02"
+        )?;
+        writeln!(
+            f,
+            "2\t2.675\t2024-06-30 23:59:59.5\t2024-06-30 23:59:59.5+00"
+        )?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let mut args = pgdump_load_args(
+            f.path().to_string_lossy().into_owned(),
+            &table,
+            dsql_pool.clone(),
+        );
+        args.verify = VerifyMode::Full;
+
+        let result = run_load(args).await?;
+
+        // The fix's payoff: a faithful narrowing load verifies clean. Before
+        // the parameterized recast this was ValueMismatch(2).
+        let v = result.verify.expect("verify=full must populate verify");
+        assert_eq!(
+            v.verdict,
+            crate::verify::VerifyVerdict::Match,
+            "narrowing load must verify as Match, got {:?} (l3_details={:?})",
+            v.verdict,
+            v.l3_details,
+        );
+
+        // Guard against a trivial pass: prove the column REALLY coerced the
+        // value (so the recast genuinely had to round to match, not just
+        // compare equal text). 1.005 must be stored as 1.01.
+        let (stored_amt,): (String,) =
+            sqlx::query_as(&format!("SELECT amt::text FROM {table} WHERE id = 1"))
+                .fetch_one(&dsql_pool)
+                .await?;
+        assert_eq!(
+            stored_amt, "1.01",
+            "column must have rounded 1.005→1.01 (else the test isn't exercising typmod)"
+        );
+
+        let _ = dsql_pool
+            .execute_query(&format!("DROP TABLE IF EXISTS {table}"))
             .await;
         Ok(())
     }
@@ -5109,6 +5271,36 @@ mod tests {
         assert!(
             err.contains("pg_dump column identifier") && err.contains("unsafe character"),
             "expected validation error naming the column field; got: {err}"
+        );
+        Ok(())
+    }
+
+    /// Plain `load --verify=full` on pgdump runs L3 end-to-end (resolving
+    /// the COPY block itself, unlike migrate) and reports a clean Match
+    /// with the affirmative schema_check populated. Pins the load-path L3
+    /// wiring, which is separate from the migrate orchestrator path.
+    #[tokio::test]
+    async fn pgdump_load_verify_full_matches_with_schema_check() -> anyhow::Result<()> {
+        let mut f = tempfile::NamedTempFile::new()?;
+        writeln!(f, "COPY public.things (id, name) FROM stdin;")?;
+        writeln!(f, "1\talpha")?;
+        writeln!(f, "2\tbeta")?;
+        writeln!(f, "\\.")?;
+        f.flush()?;
+
+        let pool = setup_sqlite_table("things", "id INTEGER PRIMARY KEY, name TEXT").await;
+        let mut args = pgdump_load_args(f.path().to_string_lossy().into_owned(), "things", pool);
+        args.verify = VerifyMode::Full;
+
+        let result = run_load(args).await?;
+        let v = result.verify.expect("verify=full must populate verify");
+        assert_eq!(v.verdict, crate::verify::VerifyVerdict::Match);
+        assert_eq!(
+            v.schema_check,
+            Some(crate::verify::SchemaCheck {
+                columns_matched: Some(2),
+                pk_present: true,
+            })
         );
         Ok(())
     }

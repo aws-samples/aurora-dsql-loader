@@ -117,15 +117,28 @@ impl Pool {
         }
     }
 
-    /// Create an in-memory SQLite pool for testing
+    /// Create an in-memory SQLite pool for testing.
+    ///
+    /// Uses a uniquely-named shared-cache in-memory DB so every pooled
+    /// connection sees the SAME database. Plain `sqlite::memory:` gives each
+    /// connection its own empty DB, so a query landing on a second connection
+    /// can miss tables a `CREATE` ran on the first — a flaky silent divergence
+    /// (e.g. a composite-PK lookup returning one column → a verify skip-test
+    /// spuriously seeing `Ran` instead of `Skipped`). The unique name keeps
+    /// each pool's DB isolated from other concurrently-running test pools.
     #[cfg(test)]
     pub async fn sqlite_in_memory() -> Result<Self, sqlx::Error> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DB_SEQ: AtomicU64 = AtomicU64::new(0);
+        let id = DB_SEQ.fetch_add(1, Ordering::Relaxed);
+        let uri = format!("sqlite:file:dsql_test_{id}?mode=memory&cache=shared");
+
         let sqlite_pool = sqlx::sqlite::SqlitePoolOptions::new()
             .min_connections(1)
             .max_connections(10)
             .idle_timeout(None)
             .max_lifetime(None)
-            .connect("sqlite::memory:")
+            .connect(&uri)
             .await?;
 
         Ok(Pool {
