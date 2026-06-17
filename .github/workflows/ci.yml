@@ -167,10 +167,20 @@ jobs:
       PGDUMP_E2E_SOURCE_URL: postgres://postgres:postgres@localhost:5432/postgres
       LOADER_DSQL_E2E_ENDPOINT: ${{ needs.create-cluster.outputs.cluster-endpoint }}
       LOADER_DSQL_E2E_REGION: ${{ needs.create-cluster.outputs.region }}
+      # Path to the pgdump-proxy that lets stock pg_dump read a DSQL cluster
+      # (checked out from awslabs/aurora-dsql-tools below). Drives the
+      # DSQL→DSQL round-trip e2e.
+      DSQL_PGDUMP_PROXY: ${{ github.workspace }}/aurora-dsql-tools/pgdump-proxy/dsql_pgdump_proxy.py
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Checkout aurora-dsql-tools (pgdump-proxy)
+        uses: actions/checkout@v4
+        with:
+          repository: awslabs/aurora-dsql-tools
+          path: aurora-dsql-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -204,7 +214,10 @@ jobs:
 
       - name: Run pgdump E2E against real DSQL cluster
         run: |
-          cargo test --lib --verbose pgdump_migrate_real_full_dump -- --ignored --nocapture
+          # Both ignored real-cluster migrate e2es: PG→DSQL (full dump) and
+          # DSQL→DSQL (dump a DSQL cluster via the proxy, migrate it back).
+          # `python3` (for the proxy) is preinstalled on ubuntu-latest runners.
+          cargo test --lib --verbose pgdump_migrate_real -- --ignored --nocapture
 
   delete-cluster:
     name: Delete DSQL cluster

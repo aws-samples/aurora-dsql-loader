@@ -217,6 +217,47 @@ target. If you need to refresh into a populated cluster, drop the
 `--clean` flag from `pg_dump` and either truncate the target tables
 manually or migrate into a fresh cluster.
 
+**Migrate from another DSQL cluster (DSQL → DSQL):**
+
+`migrate` consumes a plain `pg_dump`, so migrating between DSQL clusters
+is the same command — once you can produce the dump. Two wrinkles, both
+handled automatically:
+
+1. **Stock `pg_dump` can't read a DSQL cluster.** On connect it issues
+   session settings (`statement_timeout`, `synchronize_seqscans`, …) and
+   a per-table `LOCK` that DSQL rejects, and it aborts. Use the
+   [pgdump-proxy](https://github.com/awslabs/aurora-dsql-tools/tree/main/pgdump-proxy)
+   — a tiny stdlib wire proxy that lets stock `pg_dump` dump a DSQL
+   cluster:
+   ```bash
+   # Terminal 1: bridge plaintext localhost:6543 -> DSQL TLS
+   python3 dsql_pgdump_proxy.py source-cluster.dsql.us-east-1.on.aws
+
+   # Terminal 2: dump through the proxy (password is a DSQL auth token)
+   export PGPASSWORD="$(aws dsql generate-db-connect-admin-auth-token \
+     --hostname source-cluster.dsql.us-east-1.on.aws --region us-east-1 \
+     --expires-in 3600)"
+   pg_dump -Fp --no-owner --no-privileges \
+     "host=127.0.0.1 port=6543 dbname=postgres user=admin" > dsql.sql
+   ```
+2. **A DSQL dump contains DSQL-only idioms.** A DSQL cluster emits
+   identity columns as a standalone `ALTER TABLE … ADD GENERATED … AS
+   IDENTITY` and stamps `SET COMPRESSION` on columns — neither of which
+   DSQL accepts as input. `dsql-lint` (0.2.7+) collapses the identity
+   inline onto the `CREATE TABLE` and strips `SET COMPRESSION`
+   automatically; the migrate flow handles them with no extra flags.
+
+```bash
+aurora-dsql-loader migrate \
+  --endpoint dest-cluster.dsql.us-east-1.on.aws \
+  --source-uri dsql.sql
+```
+
+Unlike a SERIAL source, the identity counter **is** advanced after a
+DSQL→DSQL migrate: pg_dump's trailing `setval(...)` lands on the inline
+identity's implicit sequence, so the next insert continues past the
+loaded rows — no manual `RESTART WITH` needed.
+
 ### CSV/TSV header behavior
 
 By default, the loader treats every row of a CSV or TSV file as data — it does
