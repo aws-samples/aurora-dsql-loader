@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-06-19
+
 ### Added
 - `migrate` now supports **DSQL → DSQL** migration. A `pg_dump` taken from a
   DSQL cluster contains DSQL-native idioms the cluster cannot itself re-ingest:
