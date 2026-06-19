@@ -72,6 +72,14 @@
   the target during the run.
 
 ### Changed
+- `migrate`'s DDL apply and the load worker now retry on DSQL's
+  optimistic-concurrency conflict (SQLSTATE `OC000`/`OC001`, "schema has
+  been updated by another transaction") using the connector's
+  `retry_on_occ` (exponential backoff). Previously only `40001` and a few
+  other transient codes were retried, so a CREATE/ALTER whose snapshot
+  predated a just-committed catalog change — common in a DSQL→DSQL
+  migrate that re-creates objects — could fail the run instead of
+  transparently retrying.
 - A worker-crash that leaves a chunk result file unwritten now fails
   the load instead of being treated as 0 rows. Previously the missing
   rows were invisible: `records_failed` stayed 0 and `source_rows`
