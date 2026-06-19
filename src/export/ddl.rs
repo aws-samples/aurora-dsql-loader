@@ -39,11 +39,7 @@ pub struct TableDef {
     pub pk_columns: Vec<String>,
 }
 
-/// Quote a SQL identifier. Embedded `"` is doubled as defense in depth;
-/// callers validate identifiers up front (see `validate_pgdump_identifier`).
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
+use super::quote_ident;
 
 /// Render one column's definition (without leading indent or trailing comma).
 fn column_line(col: &ColumnDef) -> String {
