@@ -11,6 +11,7 @@
 
 use crate::db::Pool;
 use anyhow::{Context, Result};
+use aurora_dsql_sqlx_connector::{DsqlError, OCCRetryConfig, retry_on_occ};
 
 /// Outcome of a single applied DDL statement, captured so the migrate
 /// orchestrator can build a useful summary report and so callers (e.g. the
@@ -50,6 +51,7 @@ pub enum ApplyOutcome {
 pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> {
     let statements = split_sql_statements(ddl);
     let total = statements.len();
+    let occ = OCCRetryConfig::default();
     tracing::info!(statements = total, "applying DDL");
     let mut applied = Vec::with_capacity(total);
     for (i, stmt) in statements.into_iter().enumerate() {
@@ -59,7 +61,12 @@ pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> 
             preview = %safe_for_terminal(&stmt),
             "applying DDL statement"
         );
-        match pool.execute_query(&stmt).await {
+        // Retry on DSQL's optimistic-concurrency conflict (OC000/OC001/40001):
+        // a CREATE/ALTER whose snapshot predates a just-committed catalog change
+        // (e.g. a DROP of the same object, or concurrent DDL on a busy cluster)
+        // is rejected and is safe to re-run — each statement is its own txn and
+        // the already-exists skip below keeps re-application idempotent.
+        match apply_one(pool, &occ, &stmt).await {
             Ok(()) => applied.push(AppliedStatement {
                 sql: stmt,
                 outcome: ApplyOutcome::Applied,
@@ -79,6 +86,20 @@ pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> 
         }
     }
     Ok(applied)
+}
+
+/// Run one DDL statement with OCC retry, normalizing the connector's
+/// [`DsqlError`] back to the underlying [`sqlx::Error`] so the caller's
+/// already-exists classification (which inspects SQLSTATE on `sqlx::Error`)
+/// is unchanged. OCC-exhausted and non-database errors surface as a synthetic
+/// protocol-level `sqlx::Error` carrying the message.
+async fn apply_one(pool: &Pool, occ: &OCCRetryConfig, stmt: &str) -> Result<(), sqlx::Error> {
+    retry_on_occ(occ, || pool.execute_query(stmt))
+        .await
+        .map_err(|e| match e {
+            DsqlError::DatabaseError(inner) | DsqlError::ConnectionError(inner) => inner,
+            other => sqlx::Error::Protocol(other.to_string()),
+        })
 }
 
 /// Whether a sqlx error represents a target object that already exists
