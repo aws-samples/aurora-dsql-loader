@@ -846,7 +846,7 @@ COPY public.t (id) FROM stdin;
     /// Offline smoke test for a DSQL-SOURCED dump: the DDL `pg_dump` emits when
     /// the source is itself a DSQL cluster contains idioms DSQL cannot
     /// re-ingest (standalone `ADD GENERATED ... AS IDENTITY`, `SET COMPRESSION`,
-    /// covering `PRIMARY KEY ... INCLUDE`). dsql-lint 0.2.7 collapses/strips all
+    /// covering `PRIMARY KEY ... INCLUDE`). dsql-lint 0.2.9 collapses/strips all
     /// of them. Pins that a DSQL→DSQL dump dry-runs with ZERO unfixable — if a
     /// future dsql-lint regresses on any of these, the migrate happy-path for
     /// DSQL→DSQL silently breaks and this test catches it.

@@ -50,4 +50,3 @@ lto = true
 
 [dev-dependencies]
 proptest = "1"
-

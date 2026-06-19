@@ -243,7 +243,7 @@ handled automatically:
 2. **A DSQL dump contains DSQL-only idioms.** A DSQL cluster emits
    identity columns as a standalone `ALTER TABLE … ADD GENERATED … AS
    IDENTITY` and stamps `SET COMPRESSION` on columns — neither of which
-   DSQL accepts as input. `dsql-lint` (0.2.7+) collapses the identity
+   DSQL accepts as input. `dsql-lint` (0.2.9+) collapses the identity
    inline onto the `CREATE TABLE` and strips `SET COMPRESSION`
    automatically; the migrate flow handles them with no extra flags.
 

@@ -5180,14 +5180,32 @@ mod tests {
             .map_err(|e| {
                 anyhow::anyhow!("failed to spawn pgdump-proxy (is python3 on PATH?): {e}")
             })?;
-        // Give the proxy a moment to bind its listen socket.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // The TempDir holding the dump must outlive run_migrate (which reads it),
+        // so it lives in the test scope rather than the proxy block below — its
+        // Drop then removes the dump on every exit path, including a later panic.
+        let dump_dir = tempfile::tempdir()?;
+        let dump_path = dump_dir.path().join("dsql_dump.sql");
 
         // pg_dump the DSQL cluster THROUGH the proxy. Wrapped so the proxy is
-        // always killed even if a step fails.
-        let dump_result: anyhow::Result<std::path::PathBuf> = async {
-            let dump_dir = tempfile::tempdir()?;
-            let dump_path = dump_dir.path().join("dsql_dump.sql");
+        // always killed (and reaped) even if a step fails.
+        let dump_result: anyhow::Result<()> = async {
+            // Wait for the proxy to accept connections instead of a fixed sleep:
+            // poll-connect, and fail fast if the proxy died (e.g. port in use).
+            let addr = format!("127.0.0.1:{proxy_port}");
+            let mut ready = false;
+            for _ in 0..50 {
+                if let Some(status) = proxy.try_wait()? {
+                    anyhow::bail!("pgdump-proxy exited before accepting connections: {status}");
+                }
+                if std::net::TcpStream::connect(&addr).is_ok() {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            anyhow::ensure!(ready, "pgdump-proxy did not start listening on {addr} in time");
+
             let status = Command::new("pg_dump")
                 .args([
                     "-Fp",
@@ -5204,14 +5222,14 @@ mod tests {
                 .status()
                 .map_err(|e| anyhow::anyhow!("failed to spawn pg_dump (is it on PATH?): {e}"))?;
             anyhow::ensure!(status.success(), "pg_dump through proxy exited with {status}");
-            // Persist the dump outside the TempDir so it survives this scope.
-            let persisted = std::env::temp_dir().join(format!("dsql_dump_{suffix}.sql"));
-            std::fs::copy(&dump_path, &persisted)?;
-            Ok(persisted)
+            Ok(())
         }
         .await;
+        // kill() only signals; wait() reaps so we don't leak a zombie / orphaned
+        // listener on the fixed port for the rest of the test-binary's life.
         let _ = proxy.kill();
-        let dump_path = dump_result?;
+        let _ = proxy.wait();
+        dump_result?;
 
         // Drop the source table so the migrate re-creates it from the dump's
         // DDL — a genuine round-trip, not a no-op against an existing table.
@@ -5239,7 +5257,7 @@ mod tests {
             test_pool: None,
         })
         .await?;
-        let _ = std::fs::remove_file(&dump_path);
+        // dump_path lives in dump_dir (TempDir); it auto-cleans on Drop.
 
         // ── The DSQL-native idioms must all have transformed cleanly. ───────
         assert!(
