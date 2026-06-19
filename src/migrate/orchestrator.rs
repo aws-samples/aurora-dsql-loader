@@ -843,6 +843,64 @@ COPY public.t (id) FROM stdin;
         );
     }
 
+    /// Offline smoke test for a DSQL-SOURCED dump: the DDL `pg_dump` emits when
+    /// the source is itself a DSQL cluster contains idioms DSQL cannot
+    /// re-ingest (standalone `ADD GENERATED ... AS IDENTITY`, `SET COMPRESSION`,
+    /// covering `PRIMARY KEY ... INCLUDE`). dsql-lint 0.2.9 collapses/strips all
+    /// of them. Pins that a DSQL→DSQL dump dry-runs with ZERO unfixable — if a
+    /// future dsql-lint regresses on any of these, the migrate happy-path for
+    /// DSQL→DSQL silently breaks and this test catches it.
+    #[tokio::test]
+    async fn dry_run_dsql_native_fixture_collapses_identity_and_strips_compression() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pgdump_dsql_native.sql");
+        let args = MigrateArgs {
+            endpoint: "doesnotexist.invalid".to_string(),
+            region: "us-east-1".to_string(),
+            username: "ignored".to_string(),
+            source_uri: file_uri(&fixture),
+            schema: "public".to_string(),
+            dry_run: true,
+            worker_count: 1,
+            batch_size: 1,
+            batch_concurrency: 1,
+            chunk_size_bytes: 1024,
+            on_conflict: OnConflict::Error,
+            quiet: true,
+            debug: false,
+            verify: VerifyMode::Off,
+            test_pool: None,
+        };
+        let report = run_migrate(args).await.unwrap();
+
+        // The whole DSQL-native dump must transform with nothing left unfixable.
+        assert!(
+            report.ddl_unfixable.is_empty(),
+            "DSQL-native fixture must dry-run cleanly, got unfixable: {:?}",
+            report.ddl_unfixable
+        );
+
+        let has_rule = |r: &str| report.ddl_changes.iter().any(|d| d.rule == r);
+        assert!(
+            has_rule("identity_add_generated_collapse"),
+            "identity ALTER must collapse, got: {:?}",
+            report.ddl_changes
+        );
+        assert!(
+            has_rule("alter_column_set_compression_strip"),
+            "SET COMPRESSION must be stripped, got: {:?}",
+            report.ddl_changes
+        );
+        // The covering PK and the UNIQUE both fold via the existing collapse
+        // rules — pin them so a dsql-lint change that drops INCLUDE support
+        // surfaces here.
+        assert!(
+            has_rule("alter_add_primary_key_collapse") && has_rule("alter_add_unique_collapse"),
+            "PK + UNIQUE must fold into CREATE TABLE, got: {:?}",
+            report.ddl_changes
+        );
+    }
+
     /// Symmetric guarantee to `dry_run_does_not_build_pool`: when
     /// `transform_ddl` surfaces an `unfixable` diagnostic, the orchestrator
     /// must short-circuit BEFORE building a pool. A future refactor that

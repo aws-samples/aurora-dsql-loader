@@ -3,6 +3,20 @@
 ## [Unreleased]
 
 ### Added
+- `migrate` now supports **DSQL → DSQL** migration. A `pg_dump` taken from a
+  DSQL cluster contains DSQL-native idioms the cluster cannot itself re-ingest:
+  identity columns dumped as a standalone
+  `ALTER TABLE … ALTER COLUMN id ADD GENERATED … AS IDENTITY (SEQUENCE NAME …)`,
+  and a per-column `ALTER … SET COMPRESSION`. Raised the `dsql-lint` requirement
+  to `>=0.2.9`, which collapses the identity clause inline onto the `CREATE TABLE`
+  (preserving `ALWAYS` / `BY DEFAULT`) and strips `SET COMPRESSION`, so a
+  DSQL-sourced dump migrates with the same `migrate` command and no extra flags.
+  Unlike a SERIAL source, the identity counter is advanced automatically — the
+  dump's trailing `setval(...)` lands on the inline identity's implicit sequence.
+  Producing the dump requires the
+  [pgdump-proxy](https://github.com/awslabs/aurora-dsql-tools/tree/main/pgdump-proxy),
+  since stock `pg_dump` cannot connect to a DSQL cluster directly. Covered by a
+  real DSQL→DSQL round-trip e2e in CI.
 - New `migrate` subcommand for one-command pg_dump → DSQL migration. Reads
   the embedded DDL out of a full `pg_dump -Fp` (no `--data-only`) file,
   transforms it for DSQL via [`dsql-lint`](https://crates.io/crates/dsql-lint)
