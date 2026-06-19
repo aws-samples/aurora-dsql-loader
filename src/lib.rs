@@ -5,6 +5,7 @@ pub mod runner;
 mod config;
 mod coordination;
 mod db;
+mod export;
 mod formats;
 mod io;
 mod migrate;
