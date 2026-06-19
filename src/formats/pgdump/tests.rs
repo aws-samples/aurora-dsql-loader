@@ -1,4 +1,4 @@
-use super::escape::decode_field;
+use super::escape::{decode_field, encode_field};
 use super::reader::PgDumpReader;
 use super::scan::{ScanError, extract_ddl, find_copy_block, list_copy_blocks};
 use crate::formats::FileReader;
@@ -73,6 +73,63 @@ fn decode_trailing_backslash_passes_through() {
 fn decode_multi_byte_utf8() {
     let bytes = "café".as_bytes();
     assert_eq!(decode_field(bytes), Some("café".into()));
+}
+
+#[test]
+fn encode_null_is_sentinel() {
+    // SQL NULL (None) encodes to the `\N` sentinel, distinct from "".
+    assert_eq!(encode_field(None), "\\N");
+}
+
+#[test]
+fn encode_empty_string_is_not_null() {
+    // A genuine empty string must NOT collapse to the NULL sentinel.
+    assert_eq!(encode_field(Some("")), "");
+}
+
+#[test]
+fn encode_plain_text_is_verbatim() {
+    assert_eq!(encode_field(Some("hello")), "hello");
+    assert_eq!(encode_field(Some("café")), "café");
+}
+
+#[test]
+fn encode_escapes_special_bytes() {
+    // The exact set decode_field's named escapes cover: backslash, tab,
+    // newline, CR, plus \b \f \v. A literal backslash must double so it
+    // can't be misread as an escape introducer on decode.
+    assert_eq!(encode_field(Some("a\tb")), "a\\tb");
+    assert_eq!(encode_field(Some("a\nb")), "a\\nb");
+    assert_eq!(encode_field(Some("a\rb")), "a\\rb");
+    assert_eq!(encode_field(Some("a\\b")), "a\\\\b");
+    assert_eq!(encode_field(Some("\u{8}\u{c}\u{b}")), "\\b\\f\\v");
+}
+
+#[test]
+fn encode_decode_round_trips() {
+    // The contract that makes the export data path correct: every value
+    // the loader can read back must survive encode → decode unchanged,
+    // including the tricky classes (embedded tab/newline, backslash, the
+    // literal text "\N", bytea-style hex, multibyte UTF-8, NULL).
+    for original in [
+        None,
+        Some(""),
+        Some("plain"),
+        Some("a\tb\nc\rd"),
+        Some("back\\slash"),
+        Some("\\N"),            // literal text that LOOKS like the NULL sentinel
+        Some("\\xDEADBEEF"),    // bytea hex rendering
+        Some("café \u{1f600}"), // multibyte + emoji
+        Some("\u{8}\u{c}\u{b}"),
+    ] {
+        let encoded = encode_field(original);
+        let decoded = decode_field(encoded.as_bytes());
+        assert_eq!(
+            decoded,
+            original.map(str::to_string),
+            "round-trip failed for {original:?} (encoded as {encoded:?})"
+        );
+    }
 }
 
 const SAMPLE: &[u8] = b"\
