@@ -5280,12 +5280,22 @@ mod tests {
         assert_eq!(report.tables[0].records_loaded, 2);
         assert_eq!(report.tables[0].records_failed, 0);
 
+        // The reads below run microseconds after the migrate's DDL committed,
+        // so they can trip DSQL's optimistic-concurrency check (OC001, "schema
+        // has been updated by another transaction") against the just-changed
+        // catalog. Wrap them in the connector's `retry_on_occ` (SQLSTATE-based
+        // detection + exponential backoff) rather than hand-rolling a retry.
+        let occ = aurora_dsql_sqlx_connector::OCCRetryConfig::default();
+
         // ── The identity column re-lands as an identity on the destination. ─
-        let (is_identity,): (String,) = sqlx::query_as(&format!(
-            "SELECT is_identity FROM information_schema.columns \
-             WHERE table_schema='public' AND table_name='{table}' AND column_name='id'"
-        ))
-        .fetch_one(&dsql_pool)
+        let (is_identity,): (String,) = aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
+            sqlx::query_as(&format!(
+                "SELECT is_identity FROM information_schema.columns \
+                     WHERE table_schema='public' AND table_name='{table}' AND column_name='id'"
+            ))
+            .fetch_one(&dsql_pool)
+            .await
+        })
         .await?;
         assert_eq!(is_identity, "YES", "{table}.id must be an identity column");
 
@@ -5296,10 +5306,13 @@ mod tests {
             email: String,
             payload: Option<serde_json::Value>,
         }
-        let rows: Vec<Row> = sqlx::query_as(&format!(
-            "SELECT id, email, payload FROM public.{table} ORDER BY id"
-        ))
-        .fetch_all(&dsql_pool)
+        let rows: Vec<Row> = aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
+            sqlx::query_as(&format!(
+                "SELECT id, email, payload FROM public.{table} ORDER BY id"
+            ))
+            .fetch_all(&dsql_pool)
+            .await
+        })
         .await?;
         assert_eq!(rows.len(), 2);
         // Identity values round-trip (the loaded id column carries the source values).
@@ -5312,10 +5325,15 @@ mod tests {
 
         // ── Counter advanced: the dump's trailing setval landed on the inline
         // identity's implicit sequence, so the next insert gets id=3. ────────
-        let (next_id,): (i64,) = sqlx::query_as(&format!(
-            "INSERT INTO public.{table} (email) VALUES ('c@example.com') RETURNING id"
-        ))
-        .fetch_one(&dsql_pool)
+        // Safe under retry: an OCC-conflicted INSERT does not commit, so a retry
+        // does not double-insert.
+        let (next_id,): (i64,) = aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
+            sqlx::query_as(&format!(
+                "INSERT INTO public.{table} (email) VALUES ('c@example.com') RETURNING id"
+            ))
+            .fetch_one(&dsql_pool)
+            .await
+        })
         .await?;
         assert_eq!(
             next_id, 3,
