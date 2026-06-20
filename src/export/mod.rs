@@ -4,6 +4,7 @@
 
 mod data;
 mod ddl;
+mod document;
 
 /// Quote a SQL identifier, doubling any embedded `"`. Defense in depth —
 /// callers validate identifiers up front (see `validate_pgdump_identifier`),
