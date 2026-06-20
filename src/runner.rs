@@ -16,6 +16,10 @@ pub use crate::migrate::{
     TableLoadSummary, run_migrate,
 };
 
+// Re-export the export API so the CLI binary and library consumers reach it
+// through the same `runner::` namespace as `run_load` / `run_migrate`.
+pub use crate::export::{ExportArgs, ExportReport, run_export};
+
 // Re-export the verification surface — `VerifyMode` is set by the CLI on
 // `LoadArgs`, and `VerifyOutcome` / `VerifyVerdict` ship as fields of
 // `LoadResult` and `TableLoadSummary`.

@@ -2,9 +2,13 @@
 //! pg_dump-shaped `.sql` (DDL + `COPY ... FROM stdin` blocks) that the
 //! `migrate` flow consumes unchanged.
 
+mod catalog;
 mod data;
 mod ddl;
 mod document;
+mod orchestrator;
+
+pub use orchestrator::{ExportArgs, ExportReport, run_export};
 
 /// Quote a SQL identifier, doubling any embedded `"`. Defense in depth —
 /// callers validate identifiers up front (see `validate_pgdump_identifier`),
