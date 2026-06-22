@@ -5665,9 +5665,12 @@ mod tests {
     /// it back into the same PG instance, and compare with `EXCEPT` in both
     /// directions so any DDL- or data-generation bug surfaces as a diff.
     ///
-    /// Skipped (returns Ok) when `PGDUMP_E2E_SOURCE_URL` is unset so local
-    /// `cargo test` passes without a Postgres; CI's `postgres` service sets it.
+    /// `#[ignore]` — needs a real Postgres (CI's `e2e-dsql` job provides one via
+    /// its `postgres` service and sets `PGDUMP_E2E_SOURCE_URL`; the job opts in
+    /// via `--ignored`). Also self-skips with a message when the var is unset,
+    /// so a stray `cargo test -- --ignored` locally still passes without a PG.
     #[tokio::test]
+    #[ignore]
     async fn export_round_trip_pg_to_pg() -> anyhow::Result<()> {
         let Some(source_pg_url) = std::env::var("PGDUMP_E2E_SOURCE_URL")
             .ok()

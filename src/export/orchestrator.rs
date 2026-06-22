@@ -48,6 +48,29 @@ pub async fn run_export(args: ExportArgs) -> Result<ExportReport> {
 
     let tables = list_tables(&pool, args.schema.as_deref(), args.table.as_deref()).await?;
 
+    // An empty match almost always means a fat-fingered --schema/--table (or a
+    // truly empty cluster). Writing a near-empty dump that exits 0 would let a
+    // typo's output pipe straight into `migrate` and look like a clean run, so
+    // fail loudly with the filters that produced nothing.
+    if tables.is_empty() {
+        match (args.schema.as_deref(), args.table.as_deref()) {
+            (Some(s), Some(t)) => anyhow::bail!(
+                "export matched no tables for --schema {s:?} --table {t:?}; check the names"
+            ),
+            (Some(s), None) => {
+                anyhow::bail!("export matched no tables in --schema {s:?}; check the name")
+            }
+            (None, Some(t)) => {
+                anyhow::bail!("export matched no table named --table {t:?}; check the name")
+            }
+            (None, None) => {
+                anyhow::bail!(
+                    "export found no user tables in the source cluster; nothing to export"
+                )
+            }
+        }
+    }
+
     let mut exports = Vec::with_capacity(tables.len());
     for (schema, table) in &tables {
         exports.push(
