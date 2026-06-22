@@ -107,9 +107,16 @@ pub async fn read_table_export(pool: &Pool, schema: &str, table: &str) -> Result
 
 /// Build the lint-safe `setval` that advances the identity column's sequence
 /// past the loaded rows, so a reloaded cluster's next implicit insert
-/// continues past them. Returns `None` when the column is empty (max is NULL)
-/// or the sequence can't be resolved. We use `setval(seq, max, true)` rather
-/// than `ALTER … RESTART`, which DSQL's parser rejects.
+/// continues past them. Returns `None` when the column is empty (max is NULL).
+/// We use `setval(seq, max, true)` rather than `ALTER … RESTART`, which DSQL's
+/// parser rejects.
+///
+/// The caller only invokes this for a confirmed identity column on a non-empty
+/// table, so a *missing* sequence here is anomalous (not the benign empty
+/// case): emitting no `setval` would let the reloaded cluster's next implicit
+/// insert collide with a loaded id. We warn loudly instead of skipping
+/// silently, since that failure would otherwise surface only as a duplicate-key
+/// error on the destination, far from the export.
 async fn read_identity_setval(
     pool: &Pool,
     schema: &str,
@@ -131,8 +138,22 @@ async fn read_identity_setval(
         .await
         .with_context(|| format!("Failed to read identity max for {oid_param}.{column}"))?;
 
-    let Some((Some(seq), Some(max))) = rows.into_iter().next() else {
-        return Ok(None);
+    let (seq, max) = match rows.into_iter().next() {
+        // Empty table: max is NULL — genuinely no continuation needed.
+        Some((_, None)) | None => return Ok(None),
+        // Rows exist but the backing sequence didn't resolve: identity
+        // continuation would be silently dropped. Surface it.
+        Some((None, Some(_))) => {
+            tracing::warn!(
+                table = %oid_param,
+                column,
+                "identity column has rows but its backing sequence could not be \
+                 resolved; the reloaded cluster's identity counter will NOT be \
+                 advanced and its next implicit insert may collide with a loaded id"
+            );
+            return Ok(None);
+        }
+        Some((Some(seq), Some(max))) => (seq, max),
     };
     // setval's first arg is a regclass text literal; escape embedded quotes.
     let seq_lit = seq.replace('\'', "''");
@@ -197,8 +218,22 @@ async fn read_identity_cache(pool: &Pool, oid_param: &str, column: &str) -> Resu
         )
         .await
         .with_context(|| format!("Failed to read identity cache for {oid_param}.{column}"))?;
-    // Default to 1 (DSQL's minimum) if the sequence is somehow unreadable.
-    Ok(rows.first().map(|(c,)| *c).unwrap_or(1))
+    match rows.first() {
+        Some((c,)) => Ok(*c),
+        // The column is a confirmed identity (caller only calls us then), so an
+        // unreadable backing sequence is anomalous. Default to 1 (DSQL's
+        // minimum) to keep the export usable, but warn — silently substituting
+        // 1 for a source `CACHE 128` would change allocation semantics invisibly.
+        None => {
+            tracing::warn!(
+                table = %oid_param,
+                column,
+                "identity column's backing sequence could not be read; \
+                 emitting CACHE 1 (the source's actual cache is unknown)"
+            );
+            Ok(1)
+        }
+    }
 }
 
 /// Read the primary key's backing index name and ordered columns. Returns
