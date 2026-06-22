@@ -12,6 +12,23 @@ use super::quote_ident;
 use crate::db::Pool;
 use crate::runner::validate_pgdump_identifier;
 
+/// Build the `"schema"."table"` text literal that the per-table `::regclass`
+/// casts and `pg_get_serial_sequence`'s first argument resolve against.
+///
+/// MUST be quoted: a bare `schema.table` text fed to `::regclass` is parsed
+/// with identifier rules — unquoted parts are case-folded to lowercase — so a
+/// mixed-case or reserved-word table either fails to resolve or silently
+/// resolves a *different* lowercased relation (verified on a live cluster:
+/// `to_regclass('s.PG_CLASS')` folds and resolves, `to_regclass('"s"."PG_CLASS"')`
+/// returns NULL). Quoting preserves the catalog's exact name; lowercase names
+/// still resolve when quoted, so there is no regression. This matches the data
+/// path, which already quotes via `qualified_table_name`. Note the *column*
+/// argument of `pg_get_serial_sequence` is intentionally left unquoted — that
+/// arg is matched literally against `pg_attribute.attname`, not re-parsed.
+fn regclass_literal(schema: &str, table: &str) -> String {
+    format!("{}.{}", quote_ident(schema), quote_ident(table))
+}
+
 /// List user tables `(schema, table)` in catalog order, skipping the system
 /// schemas. An optional `schema`/`table` filter narrows the export.
 pub async fn list_tables(
@@ -50,10 +67,10 @@ pub async fn list_tables(
 }
 
 /// Read one table's full export payload: columns, primary key, kept indexes,
-/// and all row data. `qualified`/`oid_param` is the schema-qualified name the
-/// `::regclass` casts resolve against.
+/// and all row data. Builds the quoted `"schema"."table"` regclass literal
+/// (see [`regclass_literal`]) the per-column `::regclass` casts resolve against.
 pub async fn read_table_export(pool: &Pool, schema: &str, table: &str) -> Result<TableExport> {
-    let oid_param = format!("{schema}.{table}");
+    let oid_param = regclass_literal(schema, table);
 
     let columns = read_columns(pool, &oid_param).await?;
     let (pk_index_name, pk_columns) = read_primary_key(pool, &oid_param).await?;
@@ -99,7 +116,7 @@ async fn read_identity_setval(
     table: &str,
     column: &str,
 ) -> Result<Option<String>> {
-    let oid_param = format!("{schema}.{table}");
+    let oid_param = regclass_literal(schema, table);
     let qualified = pool.qualified_table_name(schema, table);
     // (sequence_name, max_value-as-text): both from one row, so an empty
     // table yields a NULL max and we skip.
