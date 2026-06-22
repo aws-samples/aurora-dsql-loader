@@ -73,6 +73,7 @@ pub async fn read_table_export(pool: &Pool, schema: &str, table: &str) -> Result
     let oid_param = regclass_literal(schema, table);
 
     let columns = read_columns(pool, &oid_param).await?;
+    reject_check_constraints(pool, &oid_param).await?;
     let (pk_index_name, pk_columns) = read_primary_key(pool, &oid_param).await?;
     let index_defs = {
         let all = read_indexes(pool, schema, table).await?;
@@ -164,14 +165,21 @@ async fn read_identity_setval(
 
 /// Read column definitions in attnum order. Identity columns carry their
 /// sequence `CACHE`; non-identity columns carry their default expression.
+///
+/// Generated columns (`GENERATED ALWAYS AS (expr) STORED`) are rejected, not
+/// exported: their `pg_get_expr` reads back as a plain default, so emitting it
+/// would silently downgrade the column to a writable default AND dump its
+/// computed values into the COPY block — a fidelity loss the operator wouldn't
+/// see. Failing fast names the column so they can edit the dump deliberately.
 async fn read_columns(pool: &Pool, oid_param: &str) -> Result<Vec<ColumnDef>> {
-    // (attname, format_type, attnotnull, attidentity, default_expr)
-    let rows: Vec<(String, String, bool, String, Option<String>)> = pool
+    // (attname, format_type, attnotnull, attidentity, attgenerated, default_expr)
+    let rows: Vec<(String, String, bool, String, String, Option<String>)> = pool
         .fetch_all_with_binds(
             "SELECT a.attname, \
                     format_type(a.atttypid, a.atttypmod), \
                     a.attnotnull, \
                     a.attidentity::text, \
+                    a.attgenerated::text, \
                     pg_get_expr(ad.adbin, ad.adrelid) \
              FROM pg_attribute a \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
@@ -183,8 +191,20 @@ async fn read_columns(pool: &Pool, oid_param: &str) -> Result<Vec<ColumnDef>> {
         .with_context(|| format!("Failed to read columns for {oid_param}"))?;
 
     let mut columns = Vec::with_capacity(rows.len());
-    for (name, type_name, not_null, identity, default_expr) in rows {
+    for (name, type_name, not_null, identity, generated, default_expr) in rows {
         validate_pgdump_identifier("column", &name)?;
+        // attgenerated is '' for a normal column, 's' for STORED generated.
+        // Exporting a generated column correctly needs a GENERATED clause plus
+        // COPY-exclusion (you can't INSERT into it); rather than silently emit
+        // the wrong thing, refuse and tell the operator which column.
+        if !generated.is_empty() {
+            anyhow::bail!(
+                "{oid_param}.{name:?} is a generated column, which export does not \
+                 support — its values are computed, not stored as a writable \
+                 default. Drop or rewrite the column in the source, or edit the \
+                 dump by hand, before migrating."
+            );
+        }
         let identity_cache = if identity.is_empty() {
             None
         } else {
@@ -234,6 +254,35 @@ async fn read_identity_cache(pool: &Pool, oid_param: &str, column: &str) -> Resu
             Ok(1)
         }
     }
+}
+
+/// Refuse to export a table that has `CHECK` constraints. The DDL generator
+/// emits only columns + PK + identity, so a `CHECK` would be silently dropped —
+/// the destination would lose the constraint with no signal, exactly the
+/// protection a "recreate into a fresh cluster" migration must preserve. Fail
+/// fast naming the constraints so the operator can re-add them deliberately.
+async fn reject_check_constraints(pool: &Pool, oid_param: &str) -> Result<()> {
+    let rows: Vec<(String,)> = pool
+        .fetch_all_with_binds(
+            "SELECT conname FROM pg_constraint \
+             WHERE conrelid = $1::regclass AND contype = 'c' ORDER BY conname",
+            &[oid_param],
+        )
+        .await
+        .with_context(|| format!("Failed to read CHECK constraints for {oid_param}"))?;
+    if !rows.is_empty() {
+        let names = rows
+            .iter()
+            .map(|(n,)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "{oid_param} has CHECK constraint(s) [{names}], which export does not \
+             emit — they would be silently dropped on the destination. Remove them \
+             from the source or add them back by hand after migrating."
+        );
+    }
+    Ok(())
 }
 
 /// Read the primary key's backing index name and ordered columns. Returns

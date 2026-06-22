@@ -275,7 +275,10 @@ exporting, editing, and migrating into a fresh cluster.
 
 `export` covers tables, columns, `NOT NULL`, defaults, primary keys,
 identity columns (the counter carries over), secondary indexes, and row
-data. It does not export views, foreign keys, grants, or triggers.
+data. It does not export views, foreign keys, grants, or triggers. Tables
+with generated columns or `CHECK` constraints are **rejected** rather than
+silently exported without them — rewrite or drop those in the source (or
+edit the dump by hand) before migrating.
 
 Run `export` against a **quiesced source** (no concurrent writes): it reads
 each table in a separate query rather than one cluster-wide snapshot, so a

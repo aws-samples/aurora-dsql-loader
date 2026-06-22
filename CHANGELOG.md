@@ -14,7 +14,8 @@
   `--schema` / `--table` narrow the export; omit `--output` to write the
   dump to stdout. Exports tables, columns, `NOT NULL`, defaults, primary
   keys, identity columns, secondary indexes, and row data; does not export
-  views, foreign keys, grants, or triggers.
+  views, foreign keys, grants, or triggers, and rejects tables with
+  generated columns or `CHECK` constraints rather than dropping them.
 
 ## [3.1.0] - 2026-06-19
 

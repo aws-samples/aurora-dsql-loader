@@ -845,7 +845,8 @@ impl Worker {
                         // 40P01 - deadlock_detected
                         // 42001 - DSQL-specific transient error
                         // OC000 (data conflict) / OC001 (schema conflict) -
-                        //   DSQL optimistic-concurrency conflicts; transient,
+                        //   DSQL optimistic-concurrency conflicts ("schema has
+                        //   been updated by another transaction"); transient,
                         //   safe to retry (matches the connector's is_occ_error
                         //   set).
                         // 08xxx - Connection errors (08000, 08003, 08006, 08P01)

@@ -223,23 +223,48 @@ jobs:
           # false green — fail loudly if a precondition is missing.
           test -n "$LOADER_DSQL_E2E_ENDPOINT" || { echo "::error::LOADER_DSQL_E2E_ENDPOINT is empty"; exit 1; }
           test -s "$DSQL_PGDUMP_PROXY" || { echo "::error::pgdump-proxy not found at $DSQL_PGDUMP_PROXY"; exit 1; }
+          # `cargo test <filter> -- --ignored` exits 0 even when the filter
+          # matches ZERO tests, so a renamed e2e would silently stop running
+          # while CI stayed green. Assert the run did not match 0 tests.
+          run_e2e() {
+            local log; log="$(mktemp)"
+            # tee keeps live output; PIPESTATUS[0] preserves cargo's real exit
+            # code (a command substitution would swallow a genuine test failure).
+            cargo test --lib --verbose "$1" -- --ignored --nocapture 2>&1 | tee "$log"
+            local rc=${PIPESTATUS[0]}
+            test "$rc" -eq 0 || return "$rc"
+            grep -q "running 0 tests" "$log" && { echo "::error::e2e filter '$1' matched 0 tests (renamed?)"; return 1; }
+            return 0
+          }
           # Both ignored real-cluster migrate e2es: PG→DSQL (full dump) and
           # DSQL→DSQL (dump a DSQL cluster via the proxy, migrate it back).
           # `python3` (for the proxy) is preinstalled on ubuntu-latest runners.
-          cargo test --lib --verbose pgdump_migrate_real -- --ignored --nocapture
+          run_e2e pgdump_migrate_real
 
       - name: Run export E2E against real DSQL cluster
         run: |
+          # See run_e2e in the prior step: guards against a renamed e2e
+          # silently matching 0 tests while CI stays green.
+          run_e2e() {
+            local log; log="$(mktemp)"
+            # tee keeps live output; PIPESTATUS[0] preserves cargo's real exit
+            # code (a command substitution would swallow a genuine test failure).
+            cargo test --lib --verbose "$1" -- --ignored --nocapture 2>&1 | tee "$log"
+            local rc=${PIPESTATUS[0]}
+            test "$rc" -eq 0 || return "$rc"
+            grep -q "running 0 tests" "$log" && { echo "::error::e2e filter '$1' matched 0 tests (renamed?)"; return 1; }
+            return 0
+          }
           # Native export → edit → migrate, all against the real cluster: the
           # DSQL→DSQL workflow the README documents (no pg_dump, no proxy).
           test -n "$LOADER_DSQL_E2E_ENDPOINT" || { echo "::error::LOADER_DSQL_E2E_ENDPOINT is empty"; exit 1; }
-          cargo test --lib --verbose export_then_migrate_dsql_to_dsql -- --ignored --nocapture
+          run_e2e export_then_migrate_dsql_to_dsql
           # Fine-grained data-fidelity proof (PG→PG via the postgres service):
           # bytea hex, jsonb, timestamptz, \N-literal text, embedded tab/newline,
           # bidirectional EXCEPT. Complements the real-DSQL test above; needs only
           # PGDUMP_E2E_SOURCE_URL (set on this job), not the DSQL cluster.
           test -n "$PGDUMP_E2E_SOURCE_URL" || { echo "::error::PGDUMP_E2E_SOURCE_URL is empty"; exit 1; }
-          cargo test --lib --verbose export_round_trip_pg_to_pg -- --ignored --nocapture
+          run_e2e export_round_trip_pg_to_pg
 
   delete-cluster:
     name: Delete DSQL cluster
