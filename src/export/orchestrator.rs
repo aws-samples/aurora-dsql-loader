@@ -53,22 +53,10 @@ pub async fn run_export(args: ExportArgs) -> Result<ExportReport> {
     // typo's output pipe straight into `migrate` and look like a clean run, so
     // fail loudly with the filters that produced nothing.
     if tables.is_empty() {
-        match (args.schema.as_deref(), args.table.as_deref()) {
-            (Some(s), Some(t)) => anyhow::bail!(
-                "export matched no tables for --schema {s:?} --table {t:?}; check the names"
-            ),
-            (Some(s), None) => {
-                anyhow::bail!("export matched no tables in --schema {s:?}; check the name")
-            }
-            (None, Some(t)) => {
-                anyhow::bail!("export matched no table named --table {t:?}; check the name")
-            }
-            (None, None) => {
-                anyhow::bail!(
-                    "export found no user tables in the source cluster; nothing to export"
-                )
-            }
-        }
+        anyhow::bail!(empty_match_message(
+            args.schema.as_deref(),
+            args.table.as_deref()
+        ));
     }
 
     let mut exports = Vec::with_capacity(tables.len());
@@ -92,6 +80,23 @@ pub async fn run_export(args: ExportArgs) -> Result<ExportReport> {
         tables: table_names,
         bytes_written: dump.len(),
     })
+}
+
+/// Build the "matched no tables" error message for the active filters. Pure so
+/// the four filter combinations can be unit-tested without a live catalog. Uses
+/// `{:?}` on the filter values, which escapes control/bidi bytes (so a crafted
+/// `--table` can't reflow the operator's terminal through the error).
+fn empty_match_message(schema: Option<&str>, table: Option<&str>) -> String {
+    match (schema, table) {
+        (Some(s), Some(t)) => {
+            format!("export matched no tables for --schema {s:?} --table {t:?}; check the names")
+        }
+        (Some(s), None) => format!("export matched no tables in --schema {s:?}; check the name"),
+        (None, Some(t)) => format!("export matched no table named --table {t:?}; check the name"),
+        (None, None) => {
+            "export found no user tables in the source cluster; nothing to export".to_string()
+        }
+    }
 }
 
 /// Write the assembled dump to the destination file, or stdout when `None`.
@@ -124,4 +129,43 @@ async fn build_pool(args: &ExportArgs) -> Result<Pool> {
         .username(&args.username)
         .build()?;
     build_dsql_pool(pool_args).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_match_message;
+
+    #[test]
+    fn empty_match_message_names_the_active_filters() {
+        // Each filter combination gets a distinct message naming what matched
+        // nothing, so a typo'd --schema/--table is actionable rather than a
+        // silent 0-byte dump. Guards the four arms of the empty-match bail.
+        let both = empty_match_message(Some("sales"), Some("orders"));
+        assert!(both.contains("sales") && both.contains("orders"), "{both}");
+        assert!(
+            both.contains("--schema") && both.contains("--table"),
+            "{both}"
+        );
+
+        let schema_only = empty_match_message(Some("sales"), None);
+        assert!(schema_only.contains("sales") && schema_only.contains("--schema"));
+        assert!(!schema_only.contains("--table"), "{schema_only}");
+
+        let table_only = empty_match_message(None, Some("orders"));
+        assert!(table_only.contains("orders") && table_only.contains("--table"));
+        assert!(!table_only.contains("--schema"), "{table_only}");
+
+        let neither = empty_match_message(None, None);
+        assert!(neither.contains("no user tables"), "{neither}");
+        assert!(!neither.contains("--schema") && !neither.contains("--table"));
+    }
+
+    #[test]
+    fn empty_match_message_escapes_control_bytes_in_filters() {
+        // `{:?}` (Debug) escapes control/bidi bytes so a crafted --table can't
+        // reflow the operator's terminal through the error line.
+        let msg = empty_match_message(None, Some("evil\u{202e}\nname"));
+        assert!(!msg.contains('\n'), "raw newline leaked: {msg:?}");
+        assert!(!msg.contains('\u{202e}'), "RTL override leaked: {msg:?}");
+    }
 }
