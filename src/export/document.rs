@@ -14,12 +14,18 @@ pub struct TableExport {
     pub index_defs: Vec<String>,
     pub copy_columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
+    /// `setval(...)` statement to advance the identity column's sequence past
+    /// the loaded rows, or `None` when the table has no identity / no rows.
+    /// Emitted as the lint-safe `SELECT pg_catalog.setval(...)` form because
+    /// DSQL rejects `ALTER … RESTART`.
+    pub identity_setval: Option<String>,
 }
 
 /// Assemble all tables into one pg_dump-shaped `.sql` document. Each table
 /// emits its `CREATE TABLE`, then any index statements, then its COPY block,
-/// blank-line separated so the migrate scanner cleanly delimits DDL from
-/// data blocks.
+/// then an identity-sequence `setval` so a reload's next insert continues
+/// past the loaded rows. Blank-line separated so the migrate scanner cleanly
+/// delimits DDL from data blocks.
 pub fn assemble_dump(exports: &[TableExport]) -> String {
     let mut out = String::new();
     for export in exports {
@@ -42,6 +48,11 @@ pub fn assemble_dump(exports: &[TableExport]) -> String {
             out.push('\n');
         }
         out.push_str("\\.\n\n");
+
+        if let Some(setval) = &export.identity_setval {
+            out.push_str(setval);
+            out.push_str(";\n\n");
+        }
     }
     out
 }
@@ -75,18 +86,28 @@ mod tests {
         }
     }
 
+    /// A `TableExport` for `simple_table()` with no indexes / no identity —
+    /// keeps the per-test literals focused on what each test exercises.
+    fn export_of(rows: Vec<Vec<Option<String>>>) -> TableExport {
+        TableExport {
+            table: simple_table(),
+            index_defs: vec![],
+            copy_columns: vec!["id".into(), "name".into()],
+            rows,
+            identity_setval: None,
+        }
+    }
+
     #[test]
     fn one_table_ddl_then_indexes_then_copy_block() {
         let export = TableExport {
-            table: simple_table(),
             index_defs: vec![
                 "CREATE INDEX idx_t_name ON public.t USING btree_index (name)".into(),
             ],
-            copy_columns: vec!["id".into(), "name".into()],
-            rows: vec![
+            ..export_of(vec![
                 vec![Some("1".into()), Some("alice".into())],
                 vec![Some("2".into()), None],
-            ],
+            ])
         };
 
         let dump = assemble_dump(&[export]);
@@ -113,32 +134,34 @@ COPY \"public\".\"t\" (\"id\", \"name\") FROM stdin;
     fn empty_table_still_emits_copy_block_with_terminator() {
         // A table with no rows must still emit its COPY header + `\.` so the
         // migrate scanner sees a well-formed (empty) block.
-        let export = TableExport {
-            table: simple_table(),
-            index_defs: vec![],
-            copy_columns: vec!["id".into(), "name".into()],
-            rows: vec![],
-        };
-        let dump = assemble_dump(&[export]);
+        let dump = assemble_dump(&[export_of(vec![])]);
         assert!(dump.contains("COPY \"public\".\"t\" (\"id\", \"name\") FROM stdin;\n\\.\n"));
     }
 
     #[test]
+    fn identity_setval_emitted_after_copy_block() {
+        // The identity-continuation statement lands after the `\.` so the
+        // sequence is advanced once the data is in place.
+        let export = TableExport {
+            identity_setval: Some(
+                "SELECT pg_catalog.setval('public.t_id_seq', 2, true)".into(),
+            ),
+            ..export_of(vec![
+                vec![Some("1".into()), Some("alice".into())],
+                vec![Some("2".into()), Some("bob".into())],
+            ])
+        };
+        let dump = assemble_dump(&[export]);
+        let term = dump.find("\\.\n").expect("terminator present");
+        let setval = dump
+            .find("SELECT pg_catalog.setval('public.t_id_seq', 2, true);")
+            .expect("setval present");
+        assert!(setval > term, "setval must follow the COPY terminator");
+    }
+
+    #[test]
     fn multiple_tables_are_separated() {
-        let dump = assemble_dump(&[
-            TableExport {
-                table: simple_table(),
-                index_defs: vec![],
-                copy_columns: vec!["id".into(), "name".into()],
-                rows: vec![],
-            },
-            TableExport {
-                table: simple_table(),
-                index_defs: vec![],
-                copy_columns: vec!["id".into(), "name".into()],
-                rows: vec![],
-            },
-        ]);
+        let dump = assemble_dump(&[export_of(vec![]), export_of(vec![])]);
         // Two CREATE TABLE statements present.
         assert_eq!(dump.matches("CREATE TABLE").count(), 2);
     }

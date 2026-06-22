@@ -71,12 +71,57 @@ pub async fn read_table_export(pool: &Pool, schema: &str, table: &str) -> Result
     let copy_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
     let rows = read_rows(pool, schema, table, &copy_columns, &pk_columns).await?;
 
+    let identity_col = columns.iter().find(|c| c.identity_cache.is_some());
+    let identity_setval = match identity_col {
+        Some(col) if !rows.is_empty() => {
+            read_identity_setval(pool, schema, table, &col.name).await?
+        }
+        _ => None,
+    };
+
     Ok(TableExport {
         table: table_def,
         index_defs,
         copy_columns,
         rows,
+        identity_setval,
     })
+}
+
+/// Build the lint-safe `setval` that advances the identity column's sequence
+/// past the loaded rows, so a reloaded cluster's next implicit insert
+/// continues past them. Returns `None` when the column is empty (max is NULL)
+/// or the sequence can't be resolved. We use `setval(seq, max, true)` rather
+/// than `ALTER … RESTART`, which DSQL's parser rejects.
+async fn read_identity_setval(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<Option<String>> {
+    let oid_param = format!("{schema}.{table}");
+    let qualified = pool.qualified_table_name(schema, table);
+    // (sequence_name, max_value-as-text): both from one row, so an empty
+    // table yields a NULL max and we skip.
+    let rows: Vec<(Option<String>, Option<String>)> = pool
+        .fetch_all_with_binds(
+            &format!(
+                "SELECT pg_get_serial_sequence($1, $2), max({col})::text FROM {qualified}",
+                col = quote_ident(column),
+            ),
+            &[&oid_param, column],
+        )
+        .await
+        .with_context(|| format!("Failed to read identity max for {oid_param}.{column}"))?;
+
+    let Some((Some(seq), Some(max))) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    // setval's first arg is a regclass text literal; escape embedded quotes.
+    let seq_lit = seq.replace('\'', "''");
+    Ok(Some(format!(
+        "SELECT pg_catalog.setval('{seq_lit}', {max}, true)"
+    )))
 }
 
 /// Read column definitions in attnum order. Identity columns carry their
