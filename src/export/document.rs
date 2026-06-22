@@ -101,9 +101,7 @@ mod tests {
     #[test]
     fn one_table_ddl_then_indexes_then_copy_block() {
         let export = TableExport {
-            index_defs: vec![
-                "CREATE INDEX idx_t_name ON public.t USING btree_index (name)".into(),
-            ],
+            index_defs: vec!["CREATE INDEX idx_t_name ON public.t USING btree_index (name)".into()],
             ..export_of(vec![
                 vec![Some("1".into()), Some("alice".into())],
                 vec![Some("2".into()), None],
@@ -143,9 +141,7 @@ COPY \"public\".\"t\" (\"id\", \"name\") FROM stdin;
         // The identity-continuation statement lands after the `\.` so the
         // sequence is advanced once the data is in place.
         let export = TableExport {
-            identity_setval: Some(
-                "SELECT pg_catalog.setval('public.t_id_seq', 2, true)".into(),
-            ),
+            identity_setval: Some("SELECT pg_catalog.setval('public.t_id_seq', 2, true)".into()),
             ..export_of(vec![
                 vec![Some("1".into()), Some("alice".into())],
                 vec![Some("2".into()), Some("bob".into())],

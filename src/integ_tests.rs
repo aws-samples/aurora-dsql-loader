@@ -5751,10 +5751,7 @@ mod tests {
             // unquoted implicit name (`<table>_id_seq`); retarget it so the
             // continuation lands on the dst table's own sequence. (In a real
             // cross-cluster move no rewrite is needed — names are identical.)
-            .replace(
-                &format!("{src}_id_seq"),
-                &format!("{dst}_id_seq"),
-            );
+            .replace(&format!("{src}_id_seq"), &format!("{dst}_id_seq"));
         let retargeted_path = dump_dir.path().join("retargeted.sql");
         std::fs::write(&retargeted_path, &retargeted)?;
 
@@ -5787,7 +5784,8 @@ mod tests {
         assert_eq!(migrate_report.tables[0].records_failed, 0);
 
         // FIDELITY: PG compares src vs dst itself, both directions.
-        let projection = "id, name, bal, status, note, encode(blob, 'hex'), payload::text, ts::text";
+        let projection =
+            "id, name, bal, status, note, encode(blob, 'hex'), payload::text, ts::text";
         let (src_minus_dst,): (i64,) = sqlx::query_as(&format!(
             "SELECT COUNT(*) FROM (SELECT {projection} FROM {src} EXCEPT SELECT {projection} FROM {dst}) d"
         ))
@@ -5812,7 +5810,10 @@ mod tests {
         let (max_id,): (i64,) = sqlx::query_as(&format!("SELECT MAX(id) FROM {dst}"))
             .fetch_one(&pg_pool)
             .await?;
-        assert!(max_id > 3, "identity must continue past loaded rows, got {max_id}");
+        assert!(
+            max_id > 3,
+            "identity must continue past loaded rows, got {max_id}"
+        );
 
         let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {src}, {dst}"))
             .execute(&pg_pool)

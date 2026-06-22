@@ -327,6 +327,9 @@ mod tests {
             "CREATE INDEX idx_t_name ON public.t (name)".to_string(),
         )];
         let kept = select_index_defs(&indexes, None);
-        assert_eq!(kept, vec!["CREATE INDEX idx_t_name ON public.t (name)".to_string()]);
+        assert_eq!(
+            kept,
+            vec!["CREATE INDEX idx_t_name ON public.t (name)".to_string()]
+        );
     }
 }
