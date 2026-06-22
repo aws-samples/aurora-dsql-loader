@@ -428,7 +428,14 @@ fn init_tracing(quiet: bool) {
             EnvFilter::new("aurora_dsql_loader=info,sqlx=off")
         }
     });
-    let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
+    // Write logs to stderr so they never corrupt a stdout payload — `export`
+    // without `--output` streams the `.sql` dump to stdout, and an interleaved
+    // `tracing::warn!` (e.g. the identity-sequence warnings) would mangle the
+    // dump that pipes into `migrate`. stdout is reserved for the payload.
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 

@@ -277,6 +277,13 @@ exporting, editing, and migrating into a fresh cluster.
 identity columns (the counter carries over), secondary indexes, and row
 data. It does not export views, foreign keys, grants, or triggers.
 
+Run `export` against a **quiesced source** (no concurrent writes): it reads
+each table in a separate query rather than one cluster-wide snapshot, so a
+write mid-export can produce an internally inconsistent dump. It also buffers
+the whole dump in memory before writing, so it suits the one-time-migration
+use case rather than continuously replicating a very large, actively-written
+cluster.
+
 **Options:** `--schema NAME` / `--table NAME` narrow the export to one
 schema or table; omit `--output` to write to stdout.
 
