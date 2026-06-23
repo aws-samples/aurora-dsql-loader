@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [3.2.0] - 2026-06-23
 
 ### Added
 - New `export` subcommand: reads a source DSQL cluster's catalog directly
