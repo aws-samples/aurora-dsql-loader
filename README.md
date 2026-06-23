@@ -4,6 +4,34 @@ Fast, parallel data loader for Aurora DSQL. Load CSV, TSV, and Parquet files int
 
 > Migrating from Python v1? See [CHANGELOG.md](CHANGELOG.md).
 
+## Contents
+
+- [Quick Start](#quick-start)
+- [Commands](#commands)
+- [Examples](#examples)
+  - [Load CSV, TSV, or Parquet](#load-csv-tsv-or-parquet)
+  - [Load from a pg_dump file](#load-from-a-pg_dump-file)
+  - [Migrate a full pg_dump into DSQL](#migrate-a-full-pg_dump-into-dsql)
+  - [Migrate from another DSQL cluster](#migrate-from-another-dsql-cluster)
+  - [CSV/TSV header behavior](#csvtsv-header-behavior)
+- [Resuming Failed Loads](#resuming-failed-loads)
+- [Verification](#verification)
+- [Performance Tuning](#performance-tuning)
+- [Requirements](#requirements)
+- [Options](#options)
+- [Troubleshooting](#troubleshooting)
+
+## Commands
+
+| Command | What it does |
+|---------|--------------|
+| `load` | Load a CSV, TSV, Parquet, or `pg_dump` data file into an existing DSQL table. |
+| `migrate` | Apply a full `pg_dump` (DDL + data) into DSQL: create tables, then load. |
+| `export` | Read a DSQL cluster into a plain `.sql` file (schema + data) for `migrate`. |
+| `list-tables` | List the tables in a `pg_dump` file (for scripting multi-table loads). |
+
+Run `aurora-dsql-loader <command> --help` for the full flag set.
+
 ## Quick Start
 
 ### 1. Install
@@ -45,7 +73,9 @@ That's it! The loader will:
 - Load data in parallel with progress tracking
 - Handle retries and errors automatically
 
-## Common Examples
+## Examples
+
+### Load CSV, TSV, or Parquet
 
 **Load from S3:**
 ```bash
@@ -83,7 +113,8 @@ aurora-dsql-loader load \
 ```
 Listed columns are dropped from the INSERT so DSQL applies the column's `DEFAULT` expression (e.g. `gen_random_uuid()`, `CURRENT_TIMESTAMP`). Source records must still contain these columns in their original positions.
 
-**Load from a pg_dump file:**
+### Load from a pg_dump file
+
 ```bash
 # 1. Generate the dump on the source PG side:
 pg_dump --data-only --table=users mydb > users.sql
@@ -130,7 +161,7 @@ COPY clause. Order does not matter — the loader reorders columns by name to
 match the dump. A column-set mismatch (extra or missing columns) is rejected
 with a clear error before any rows are loaded.
 
-**Migrate a full pg_dump (DDL + data) into DSQL with one command:**
+### Migrate a full pg_dump into DSQL
 
 ```bash
 # 1. Generate a FULL dump (no --data-only) so the DDL is included.
@@ -217,46 +248,47 @@ target. If you need to refresh into a populated cluster, drop the
 `--clean` flag from `pg_dump` and either truncate the target tables
 manually or migrate into a fresh cluster.
 
-**Migrate from another DSQL cluster (DSQL → DSQL):**
+### Migrate from another DSQL cluster
 
-`migrate` consumes a plain `pg_dump`, so migrating between DSQL clusters
-is the same command — once you can produce the dump. Two wrinkles, both
-handled automatically:
-
-1. **Stock `pg_dump` can't read a DSQL cluster.** On connect it issues
-   session settings (`statement_timeout`, `synchronize_seqscans`, …) and
-   a per-table `LOCK` that DSQL rejects, and it aborts. Use the
-   [pgdump-proxy](https://github.com/awslabs/aurora-dsql-tools/tree/main/pgdump-proxy)
-   — a tiny stdlib wire proxy that lets stock `pg_dump` dump a DSQL
-   cluster:
-   ```bash
-   # Terminal 1: bridge plaintext localhost:6543 -> DSQL TLS
-   python3 dsql_pgdump_proxy.py source-cluster.dsql.us-east-1.on.aws
-
-   # Terminal 2: dump through the proxy (password is a DSQL auth token)
-   export PGPASSWORD="$(aws dsql generate-db-connect-admin-auth-token \
-     --hostname source-cluster.dsql.us-east-1.on.aws --region us-east-1 \
-     --expires-in 3600)"
-   pg_dump -Fp --no-owner --no-privileges \
-     "host=127.0.0.1 port=6543 dbname=postgres user=admin" > dsql.sql
-   ```
-2. **A DSQL dump contains DSQL-only idioms.** A DSQL cluster emits
-   identity columns as a standalone `ALTER TABLE … ADD GENERATED … AS
-   IDENTITY` and stamps `SET COMPRESSION` on columns — neither of which
-   DSQL accepts as input. `dsql-lint` (0.2.9+) collapses the identity
-   inline onto the `CREATE TABLE` and strips `SET COMPRESSION`
-   automatically; the migrate flow handles them with no extra flags.
+`export` reads a DSQL cluster directly and writes a plain `.sql` file
+(schema + data). Feed that file to `migrate` to load it into another
+cluster:
 
 ```bash
+# 1. Export the source cluster.
+aurora-dsql-loader export \
+  --endpoint source-cluster.dsql.us-east-1.on.aws \
+  --output dsql.sql
+
+# 2. (Optional) edit dsql.sql — change a column type, add a constraint, etc.
+
+# 3. Migrate it into the destination cluster.
 aurora-dsql-loader migrate \
   --endpoint dest-cluster.dsql.us-east-1.on.aws \
   --source-uri dsql.sql
 ```
 
-Unlike a SERIAL source, the identity counter **is** advanced after a
-DSQL→DSQL migrate: pg_dump's trailing `setval(...)` lands on the inline
-identity's implicit sequence, so the next insert continues past the
-loaded rows — no manual `RESTART WITH` needed.
+Step 2 is optional but useful: since the export is plain SQL, you can
+edit it before loading. This is the way to change something DSQL won't
+let you alter in place — e.g. a column type or a constraint — by
+exporting, editing, and migrating into a fresh cluster.
+
+`export` covers tables, columns, `NOT NULL`, defaults, primary keys,
+identity columns (the counter carries over), secondary indexes, and row
+data. It does not export views, foreign keys, grants, or triggers. Tables
+with generated columns or `CHECK` constraints are **rejected** rather than
+silently exported without them — rewrite or drop those in the source (or
+edit the dump by hand) before migrating.
+
+Run `export` against a **quiesced source** (no concurrent writes): it reads
+each table in a separate query rather than one cluster-wide snapshot, so a
+write mid-export can produce an internally inconsistent dump. It also buffers
+the whole dump in memory before writing, so it suits the one-time-migration
+use case rather than continuously replicating a very large, actively-written
+cluster.
+
+**Options:** `--schema NAME` / `--table NAME` narrow the export to one
+schema or table; omit `--output` to write to stdout.
 
 ### CSV/TSV header behavior
 
@@ -287,14 +319,6 @@ aurora-dsql-loader load \
 > assumed a header row and silently dropped the first data row when one was
 > missing. Add `--header` to any 2.x invocation that loaded a header-bearing
 > file. See the [CHANGELOG](CHANGELOG.md) for full migration notes.
-
-## Key Features
-
-- **Fast**: Parallel loading with configurable workers
-- **Smart**: Auto-detects file format and region
-- **Reliable**: Automatic retries and fault-tolerant loading
-- **Flexible**: Works with local files or S3 URIs
-- **Formats**: CSV, TSV, and Parquet support
 
 ## Resuming Failed Loads
 
@@ -378,9 +402,11 @@ aurora-dsql-loader load \
 
 ## Options
 
-See all options with:
+See all options for each subcommand with:
 ```bash
 aurora-dsql-loader load --help
+aurora-dsql-loader migrate --help
+aurora-dsql-loader export --help
 ```
 
 ## Troubleshooting

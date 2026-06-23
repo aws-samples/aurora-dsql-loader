@@ -15,6 +15,7 @@ mod scan;
 #[cfg(test)]
 mod tests;
 
+pub use escape::encode_field;
 pub use reader::PgDumpReader;
 pub(crate) use scan::find_copy_block;
 pub use scan::{CopyBlock, extract_ddl, list_copy_blocks};

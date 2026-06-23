@@ -29,3 +29,6 @@
 # Coding agents
 .kiro/
 **/.claude/**
+
+# Local design/planning notes — not part of the published repo
+docs/plans/

@@ -14,6 +14,31 @@ pub fn decode_field(input: &[u8]) -> Option<String> {
     Some(decode_non_null(input))
 }
 
+/// Encode one field into COPY text format — the inverse of [`decode_field`].
+/// `None` is SQL NULL and renders as the `\N` sentinel; `Some(s)` escapes
+/// exactly the characters `decode_field`'s named escapes cover, so any value
+/// round-trips through `decode_field(encode_field(v)) == v`. Used by the
+/// `export` path to emit `COPY ... FROM stdin` rows.
+pub fn encode_field(value: Option<&str>) -> String {
+    let Some(s) = value else {
+        return "\\N".to_string();
+    };
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0b}' => out.push_str("\\v"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn decode_non_null(input: &[u8]) -> String {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;

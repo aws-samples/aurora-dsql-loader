@@ -844,10 +844,11 @@ impl Worker {
                         // 40001 - serialization_failure (transaction conflicts)
                         // 40P01 - deadlock_detected
                         // 42001 - DSQL-specific transient error
-                        // OC000/OC001 - DSQL optimistic-concurrency conflict
-                        //   ("schema has been updated by another transaction");
-                        //   transient, safe to retry (matches the connector's
-                        //   is_occ_error set).
+                        // OC000 (data conflict) / OC001 (schema conflict) -
+                        //   DSQL optimistic-concurrency conflicts ("schema has
+                        //   been updated by another transaction"); transient,
+                        //   safe to retry (matches the connector's is_occ_error
+                        //   set).
                         // 08xxx - Connection errors (08000, 08003, 08006, 08P01)
                         // 53xxx - Insufficient resources (53000, 53100, 53200, 53300, 53400)
                         // 57xxx - Operator intervention (57000, 57014, 57P01, 57P02, 57P03)
