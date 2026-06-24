@@ -221,6 +221,134 @@ mod tests {
         0
     }
 
+    /// True if `table_name` exists in the SQLite test DB (sqlite_master lookup).
+    async fn sqlite_table_exists(pool: &Pool, table_name: &str) -> bool {
+        if let Ok(mut conn) = pool.acquire().await
+            && let PoolConnection::Sqlite(ref mut sqlite_conn) = conn
+        {
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+            )
+            .bind(table_name)
+            .fetch_one(&mut **sqlite_conn)
+            .await
+            .unwrap();
+            return n > 0;
+        }
+        false
+    }
+
+    /// Build a `LoadArgs` for a CSV load against `pool`, with the atomic and
+    /// if-not-exists toggles exposed (everything else defaulted).
+    fn atomic_load_args(
+        pool: &Pool,
+        table: &str,
+        csv_path: &str,
+        atomic: bool,
+        if_not_exists: bool,
+    ) -> LoadArgs {
+        LoadArgs {
+            endpoint: "test".to_string(),
+            region: "us-west-2".to_string(),
+            username: "test".to_string(),
+            source_uri: csv_path.to_string(),
+            target_table: table.to_string(),
+            schema: "public".to_string(),
+            format: Format::Csv,
+            worker_count: 1,
+            chunk_size_bytes: 1_000_000,
+            batch_size: 10,
+            batch_concurrency: 1,
+            create_table_if_missing: if_not_exists,
+            atomic,
+            manifest_dir: None,
+            quiet: true,
+            debug: false,
+            column_mappings: HashMap::new(),
+            resume_job_id: None,
+            on_conflict: crate::coordination::manifest::OnConflict::DoNothing,
+            exclude_columns: Vec::new(),
+            delimiter: None,
+            quote: None,
+            escape: None,
+            has_header: Some(true),
+            verify: VerifyMode::Off,
+            test_pool: Some(pool.clone()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_atomic_requires_if_not_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "ok.csv", 5).await;
+        let pool =
+            setup_sqlite_table("atomic_pre", "id TEXT, name TEXT, value TEXT, amount TEXT").await;
+
+        let args = atomic_load_args(&pool, "atomic_pre", &csv_path, true, false);
+        let err = run_load(args).await.unwrap_err().to_string();
+        assert!(err.contains("--atomic requires --if-not-exists"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_atomic_refuses_existing_table() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "ok.csv", 5).await;
+        // Pre-existing table with a row: --atomic must never drop it.
+        let pool = setup_sqlite_table(
+            "atomic_exists",
+            "id TEXT, name TEXT, value TEXT, amount TEXT",
+        )
+        .await;
+        pool.execute_query("INSERT INTO atomic_exists VALUES ('x','x','x','x')")
+            .await
+            .unwrap();
+
+        let args = atomic_load_args(&pool, "atomic_exists", &csv_path, true, true);
+        let err = run_load(args).await.unwrap_err().to_string();
+        assert!(err.contains("refuses to load into existing table"), "{err}");
+        assert_eq!(get_table_count(&pool, "atomic_exists").await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_atomic_drops_table_on_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        // Inconsistent column counts force a deterministic partial failure.
+        let csv_path = create_csv_with_content(
+            &temp_dir,
+            "bad.csv",
+            &[
+                "id,name,value\n",
+                "1,alice,100\n",
+                "2,bob\n", // missing column → fails
+                "3,charlie,300\n",
+                "4,diana,400,extra\n", // extra column → fails
+            ],
+        )
+        .await;
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+
+        let args = atomic_load_args(&pool, "atomic_rollback", &csv_path, true, true);
+        let err = run_load(args).await.unwrap_err().to_string();
+        assert!(err.contains("rolled back"), "{err}");
+        assert!(
+            !sqlite_table_exists(&pool, "atomic_rollback").await,
+            "atomic load must DROP the table it created on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_atomic_keeps_table_on_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "ok.csv", 20).await;
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+
+        let args = atomic_load_args(&pool, "atomic_success", &csv_path, true, true);
+        let result = run_load(args).await.unwrap();
+        assert_eq!(result.records_failed, 0);
+        assert!(sqlite_table_exists(&pool, "atomic_success").await);
+        assert_eq!(get_table_count(&pool, "atomic_success").await, 20);
+    }
+
     // ============ Tests ============
 
     #[tokio::test]
@@ -500,6 +628,7 @@ mod tests {
             batch_size: 10,
             batch_concurrency: 2,
             create_table_if_missing: false, // Table already created
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: true,
@@ -589,6 +718,7 @@ mod tests {
             batch_size: 20,
             batch_concurrency: 2,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: true,
@@ -731,6 +861,7 @@ mod tests {
             batch_size: 10,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None, // Don't specify manifest dir - this is key
             quiet: true,
             debug: true,
@@ -1002,6 +1133,7 @@ mod tests {
             batch_size: 10,
             batch_concurrency: 2,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: true,
@@ -1105,6 +1237,7 @@ mod tests {
             batch_size: 10,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: Some(manifest_path.clone()),
             quiet: true,
             debug: true,
@@ -1196,6 +1329,7 @@ mod tests {
             batch_size: 10,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: Some(manifest_path.clone()),
             quiet: true,
             debug: true,
@@ -1319,6 +1453,7 @@ mod tests {
             batch_size: 5,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: Some(manifest_path.clone()),
             quiet: true,
             debug: true,
@@ -1432,6 +1567,7 @@ mod tests {
             batch_size: 5,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: Some(manifest_path.clone()),
             quiet: true,
             debug: true,
@@ -1934,6 +2070,7 @@ mod tests {
             batch_size: 10,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
@@ -2108,6 +2245,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
@@ -2234,6 +2372,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
@@ -2284,6 +2423,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
@@ -2359,6 +2499,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
@@ -4020,6 +4161,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
@@ -4323,6 +4465,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
@@ -5446,6 +5589,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
@@ -5491,6 +5635,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
@@ -5554,6 +5699,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 1,
             create_table_if_missing: true,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,

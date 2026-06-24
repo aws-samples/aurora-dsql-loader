@@ -343,6 +343,21 @@ aurora-dsql-loader load \
 
 Resume automatically retries failed chunks and skips completed ones. For safety against duplicates on retry, use unique constraints on your table—the loader will use `ON CONFLICT DO NOTHING` to skip duplicates.
 
+## Atomic Loads (all-or-nothing)
+
+DSQL caps every transaction at 3,000 rows / 10 MiB / 5 min and has no `SAVEPOINT`, so a parallel bulk load can't be one atomic transaction. The one clean rollback is to drop a table the loader created this run, so `--atomic` covers exactly that case:
+
+```bash
+aurora-dsql-loader load \
+  --endpoint your-cluster.dsql.us-east-1.on.aws \
+  --source-uri data.csv \
+  --table new_table \
+  --if-not-exists \
+  --atomic
+```
+
+On any failure the loader drops the table it created and exits non-zero, leaving the cluster as it was. `--atomic` requires `--if-not-exists` and refuses to run if the table already exists (it will not drop pre-existing data—drop it yourself first). Loading into an existing table atomically is not yet supported.
+
 ## Verification
 
 After a load, `--verify` cross-checks what landed and prints one verdict per table. Pick the level by how much assurance you need vs. how much extra time you'll spend.

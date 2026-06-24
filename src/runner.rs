@@ -38,6 +38,7 @@ use tempfile::TempDir;
 use crate::coordination::manifest::{LocalManifestStorage, ParquetConfig, PgDumpConfig};
 use crate::coordination::{Coordinator, DsqlConfig, FileFormat, LoadConfigBuilder};
 use crate::db::pool::PoolArgsBuilder;
+use crate::db::schema::query_table_schema;
 use crate::db::{self as db_pool, SchemaInferrer};
 use crate::formats::pgdump::{CopyBlock, PgDumpReader, list_copy_blocks};
 use crate::formats::{DelimitedConfig, ReaderFactory};
@@ -110,6 +111,11 @@ pub struct LoadArgs {
 
     // Options
     pub create_table_if_missing: bool,
+    /// Opt-in all-or-nothing. DSQL can't run a multi-worker bulk load in one
+    /// transaction (3,000-row/txn cap, no SAVEPOINT), so the only clean
+    /// rollback is to DROP a table the loader created this run. Requires
+    /// `create_table_if_missing`; refuses if the table already exists.
+    pub atomic: bool,
     pub manifest_dir: Option<PathBuf>,
     pub quiet: bool,
     pub debug: bool,
@@ -197,6 +203,7 @@ pub struct LoadResult {
 ///     batch_size: 3000,
 ///     batch_concurrency: 20,
 ///     create_table_if_missing: true,
+///     atomic: false,
 ///     manifest_dir: None,
 ///     column_mappings: HashMap::new(),
 ///     quiet: true,
@@ -222,6 +229,34 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     // who skip `run_load` still get the same checks.
     validate_load_args(&args)?;
     let pool = build_pool(&args).await?;
+
+    // Only a table the loader creates this run is safe to DROP on failure;
+    // gate out the cases where rollback would destroy pre-existing data.
+    if args.atomic {
+        if !args.create_table_if_missing {
+            anyhow::bail!(
+                "--atomic requires --if-not-exists: rollback drops the table the loader \
+                 creates this run, so the table must not already exist (DSQL has no \
+                 SAVEPOINT and caps transactions at 3,000 rows, so a bulk load can't be \
+                 one atomic transaction)."
+            );
+        }
+        if query_table_schema(&pool, &args.schema, &args.target_table)
+            .await
+            .is_ok()
+        {
+            anyhow::bail!(
+                "--atomic refuses to load into existing table {}.{}: rollback would DROP it, \
+                 destroying pre-existing data. Drop it yourself first, or run without --atomic.",
+                args.schema,
+                args.target_table
+            );
+        }
+    }
+
+    let atomic = args.atomic;
+    let atomic_schema = args.schema.clone();
+    let atomic_table = args.target_table.clone();
 
     // L2 needs a stable pre/post pair AND an exact source count to be
     // meaningful. Skip on `--if-not-exists` (table may not exist yet, and a
@@ -262,7 +297,25 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     let format = args.format;
     let chunk_size_bytes = args.chunk_size_bytes;
 
-    let mut result = run_load_with_pool(pool.clone(), args).await?;
+    let mut result = match run_load_with_pool(pool.clone(), args).await {
+        Ok(r) if atomic && r.records_failed > 0 => {
+            drop_atomic_table(&pool, &atomic_schema, &atomic_table).await;
+            anyhow::bail!(
+                "--atomic: rolled back — {} record(s) failed; dropped table {}.{}.",
+                r.records_failed,
+                atomic_schema,
+                atomic_table
+            );
+        }
+        Ok(r) => r,
+        Err(e) if atomic => {
+            drop_atomic_table(&pool, &atomic_schema, &atomic_table).await;
+            return Err(e.context(format!(
+                "--atomic: rolled back — load failed; dropped table {atomic_schema}.{atomic_table}"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
 
     if verify_on {
         let target_post = if l2_runs {
@@ -324,6 +377,19 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     }
 
     Ok(result)
+}
+
+/// Drop the table created by an `--atomic` load that's about to fail. The
+/// DROP error is logged, not propagated, so it can't mask the load error the
+/// caller is already returning (the original cause is what the operator needs).
+async fn drop_atomic_table(pool: &crate::db::Pool, schema: &str, table: &str) {
+    let ddl = format!("DROP TABLE {}", pool.qualified_table_name(schema, table));
+    if let Err(e) = pool.execute_query(&ddl).await {
+        tracing::error!(
+            "--atomic: rollback DROP of {schema}.{table} failed: {e:#}. \
+             Drop it manually to restore the prior state."
+        );
+    }
 }
 
 /// Build the connection pool. Honors `args.test_pool` in `#[cfg(test)]`.
@@ -870,6 +936,7 @@ mod tests {
             batch_size: 1,
             batch_concurrency: 1,
             create_table_if_missing: false,
+            atomic: false,
             manifest_dir: None,
             quiet: true,
             debug: false,
