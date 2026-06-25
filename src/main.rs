@@ -100,6 +100,15 @@ struct LoadParams {
     #[arg(long)]
     if_not_exists: bool,
 
+    /// All-or-nothing: on any load failure, DROP the table the loader created
+    /// and exit non-zero. Requires --if-not-exists and refuses to run if the
+    /// table already exists or its absence can't be verified (it will not drop
+    /// pre-existing data); cannot be combined with --resume-job-id. DSQL can't
+    /// do a single-transaction bulk load (3,000-row/txn cap, no SAVEPOINT), so
+    /// this is the only clean rollback.
+    #[arg(long, requires = "if_not_exists", conflicts_with = "resume_job_id")]
+    atomic: bool,
+
     /// Column mapping from source to destination (format: src:dest,src2:dest2)
     #[arg(long)]
     column_map: Option<String>,
@@ -889,6 +898,7 @@ async fn run_loader(
         batch_size: load.batch_size,
         batch_concurrency: load.batch_concurrency,
         create_table_if_missing: load.if_not_exists,
+        atomic: load.atomic,
         manifest_dir: output.manifest_dir.clone().map(PathBuf::from),
         quiet: output.quiet,
         debug: output.debug,
@@ -1318,6 +1328,53 @@ mod tests {
         };
         // Assert on ErrorKind (the stable contract) rather than message wording,
         // which clap is free to re-phrase between releases.
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn atomic_requires_if_not_exists_at_parse_time() {
+        let result = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "test.csv",
+            "--table",
+            "t",
+            "--atomic",
+            "--dry-run",
+        ]);
+        let err = match result {
+            Ok(_) => panic!("clap should reject --atomic without --if-not-exists"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn atomic_conflicts_with_resume_at_parse_time() {
+        let result = Args::try_parse_from([
+            "aurora-dsql-loader",
+            "load",
+            "--endpoint",
+            "xxxx.dsql.us-east-1.on.aws",
+            "--source-uri",
+            "test.csv",
+            "--table",
+            "t",
+            "--if-not-exists",
+            "--atomic",
+            "--manifest-dir",
+            "/tmp/m",
+            "--resume-job-id",
+            "job-123",
+            "--dry-run",
+        ]);
+        let err = match result {
+            Ok(_) => panic!("clap should reject --atomic + --resume-job-id"),
+            Err(e) => e,
+        };
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
