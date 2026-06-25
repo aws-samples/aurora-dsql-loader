@@ -329,10 +329,31 @@ mod tests {
 
         let args = atomic_load_args(&pool, "atomic_rollback", &csv_path, true, true);
         let err = run_load(args).await.unwrap_err().to_string();
-        assert!(err.contains("rolled back"), "{err}");
+        // Pins the partial-failure arm and the truthful "dropped" message
+        // (not the hard-Err arm, and not the "rollback INCOMPLETE" wording).
+        assert!(err.contains("record(s) failed"), "{err}");
+        assert!(err.contains("rolled back — dropped table"), "{err}");
         assert!(
             !sqlite_table_exists(&pool, "atomic_rollback").await,
             "atomic load must DROP the table it created on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_atomic_rejects_resume() {
+        // Library callers bypass clap's `conflicts_with`, so run_load must
+        // also refuse --atomic + --resume-job-id (a dropped-table rollback
+        // can't be coherently resumed).
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = create_test_csv(&temp_dir, "ok.csv", 5).await;
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+
+        let mut args = atomic_load_args(&pool, "atomic_resume", &csv_path, true, true);
+        args.resume_job_id = Some("job-123".to_string());
+        let err = run_load(args).await.unwrap_err().to_string();
+        assert!(
+            err.contains("--atomic cannot be combined with --resume-job-id"),
+            "{err}"
         );
     }
 

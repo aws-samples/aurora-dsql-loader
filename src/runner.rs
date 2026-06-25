@@ -38,7 +38,6 @@ use tempfile::TempDir;
 use crate::coordination::manifest::{LocalManifestStorage, ParquetConfig, PgDumpConfig};
 use crate::coordination::{Coordinator, DsqlConfig, FileFormat, LoadConfigBuilder};
 use crate::db::pool::PoolArgsBuilder;
-use crate::db::schema::query_table_schema;
 use crate::db::{self as db_pool, SchemaInferrer};
 use crate::formats::pgdump::{CopyBlock, PgDumpReader, list_copy_blocks};
 use crate::formats::{DelimitedConfig, ReaderFactory};
@@ -230,33 +229,32 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     validate_load_args(&args)?;
     let pool = build_pool(&args).await?;
 
-    // Only a table the loader creates this run is safe to DROP on failure;
-    // gate out the cases where rollback would destroy pre-existing data.
-    if args.atomic {
-        if !args.create_table_if_missing {
-            anyhow::bail!(
-                "--atomic requires --if-not-exists: rollback drops the table the loader \
-                 creates this run, so the table must not already exist (DSQL has no \
-                 SAVEPOINT and caps transactions at 3,000 rows, so a bulk load can't be \
-                 one atomic transaction)."
-            );
-        }
-        if query_table_schema(&pool, &args.schema, &args.target_table)
+    // Only a table the loader creates this run is safe to DROP on failure.
+    // Fail CLOSED: a probe failure must abort, never be read as "table absent"
+    // and proceed — otherwise a transient error could let the load run against
+    // pre-existing data and then DROP it. (The flag-only `--atomic requires
+    // --if-not-exists` / no-resume checks live in `validate_load_args`.)
+    if args.atomic
+        && pool
+            .table_exists(&args.schema, &args.target_table)
             .await
-            .is_ok()
-        {
-            anyhow::bail!(
-                "--atomic refuses to load into existing table {}.{}: rollback would DROP it, \
-                 destroying pre-existing data. Drop it yourself first, or run without --atomic.",
-                args.schema,
-                args.target_table
-            );
-        }
+            .with_context(|| {
+                format!(
+                    "--atomic: could not verify whether target table {}.{} already exists; \
+                     refusing to run so rollback can never DROP pre-existing data",
+                    args.schema, args.target_table
+                )
+            })?
+    {
+        anyhow::bail!(
+            "--atomic refuses to load into existing table {}.{}: rollback would DROP it, \
+             destroying pre-existing data. Drop it yourself first, or run without --atomic.",
+            args.schema,
+            args.target_table
+        );
     }
 
     let atomic = args.atomic;
-    let atomic_schema = args.schema.clone();
-    let atomic_table = args.target_table.clone();
 
     // L2 needs a stable pre/post pair AND an exact source count to be
     // meaningful. Skip on `--if-not-exists` (table may not exist yet, and a
@@ -299,22 +297,27 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
 
     let mut result = match run_load_with_pool(pool.clone(), args).await {
         Ok(r) if atomic && r.records_failed > 0 => {
-            drop_atomic_table(&pool, &atomic_schema, &atomic_table).await;
+            let dropped = drop_atomic_table(&pool, &schema, &target_table).await;
+            let manifest = r
+                .persisted_manifest_dir
+                .as_ref()
+                .map(|p| format!(" Failure manifest preserved at {}.", p.display()))
+                .unwrap_or_default();
             anyhow::bail!(
-                "--atomic: rolled back — {} record(s) failed; dropped table {}.{}.",
+                "--atomic: {} record(s) failed; {}.{manifest}",
                 r.records_failed,
-                atomic_schema,
-                atomic_table
+                rollback_note(dropped, &schema, &target_table),
             );
         }
-        Ok(r) => r,
         Err(e) if atomic => {
-            drop_atomic_table(&pool, &atomic_schema, &atomic_table).await;
+            let dropped = drop_atomic_table(&pool, &schema, &target_table).await;
             return Err(e.context(format!(
-                "--atomic: rolled back — load failed; dropped table {atomic_schema}.{atomic_table}"
+                "--atomic: load failed; {}",
+                rollback_note(dropped, &schema, &target_table)
             )));
         }
-        Err(e) => return Err(e),
+        // Clean success, or a non-atomic error to propagate unchanged.
+        other => other?,
     };
 
     if verify_on {
@@ -379,16 +382,38 @@ pub async fn run_load(args: LoadArgs) -> Result<LoadResult> {
     Ok(result)
 }
 
-/// Drop the table created by an `--atomic` load that's about to fail. The
-/// DROP error is logged, not propagated, so it can't mask the load error the
-/// caller is already returning (the original cause is what the operator needs).
-async fn drop_atomic_table(pool: &crate::db::Pool, schema: &str, table: &str) {
-    let ddl = format!("DROP TABLE {}", pool.qualified_table_name(schema, table));
-    if let Err(e) = pool.execute_query(&ddl).await {
-        tracing::error!(
-            "--atomic: rollback DROP of {schema}.{table} failed: {e:#}. \
-             Drop it manually to restore the prior state."
-        );
+/// Drop the table created by an `--atomic` load that's about to fail. Returns
+/// `true` if the DROP succeeded. `IF EXISTS` keeps it idempotent when the load
+/// failed before the table was created. The DROP error is logged, not
+/// propagated, so it can't mask the load failure the caller reports — but the
+/// returned bool lets the caller tell the operator the truth (see
+/// `rollback_note`) instead of always claiming the table was dropped.
+async fn drop_atomic_table(pool: &crate::db::Pool, schema: &str, table: &str) -> bool {
+    let ddl = format!(
+        "DROP TABLE IF EXISTS {}",
+        pool.qualified_table_name(schema, table)
+    );
+    match pool.execute_query(&ddl).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                "--atomic: rollback DROP of {schema}.{table} failed: {e:#}. \
+                 Drop it manually to restore the prior state."
+            );
+            false
+        }
+    }
+}
+
+/// Operator-facing rollback status, honest about whether the DROP succeeded.
+fn rollback_note(dropped: bool, schema: &str, table: &str) -> String {
+    if dropped {
+        format!("rolled back — dropped table {schema}.{table}")
+    } else {
+        format!(
+            "rollback INCOMPLETE — cleanup DROP of {schema}.{table} also failed; \
+             the table may still exist with partial data, drop it manually"
+        )
     }
 }
 
@@ -654,6 +679,31 @@ fn validate_load_args(args: &LoadArgs) -> Result<()> {
             "--verify (count/full) cannot be combined with --resume-job-id: pre-count \
              would not include rows from the original run. Re-run with --verify=off."
         );
+    }
+
+    if args.atomic {
+        // Rollback drops the table the loader creates this run, so the table
+        // must not already exist. (DSQL has no SAVEPOINT and caps transactions
+        // at 3,000 rows, so a bulk load can't be one atomic transaction.) clap
+        // also enforces `requires`, but library callers of `run_load` bypass it.
+        if !args.create_table_if_missing {
+            anyhow::bail!(
+                "--atomic requires --if-not-exists: rollback drops the table the loader \
+                 creates this run, so the table must not already exist."
+            );
+        }
+        // Resume re-creates the table and replays only the not-yet-completed
+        // chunks against it, so an atomic rollback (which dropped the table)
+        // can't be retried coherently — the result would be a partial load
+        // reported as success. Refuse the combination.
+        if args.resume_job_id.is_some() {
+            anyhow::bail!(
+                "--atomic cannot be combined with --resume-job-id: an atomic rollback \
+                 drops the table, so a resume would replay only the remaining chunks \
+                 into a freshly created table and silently land a partial dataset. \
+                 Re-run the full load with --atomic instead."
+            );
+        }
     }
     Ok(())
 }

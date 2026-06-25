@@ -356,7 +356,7 @@ aurora-dsql-loader load \
   --atomic
 ```
 
-On any failure the loader drops the table it created and exits non-zero, leaving the cluster as it was. `--atomic` requires `--if-not-exists` and refuses to run if the table already exists (it will not drop pre-existing data—drop it yourself first). Loading into an existing table atomically is not yet supported.
+On any failure the loader drops the table it created and exits non-zero. If that cleanup DROP itself fails, the loader says so and names the table for you to drop manually. `--atomic` requires `--if-not-exists` and refuses to run if the table already exists or can't be verified absent (it will not drop pre-existing data—drop it yourself first). It can't be combined with `--resume-job-id`. Loading into an existing table atomically is not yet supported.
 
 ## Verification
 
