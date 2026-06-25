@@ -100,11 +100,12 @@ struct LoadParams {
     #[arg(long)]
     if_not_exists: bool,
 
-    /// All-or-nothing: on any failure, DROP the table the loader created and
-    /// exit non-zero, leaving the cluster as it was. Requires --if-not-exists
-    /// and refuses to run if the table already exists (it will not drop
-    /// pre-existing data). DSQL can't do a single-transaction bulk load
-    /// (3,000-row/txn cap, no SAVEPOINT), so this is the only clean rollback.
+    /// All-or-nothing: on any load failure, DROP the table the loader created
+    /// and exit non-zero. Requires --if-not-exists and refuses to run if the
+    /// table already exists or its absence can't be verified (it will not drop
+    /// pre-existing data); cannot be combined with --resume-job-id. DSQL can't
+    /// do a single-transaction bulk load (3,000-row/txn cap, no SAVEPOINT), so
+    /// this is the only clean rollback.
     #[arg(long, requires = "if_not_exists", conflicts_with = "resume_job_id")]
     atomic: bool,
 

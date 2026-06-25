@@ -333,6 +333,8 @@ mod tests {
         // (not the hard-Err arm, and not the "rollback INCOMPLETE" wording).
         assert!(err.contains("record(s) failed"), "{err}");
         assert!(err.contains("rolled back — dropped table"), "{err}");
+        // The failure manifest path must be surfaced, not orphaned.
+        assert!(err.contains("Failure manifest preserved at"), "{err}");
         assert!(
             !sqlite_table_exists(&pool, "atomic_rollback").await,
             "atomic load must DROP the table it created on failure"

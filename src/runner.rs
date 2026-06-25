@@ -112,8 +112,10 @@ pub struct LoadArgs {
     pub create_table_if_missing: bool,
     /// Opt-in all-or-nothing. DSQL can't run a multi-worker bulk load in one
     /// transaction (3,000-row/txn cap, no SAVEPOINT), so the only clean
-    /// rollback is to DROP a table the loader created this run. Requires
-    /// `create_table_if_missing`; refuses if the table already exists.
+    /// rollback is to DROP a table the loader created this run. On any load
+    /// failure it drops that table and exits non-zero. Requires
+    /// `create_table_if_missing`; refuses if the table already exists or its
+    /// absence can't be verified; cannot be combined with `resume_job_id`.
     pub atomic: bool,
     pub manifest_dir: Option<PathBuf>,
     pub quiet: bool,
@@ -838,6 +840,18 @@ mod tests {
     fn format_parse_accepts_pgdump() {
         assert_eq!(Format::parse("pgdump").unwrap(), Format::PgDump);
         assert_eq!(Format::parse("PGDUMP").unwrap(), Format::PgDump);
+    }
+
+    #[test]
+    fn rollback_note_is_truthful_about_drop() {
+        let dropped = rollback_note(true, "public", "t");
+        assert!(
+            dropped.contains("rolled back — dropped table public.t"),
+            "{dropped}"
+        );
+        let failed = rollback_note(false, "public", "t");
+        assert!(failed.contains("rollback INCOMPLETE"), "{failed}");
+        assert!(failed.contains("drop it manually"), "{failed}");
     }
 
     #[test]

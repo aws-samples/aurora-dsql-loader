@@ -564,4 +564,16 @@ mod tests {
         let pool = Pool::sqlite_in_memory().await.unwrap();
         assert_eq!(pool.qualified_table_name("public", "orders"), "\"orders\"");
     }
+
+    /// `table_exists` must distinguish absent (`Ok(false)`) from present
+    /// (`Ok(true)`) — the contract `--atomic` relies on to fail closed.
+    #[tokio::test]
+    async fn table_exists_reports_absent_then_present() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        assert!(!pool.table_exists("public", "t").await.unwrap());
+        pool.execute_query("CREATE TABLE t (id TEXT)")
+            .await
+            .unwrap();
+        assert!(pool.table_exists("public", "t").await.unwrap());
+    }
 }
