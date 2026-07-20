@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Opt-in `--atomic` flag for `load`: on any load failure it drops the table
+  the loader created this run and exits non-zero, leaving the cluster as it
+  was. Requires `--if-not-exists`; refuses if the target table already exists
+  or its absence can't be verified (never drops pre-existing data); can't be
+  combined with `--resume-job-id`. A single-transaction bulk load isn't
+  possible under DSQL's 3,000-row/txn cap and lack of `SAVEPOINT`, so dropping
+  a loader-created table is the one clean rollback; loading atomically into an
+  existing table is left for a follow-up.
+
 ## [3.2.0] - 2026-06-23
 
 ### Added
