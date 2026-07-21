@@ -463,6 +463,8 @@ fn build_load_args(args: &MigrateArgs, table: &str, schema: &str) -> LoadArgs {
         // already exists; the IF-NOT-EXISTS path is gated against pg_dump
         // anyway by validate_load_args.
         create_table_if_missing: false,
+        // migrate applies DDL itself before loading; no per-table atomic drop.
+        atomic: false,
         column_mappings: HashMap::new(),
         manifest_dir: None,
         quiet: args.quiet,

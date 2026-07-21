@@ -256,6 +256,46 @@ impl Pool {
         }
     }
 
+    /// True if the table exists. Unlike probing `query_table_schema(...).is_ok()`,
+    /// this distinguishes "absent" (`Ok(false)`) from "could not check" (`Err`),
+    /// so a transient probe failure is never silently read as "table absent".
+    /// Callers that gate a destructive action on non-existence MUST treat `Err`
+    /// as "stop", not "proceed".
+    pub async fn table_exists(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<bool, sqlx::Error> {
+        match &self.inner {
+            PoolInner::Postgres(pool) => {
+                let mut conn = pool.acquire().await?;
+                let sql = r#"
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = $1 AND table_name = $2
+                    )
+                "#;
+                let (exists,): (bool,) = sqlx::query_as(sql)
+                    .bind(schema_name)
+                    .bind(table_name)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                Ok(exists)
+            }
+            #[cfg(test)]
+            PoolInner::Sqlite(pool) => {
+                let (_, sqlite_table) = self.table_identifier(schema_name, table_name);
+                let (n,): (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+                )
+                .bind(sqlite_table)
+                .fetch_one(pool)
+                .await?;
+                Ok(n > 0)
+            }
+        }
+    }
+
     /// Check if a table has unique constraints (primary key or unique index)
     pub async fn has_unique_constraints(
         &self,
@@ -523,5 +563,17 @@ mod tests {
     async fn qualified_table_name_plain_is_unchanged() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
         assert_eq!(pool.qualified_table_name("public", "orders"), "\"orders\"");
+    }
+
+    /// `table_exists` must distinguish absent (`Ok(false)`) from present
+    /// (`Ok(true)`) — the contract `--atomic` relies on to fail closed.
+    #[tokio::test]
+    async fn table_exists_reports_absent_then_present() {
+        let pool = Pool::sqlite_in_memory().await.unwrap();
+        assert!(!pool.table_exists("public", "t").await.unwrap());
+        pool.execute_query("CREATE TABLE t (id TEXT)")
+            .await
+            .unwrap();
+        assert!(pool.table_exists("public", "t").await.unwrap());
     }
 }
