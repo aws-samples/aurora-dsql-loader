@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [3.3.0] - 2026-07-21
 
 ### Added
 - Opt-in `--atomic` flag for `load`: on any load failure it drops the table
