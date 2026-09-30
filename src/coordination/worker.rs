@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,7 +115,7 @@ impl Worker {
             }
 
             // Shuffle chunks to randomize processing order and avoid contention
-            unclaimed.shuffle(&mut rand::thread_rng());
+            unclaimed.shuffle(&mut rand::rng());
 
             let mut claimed_any = false;
             for chunk_id in unclaimed {
@@ -751,7 +751,7 @@ impl Worker {
     /// Calculate exponential backoff delay with jitter
     fn backoff_delay(attempt: u32) -> Duration {
         let exp_delay = BASE_DELAY.as_millis().saturating_mul(2u128.pow(attempt));
-        let jitter = rand::thread_rng().gen_range(0.75..=1.25);
+        let jitter = rand::rng().random_range(0.75..=1.25);
         let delay_ms = (exp_delay as f64 * jitter) as u64;
         Duration::from_millis(delay_ms).min(MAX_DELAY)
     }
