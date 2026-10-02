@@ -10,21 +10,19 @@ jobs:
   scan-for-leaks:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
-      # Explicitly set permissions, following the principle of least privilege
-      actions: read
-      checks: write
-      pull-requests: write
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
-        # For pull requests, check out the base branch, not the PR branch
-        ref: ${{ github.event.pull_request.base.sha }}
-    - name: gitleaks
-      uses: gitleaks/gitleaks-action@v1.6.0
-      env:
-        # GitHub Token automatically created on run
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Gitleaks' git mode scans commit history, so a shallow checkout can
+        # silently miss secrets introduced before the tip commit.
+        fetch-depth: 0
+
+    - name: Scan with Gitleaks
+      run: |
+        docker run --rm \
+          --volume "$GITHUB_WORKSPACE:/repo:ro" \
+          zricethezav/gitleaks:v8.30.1 \
+          git --verbose --redact --no-banner /repo
