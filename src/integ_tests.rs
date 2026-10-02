@@ -4862,13 +4862,17 @@ mod tests {
         assert_eq!(fk_count, 0, "{events_src} must have 0 FK constraints");
 
         // Inline UNIQUE survives the pg_dump → ALTER → collapse round-trip.
-        let (users_unique_count,): (i64,) = sqlx::query_as(&format!(
-            "SELECT COUNT(*) FROM information_schema.table_constraints \
-             WHERE table_schema='public' AND table_name='{users_src}' \
-             AND constraint_type='UNIQUE'"
-        ))
-        .fetch_one(&dsql_pool)
-        .await?;
+        let (users_unique_count,): (i64,) =
+            aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
+                sqlx::query_as(&format!(
+                    "SELECT COUNT(*) FROM information_schema.table_constraints \
+                 WHERE table_schema='public' AND table_name='{users_src}' \
+                 AND constraint_type='UNIQUE'"
+                ))
+                .fetch_one(&dsql_pool)
+                .await
+            })
+            .await?;
         assert_eq!(
             users_unique_count, 1,
             "{users_src} must have exactly 1 UNIQUE constraint"
@@ -4876,11 +4880,14 @@ mod tests {
 
         // JSONB preserved: DSQL supports it natively, so the column stays
         // `jsonb` (dsql-lint >=0.2.6 no longer rewrites it to `json`).
-        let (payload_type,): (String,) = sqlx::query_as(&format!(
-            "SELECT data_type FROM information_schema.columns \
-             WHERE table_schema='public' AND table_name='{events_src}' AND column_name='payload'"
-        ))
-        .fetch_one(&dsql_pool)
+        let (payload_type,): (String,) = aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
+    sqlx::query_as(&format!(
+                "SELECT data_type FROM information_schema.columns \
+                 WHERE table_schema='public' AND table_name='{events_src}' AND column_name='payload'"
+            ))
+            .fetch_one(&dsql_pool)
+            .await
+        })
         .await?;
         assert_eq!(
             payload_type, "jsonb",
@@ -4888,12 +4895,16 @@ mod tests {
         );
 
         // NOT NULL DEFAULT '' preserved on events.note.
-        let (note_nullable, note_default): (String, Option<String>) = sqlx::query_as(&format!(
-            "SELECT is_nullable, column_default FROM information_schema.columns \
-             WHERE table_schema='public' AND table_name='{events_src}' AND column_name='note'"
-        ))
-        .fetch_one(&dsql_pool)
-        .await?;
+        let (note_nullable, note_default): (String, Option<String>) =
+            aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
+                sqlx::query_as(&format!(
+                    "SELECT is_nullable, column_default FROM information_schema.columns \
+                 WHERE table_schema='public' AND table_name='{events_src}' AND column_name='note'"
+                ))
+                .fetch_one(&dsql_pool)
+                .await
+            })
+            .await?;
         assert_eq!(note_nullable, "NO", "events.note must remain NOT NULL");
         assert!(
             note_default.as_deref().is_some_and(|d| d.contains("''")),
@@ -4914,11 +4925,14 @@ mod tests {
             created_at: chrono::DateTime<chrono::Utc>,
         }
 
-        let rows: Vec<EventRow> = sqlx::query_as(&format!(
-            "SELECT label, note, user_id, payload, created_at \
-             FROM {events_src} ORDER BY label"
-        ))
-        .fetch_all(&dsql_pool)
+        let rows: Vec<EventRow> = aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
+            sqlx::query_as(&format!(
+                "SELECT label, note, user_id, payload, created_at \
+                 FROM {events_src} ORDER BY label"
+            ))
+            .fetch_all(&dsql_pool)
+            .await
+        })
         .await?;
         assert_eq!(rows.len(), 8, "all 8 events rows must round-trip");
 
@@ -5015,10 +5029,12 @@ mod tests {
         struct UserRow {
             email: String,
         }
-        let user_rows: Vec<UserRow> =
+        let user_rows: Vec<UserRow> = aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
             sqlx::query_as(&format!("SELECT email FROM {users_src} ORDER BY email"))
                 .fetch_all(&dsql_pool)
-                .await?;
+                .await
+        })
+        .await?;
         let emails: Vec<&str> = user_rows.iter().map(|u| u.email.as_str()).collect();
         assert_eq!(emails, vec!["a@example.com", "b@example.com"]);
 
@@ -5030,10 +5046,13 @@ mod tests {
         {
             // Find events row (label 'alpha') and corrupt its note. `id` is
             // BIGINT after the SERIAL→IDENTITY rewrite, so fetch as i64.
-            let (alpha_id,): (i64,) = sqlx::query_as(&format!(
-                "SELECT id FROM {events_src} WHERE label = 'alpha'"
-            ))
-            .fetch_one(&dsql_pool)
+            let (alpha_id,): (i64,) = aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
+                sqlx::query_as(&format!(
+                    "SELECT id FROM {events_src} WHERE label = 'alpha'"
+                ))
+                .fetch_one(&dsql_pool)
+                .await
+            })
             .await?;
             dsql_pool
                 .execute_query(&format!(
