@@ -245,7 +245,7 @@ mod tests {
         ]);
 
         let props = WriterProperties::builder()
-            .set_max_row_group_size(row_group_size)
+            .set_max_row_group_row_count(Some(row_group_size))
             .build();
 
         let file = std::fs::File::create(temp_file.path()).unwrap();

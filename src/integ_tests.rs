@@ -425,7 +425,7 @@ mod tests {
 
         let file = std::fs::File::create(&parquet_path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(50)
+            .set_max_row_group_row_count(Some(50))
             .build();
 
         let mut writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props)).unwrap();
@@ -689,7 +689,7 @@ mod tests {
 
         let file = std::fs::File::create(&parquet_path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(25)
+            .set_max_row_group_row_count(Some(25))
             .build();
 
         let mut writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props)).unwrap();
@@ -3127,7 +3127,7 @@ mod tests {
 
         let file = std::fs::File::create(&parquet_path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(50)
+            .set_max_row_group_row_count(Some(50))
             .build();
         let mut writer =
             ArrowWriter::try_new(file, Arc::new(arrow_schema.clone()), Some(props)).unwrap();
@@ -5610,7 +5610,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)]);
         let file = std::fs::File::create(&parquet_path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(20)
+            .set_max_row_group_row_count(Some(20))
             .build();
         let mut writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props)).unwrap();
         let id_array = Int32Array::from_iter_values(0..50);
