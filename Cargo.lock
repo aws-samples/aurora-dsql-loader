@@ -1605,9 +1605,9 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dsql-lint"
-version = "0.2.9"
+version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d55cbef070b764bd714f959c7f89808b1e1fc7b9039441bcead7f2a8ba3ada5a"
+checksum = "43399510f989a94fafc366c22ec0d0be4f8a68dc6bfee7ecf20a446c1b81cbc3"
 dependencies = [
  "clap",
  "serde",
@@ -3637,12 +3637,24 @@ dependencies = [
 
 [[package]]
 name = "sqlparser-dsql"
-version = "0.62.1"
+version = "0.62.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4f9eb2c9c6d679abb7b65e837c4d75b8cd3ad22827a17264d00a01542492cbd"
+checksum = "e669f553713128429e2afaa7311ec536d81a7bf76c9686e1a9e3befe0e4ad77b"
 dependencies = [
  "log",
  "recursive",
+ "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6dd45d8fc1c79299bfbb7190e42ccbbdf6a5f52e4a6ad98d92357ea965bd289"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
