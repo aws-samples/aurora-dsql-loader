@@ -171,6 +171,50 @@
   their original positions; the loader drops them by index before batching.
   Cannot be combined with `--if-not-exists`.
 
+## [2.0.7] - 2026-05-05
+
+### Fixed
+- Removed the default `--quote` value so Parquet loads don't trip
+  delimited-options validation.
+
+## [2.0.6] - 2026-04-24
+
+### Changed
+- Use `raw_sql` for batch inserts (#24).
+
+### Fixed
+- Use `checked_div` to satisfy the clippy `manual_checked_ops` lint (#23).
+
+## [2.0.5] - 2026-04-10
+
+### Fixed
+- Execute inserts directly (#21).
+- Improve parse error detection and connection reliability (#22).
+
+## [2.0.4] - 2026-04-07
+
+### Changed
+- Switch to the Aurora DSQL connector library (#20).
+
+### Added
+- `DelimitedConfig` is configurable from the CLI (#19).
+
+## [2.0.3] - 2026-03-13
+
+### Fixed
+- Surface PostgreSQL parameter-limit errors that caused silent load failures (#16).
+- Fix timestamp parsing (#17).
+
+## [2.0.2] - 2026-02-20
+
+### Added
+- musl Linux release targets.
+
+## [2.0.1] - 2026-02-20
+
+### Fixed
+- Fix the constraint query.
+
 ## [2.0.0] - 2026-01-06
 
 Rewrite in Rust with 3-5x throughput improvement and new features.
@@ -222,6 +266,6 @@ aurora-dsql-loader load \
 - `--host`, `--user`, `--password` → `--endpoint` (AWS SDK handles auth)
 - `--delim` → `--format csv|tsv|parquet` (or auto-detect)
 
-## [1.0.0] - 2024
+## [0.1.0] - 2024-12-04
 
 Initial Python implementation.
