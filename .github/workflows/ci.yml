@@ -90,6 +90,15 @@ jobs:
               core.setOutput('should-run', 'true');
               return;
             }
+            // Dependabot pull_request runs cannot access Actions secrets, even
+            // though their branches live in this repository. A manual
+            // workflow_dispatch against the exact bot branch retains the full
+            // E2E path and secret access after the revision has been reviewed.
+            if (context.actor === 'dependabot[bot]') {
+              core.info('Dependabot PR: run CI manually on the exact branch for DSQL E2E');
+              core.setOutput('should-run', 'false');
+              return;
+            }
             // Forked PR: can't read secrets, skip
             const pr = context.payload.pull_request;
             if (!pr) { core.setOutput('should-run', 'false'); return; }
