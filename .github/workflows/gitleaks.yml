@@ -24,7 +24,7 @@ jobs:
         # For pull requests, check out the base branch, not the PR branch
         ref: ${{ github.event.pull_request.base.sha }}
     - name: gitleaks
-      uses: gitleaks/gitleaks-action@v1.6.0
+      uses: gitleaks/gitleaks-action@v3.0.0
       env:
         # GitHub Token automatically created on run
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
