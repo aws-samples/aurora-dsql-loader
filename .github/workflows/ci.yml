@@ -81,13 +81,22 @@ jobs:
     steps:
       - name: Decide whether to run e2e-dsql
         id: decide
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const event = context.eventName;
             // workflow_dispatch and push-to-main always run e2e
             if (event === 'workflow_dispatch' || event === 'push') {
               core.setOutput('should-run', 'true');
+              return;
+            }
+            // Dependabot pull_request runs cannot access Actions secrets, even
+            // though their branches live in this repository. A manual
+            // workflow_dispatch against the exact bot branch retains the full
+            // E2E path and secret access after the revision has been reviewed.
+            if (context.actor === 'dependabot[bot]') {
+              core.info('Dependabot PR: run CI manually on the exact branch for DSQL E2E');
+              core.setOutput('should-run', 'false');
               return;
             }
             // Forked PR: can't read secrets, skip
