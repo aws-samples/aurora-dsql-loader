@@ -8,7 +8,7 @@ use crate::db::Pool;
 use crate::db::pool::{PoolArgsBuilder, pool as build_dsql_pool};
 use crate::formats::pgdump::{extract_ddl, list_copy_blocks};
 use crate::io::{ByteReader, LocalFileByteReader, S3ByteReader, SourceUri};
-use crate::migrate::apply::{AppliedStatement, apply_ddl};
+use crate::migrate::apply::{AppliedStatement, apply_ddl, partition_deferred_foreign_keys};
 use crate::migrate::transform::{Diagnostic, TransformResult, transform_ddl};
 use crate::runner::{
     Format, LoadArgs, OnConflict, VerifyMode, run_load_with_pool_for_pgdump_block,
@@ -199,7 +199,8 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
     // skip the DSQL IAM round-trip; for an offline (`file://`) fixture
     // the entire run stays cluster-free up to this point.
     let pool = build_pool(&args).await?;
-    let ddl_applied = apply_ddl(&pool, &fixed_sql)
+    let (immediate_ddl, deferred_fk_ddl) = partition_deferred_foreign_keys(&fixed_sql);
+    let mut ddl_applied = apply_ddl(&pool, &immediate_ddl)
         .await
         .context("Failed to apply DDL to cluster")?;
 
@@ -211,9 +212,9 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         Some(MigrateProgress::new(&blocks))
     };
 
-    // Halt on the first table with `records_failed > 0`. DSQL doesn't
-    // enforce FKs, so continuing would silently load child rows against
-    // a partially-loaded parent and the final report would look healthy.
+    // Halt on the first table with `records_failed > 0`; continuing would
+    // make a partial migration look healthy and must also prevent deferred
+    // constraints from being installed over incomplete data.
     // The pre-resolved `blocks` and `aws_config` are threaded through so
     // each load skips the dump rescan + credential-chain walk.
     let mut tables = Vec::with_capacity(blocks.len());
@@ -340,8 +341,17 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         }
     }
 
-    if !halted && let Some(mp) = &migrate_progress {
-        mp.finish_visible();
+    if !halted {
+        if !deferred_fk_ddl.is_empty() {
+            ddl_applied.extend(
+                apply_ddl(&pool, &deferred_fk_ddl)
+                    .await
+                    .context("Failed to apply deferred foreign-key constraints")?,
+            );
+        }
+        if let Some(mp) = &migrate_progress {
+            mp.finish_visible();
+        }
     }
 
     Ok(MigrateReport {
