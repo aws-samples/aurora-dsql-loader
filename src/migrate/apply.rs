@@ -88,6 +88,33 @@ pub async fn apply_ddl(pool: &Pool, ddl: &str) -> Result<Vec<AppliedStatement>> 
     Ok(applied)
 }
 
+/// Split foreign-key constraints that must be applied after bulk data.
+///
+/// `dsql-lint` rewrites an ALTER-added foreign key to `NOT VALID`. DSQL
+/// still enforces that constraint for new writes, so applying it before
+/// COPY blocks can reject valid child rows when their parent block appears
+/// later in the dump. Existing rows remain unvalidated, as the lint
+/// diagnostic warns; callers may validate them asynchronously afterward.
+pub(crate) fn partition_deferred_foreign_keys(ddl: &str) -> (String, String) {
+    let (deferred, immediate): (Vec<_>, Vec<_>) =
+        split_sql_statements(ddl).into_iter().partition(|stmt| {
+            let upper = stmt.to_ascii_uppercase();
+            upper.contains("ALTER TABLE")
+                && upper.contains("ADD CONSTRAINT")
+                && upper.contains("FOREIGN KEY")
+                && upper.contains("NOT VALID")
+        });
+    (join_statements(immediate), join_statements(deferred))
+}
+
+fn join_statements(statements: Vec<String>) -> String {
+    if statements.is_empty() {
+        String::new()
+    } else {
+        format!("{};", statements.join(";\n"))
+    }
+}
+
 /// Run one DDL statement with OCC retry, normalizing the connector's
 /// [`DsqlError`] back to the underlying [`sqlx::Error`] so the caller's
 /// already-exists classification (which inspects SQLSTATE on `sqlx::Error`)
@@ -351,6 +378,38 @@ mod tests {
 
     fn split(sql: &str) -> Vec<String> {
         split_sql_statements(sql)
+    }
+
+    #[test]
+    fn defers_not_valid_foreign_keys_only() {
+        let ddl = "\
+CREATE TABLE parent (id bigint PRIMARY KEY);
+CREATE TABLE child (id bigint PRIMARY KEY, parent_id bigint);
+ALTER TABLE child ADD CONSTRAINT child_parent_fk
+  FOREIGN KEY (parent_id) REFERENCES parent(id) NOT VALID;
+CREATE INDEX ASYNC child_parent_idx ON child(parent_id);
+";
+        let (immediate, deferred) = partition_deferred_foreign_keys(ddl);
+        assert!(immediate.contains("CREATE TABLE parent"));
+        assert!(immediate.contains("CREATE TABLE child"));
+        assert!(immediate.contains("CREATE INDEX ASYNC"));
+        assert!(!immediate.contains("FOREIGN KEY"));
+        assert!(deferred.contains("ALTER TABLE child"));
+        assert!(deferred.contains("FOREIGN KEY"));
+        assert!(deferred.contains("NOT VALID"));
+    }
+
+    #[test]
+    fn does_not_defer_inline_or_already_valid_foreign_keys() {
+        let ddl = "\
+CREATE TABLE child (parent_id bigint REFERENCES parent(id));
+ALTER TABLE child ADD CONSTRAINT child_parent_fk
+  FOREIGN KEY (parent_id) REFERENCES parent(id);
+";
+        let (immediate, deferred) = partition_deferred_foreign_keys(ddl);
+        assert!(immediate.contains("REFERENCES parent"));
+        assert!(immediate.contains("ADD CONSTRAINT"));
+        assert!(deferred.is_empty());
     }
 
     #[test]

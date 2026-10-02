@@ -8,7 +8,7 @@
 --   * standalone ALTER ... ADD CONSTRAINT ... UNIQUE
 --                          (folded back onto CREATE TABLE by
 --                           dsql-lint's alter_add_unique_collapse rule)
---   * FOREIGN KEY          (auto-removed by dsql-lint with a warning)
+--   * FOREIGN KEY          (retained as NOT VALID for async validation)
 --   * sync CREATE INDEX    (dsql-lint rewrites to CREATE INDEX ASYNC)
 -- Used by the orchestrator's offline smoke test to pin --dry-run behavior
 -- without needing a real Postgres source. See

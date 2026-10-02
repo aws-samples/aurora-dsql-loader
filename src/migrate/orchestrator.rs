@@ -8,7 +8,7 @@ use crate::db::Pool;
 use crate::db::pool::{PoolArgsBuilder, pool as build_dsql_pool};
 use crate::formats::pgdump::{extract_ddl, list_copy_blocks};
 use crate::io::{ByteReader, LocalFileByteReader, S3ByteReader, SourceUri};
-use crate::migrate::apply::{AppliedStatement, apply_ddl};
+use crate::migrate::apply::{AppliedStatement, apply_ddl, partition_deferred_foreign_keys};
 use crate::migrate::transform::{Diagnostic, TransformResult, transform_ddl};
 use crate::runner::{
     Format, LoadArgs, OnConflict, VerifyMode, run_load_with_pool_for_pgdump_block,
@@ -199,7 +199,8 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
     // skip the DSQL IAM round-trip; for an offline (`file://`) fixture
     // the entire run stays cluster-free up to this point.
     let pool = build_pool(&args).await?;
-    let ddl_applied = apply_ddl(&pool, &fixed_sql)
+    let (immediate_ddl, deferred_fk_ddl) = partition_deferred_foreign_keys(&fixed_sql);
+    let mut ddl_applied = apply_ddl(&pool, &immediate_ddl)
         .await
         .context("Failed to apply DDL to cluster")?;
 
@@ -211,9 +212,9 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         Some(MigrateProgress::new(&blocks))
     };
 
-    // Halt on the first table with `records_failed > 0`. DSQL doesn't
-    // enforce FKs, so continuing would silently load child rows against
-    // a partially-loaded parent and the final report would look healthy.
+    // Halt on the first table with `records_failed > 0`; continuing would
+    // make a partial migration look healthy and must also prevent deferred
+    // constraints from being installed over incomplete data.
     // The pre-resolved `blocks` and `aws_config` are threaded through so
     // each load skips the dump rescan + credential-chain walk.
     let mut tables = Vec::with_capacity(blocks.len());
@@ -340,8 +341,17 @@ pub async fn run_migrate(args: MigrateArgs) -> Result<MigrateReport> {
         }
     }
 
-    if !halted && let Some(mp) = &migrate_progress {
-        mp.finish_visible();
+    if !halted {
+        if !deferred_fk_ddl.is_empty() {
+            ddl_applied.extend(
+                apply_ddl(&pool, &deferred_fk_ddl)
+                    .await
+                    .context("Failed to apply deferred foreign-key constraints")?,
+            );
+        }
+        if let Some(mp) = &migrate_progress {
+            mp.finish_visible();
+        }
     }
 
     Ok(MigrateReport {
@@ -582,10 +592,9 @@ COPY public.t (id, x) FROM stdin;
         let pool = Pool::sqlite_in_memory().await.unwrap();
         let dump = write_dump(
             "\
-CREATE TABLE public.t (id integer NOT NULL);
-ALTER TABLE ONLY public.t ALTER COLUMN id SET DEFAULT nextval('other_db.s'::regclass);
-COPY public.t (id) FROM stdin;
-1
+CREATE TABLE public.t (items integer[]);
+COPY public.t (items) FROM stdin;
+{1}
 \\.
 ",
         );
@@ -743,7 +752,7 @@ COPY public.t (id) FROM stdin;
     /// proof that all of dsql-lint's transforms compose end-to-end via
     /// the migrate flow without touching a cluster.
     #[tokio::test]
-    async fn dry_run_full_dump_fixture_collapses_idioms_and_strips_fk() {
+    async fn dry_run_full_dump_fixture_collapses_idioms_and_retains_fk() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pgdump_full.sql");
         let args = MigrateArgs {
@@ -779,13 +788,16 @@ COPY public.t (id) FROM stdin;
             report.ddl_changes
         );
 
-        // Foreign key auto-removed (DSQL has no FK enforcement).
+        // ALTER-added foreign keys are retained and made NOT VALID so new
+        // writes are enforced while existing rows await async validation.
         assert!(
-            report.ddl_changes.iter().any(|d| d.rule == "foreign_key"),
-            "FK should be reported as auto-removed, got: {:?}",
+            report
+                .ddl_changes
+                .iter()
+                .any(|d| d.rule == "foreign_key_not_valid"),
+            "FK should be rewritten as NOT VALID, got: {:?}",
             report.ddl_changes
         );
-
         // Sync CREATE INDEX rewritten to ASYNC, USING clause stripped.
         assert!(
             report.ddl_changes.iter().any(|d| d.rule == "index_async"),
@@ -911,12 +923,11 @@ COPY public.t (id) FROM stdin;
     /// test silently.
     #[tokio::test]
     async fn unfixable_does_not_build_pool() {
-        // Cross-file SET DEFAULT with no preceding sequence DECLARE in the
-        // same input is the canonical unfixable diagnostic from dsql-lint.
+        // Array columns are a canonical unfixable diagnostic from dsql-lint.
         let dump = "\
-ALTER TABLE public.events ALTER COLUMN id SET DEFAULT nextval('public.events_id_seq'::regclass);
-COPY public.events (id) FROM stdin;
-1
+CREATE TABLE public.events (items integer[]);
+COPY public.events (items) FROM stdin;
+{1}
 \\.
 ";
         let f = write_dump(dump);
@@ -940,17 +951,11 @@ COPY public.events (id) FROM stdin;
             test_pool: None,
         };
         let report = run_migrate(args).await.unwrap();
-        // Pin the specific rule, not just "non-empty unfixable" — if a
-        // future dsql-lint reclassifies cross-file SET DEFAULT under a
-        // different rule name (or worse, makes it fixable), the test
-        // surfaces here rather than silently passing for an unrelated
-        // reason.
+        // Pin the specific rule so an unrelated diagnostic cannot make the
+        // short-circuit test pass accidentally.
         assert!(
-            report
-                .ddl_unfixable
-                .iter()
-                .any(|d| d.rule == "at_unsupported_alter_column_set_default"),
-            "must surface at_unsupported_alter_column_set_default; got: {:?}",
+            report.ddl_unfixable.iter().any(|d| d.rule == "array_type"),
+            "must surface array_type; got: {:?}",
             report.ddl_unfixable
         );
         assert!(report.ddl_applied.is_empty());
@@ -1320,9 +1325,9 @@ COPY public.missing (id) FROM stdin;
     async fn run_migrate_verify_unfixable_short_circuits_no_verify_outcome() {
         let pool = Pool::sqlite_in_memory().await.unwrap();
         let dump = "\
-ALTER TABLE public.events ALTER COLUMN id SET DEFAULT nextval('public.events_id_seq'::regclass);
-COPY public.events (id) FROM stdin;
-1
+CREATE TABLE public.events (items integer[]);
+COPY public.events (items) FROM stdin;
+{1}
 \\.
 ";
         let f = write_dump(dump);
