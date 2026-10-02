@@ -29,7 +29,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -183,10 +183,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Checkout aurora-dsql-tools (pgdump-proxy)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: awslabs/aurora-dsql-tools
           # Pinned to an immutable commit: the proxy script runs in a job that
