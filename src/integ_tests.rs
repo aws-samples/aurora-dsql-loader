@@ -4589,7 +4589,7 @@ mod tests {
     /// opts in via `--ignored`.
     #[tokio::test]
     #[ignore]
-    async fn pgdump_migrate_real_full_dump_collapses_serial_strips_fk() -> anyhow::Result<()> {
+    async fn pgdump_migrate_real_full_dump_collapses_serial_retains_fk() -> anyhow::Result<()> {
         let source_pg_url = std::env::var("PGDUMP_E2E_SOURCE_URL")
             .map_err(|_| anyhow::anyhow!("PGDUMP_E2E_SOURCE_URL must be set"))?;
         let dsql_endpoint = std::env::var("LOADER_DSQL_E2E_ENDPOINT").map_err(|_| {
@@ -4747,8 +4747,8 @@ mod tests {
             report.ddl_changes
         );
         assert!(
-            rule_count("foreign_key") >= 1,
-            "FK should be reported as auto-removed, got: {:?}",
+            rule_count("foreign_key_not_valid") >= 1,
+            "ALTER-added FK should be retained as NOT VALID, got: {:?}",
             report.ddl_changes
         );
         assert!(
@@ -4848,7 +4848,7 @@ mod tests {
             );
         }
 
-        // FK auto-removed: zero FOREIGN KEY constraints on events.
+        // The ALTER-added FK is retained as NOT VALID.
         let (fk_count,): (i64,) = aurora_dsql_sqlx_connector::retry_on_occ(&occ, || async {
             sqlx::query_as(&format!(
                 "SELECT COUNT(*) FROM information_schema.table_constraints \
@@ -4859,7 +4859,10 @@ mod tests {
             .await
         })
         .await?;
-        assert_eq!(fk_count, 0, "{events_src} must have 0 FK constraints");
+        assert_eq!(
+            fk_count, 1,
+            "{events_src} must have exactly 1 FK constraint"
+        );
 
         // Inline UNIQUE survives the pg_dump → ALTER → collapse round-trip.
         let (users_unique_count,): (i64,) =

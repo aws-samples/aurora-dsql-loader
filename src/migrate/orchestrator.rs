@@ -742,7 +742,7 @@ COPY public.t (items) FROM stdin;
     /// proof that all of dsql-lint's transforms compose end-to-end via
     /// the migrate flow without touching a cluster.
     #[tokio::test]
-    async fn dry_run_full_dump_fixture_collapses_idioms_and_strips_fk() {
+    async fn dry_run_full_dump_fixture_collapses_idioms_and_retains_fk() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pgdump_full.sql");
         let args = MigrateArgs {
