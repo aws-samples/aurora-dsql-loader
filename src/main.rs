@@ -1708,4 +1708,39 @@ mod tests {
         validate_delimited_options("parquet", Format::Parquet, &source)
             .expect("parquet load should not trigger the delimited-options error");
     }
+
+    // `validate_delimited_options` and the library's `validate_load_args`
+    // both treat a populated delimited field as "user passed this flag". A
+    // clap `default_value` would populate it on every invocation and reject
+    // all parquet/pgdump loads (the regression fixed in efe936b). Format
+    // defaults belong in the runner, which resolves `None` per format.
+    #[test]
+    fn delimited_options_have_no_clap_defaults() {
+        use clap::CommandFactory;
+
+        let mut cmd = Args::command();
+        // Arg-level `group = ".."` memberships are only attached at build time.
+        cmd.build();
+        let load = cmd.find_subcommand("load").expect("load subcommand");
+        let group = load
+            .get_groups()
+            .find(|g| g.get_id() == "delimited")
+            .expect("delimited arg group");
+        let mut ids = group.get_args().peekable();
+        assert!(ids.peek().is_some(), "delimited group should not be empty");
+        for id in ids {
+            let arg = load
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .expect("group member is a load argument");
+            // Boolean flags carry an implicit "false" default, which is harmless.
+            if !arg.get_action().takes_values() {
+                continue;
+            }
+            assert!(
+                arg.get_default_values().is_empty(),
+                "--{id} must not have a clap default_value; resolve defaults in the runner instead",
+            );
+        }
+    }
 }
